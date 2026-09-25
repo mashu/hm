@@ -1,0 +1,13 @@
+[package]
+name = "hm-wire"
+description = "Wire primitives: base-40 callsigns, radio frame headers, ACKs, object ids"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+minicbor.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

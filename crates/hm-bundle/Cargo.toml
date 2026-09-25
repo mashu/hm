@@ -1,0 +1,15 @@
+[package]
+name = "hm-bundle"
+description = "Messages: build, seal, open and verify bundles"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hm-wire = { path = "../hm-wire" }
+hm-ident = { path = "../hm-ident" }
+minicbor.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

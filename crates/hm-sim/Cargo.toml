@@ -1,0 +1,10 @@
+[package]
+name = "hm-sim"
+description = "Deterministic discrete-event simulator for station machines on a shared radio channel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hm-core = { path = "../hm-core" }
