@@ -9,3 +9,8 @@ license.workspace = true
 [dependencies]
 hm-core = { path = "../hm-core" }
 hm-wire = { path = "../hm-wire" }
+libm = "0.2"
+
+[dev-dependencies]
+hm-bearer = { path = "../hm-bearer" }
+hm-modem-afsk = { path = "../hm-modem-afsk" }

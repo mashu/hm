@@ -300,7 +300,7 @@ fn precedence_orders_the_queue_and_bad_sends_fail_fast() {
 fn duty_cycle_limits_over_size_and_spacing() {
     let mut cfg = Config::vhf_1200(call("SA0KAM"));
     cfg.duty_cycle_permille = 100;
-    cfg.bucket = Millis(5_000);
+    cfg.bucket = Millis(5_500);
     let mut a = Xfer::new(cfg, identity("SA0KAM"), DetRng::from_seed(1)).unwrap();
     let mut out = Vec::new();
     a.handle(
@@ -312,7 +312,8 @@ fn duty_cycle_limits_over_size_and_spacing() {
         }),
         &mut out,
     );
-    // A 5 s bucket holds TXDELAY + OFFER + two 222-byte frames (1.48 s each), not the 20 wanted.
+    // A 5.5 s bucket holds TXDELAY + OFFER (0.52 s) + two 222-byte frames
+    // (1.64 s each on air as AX.25), not the 20 wanted.
     assert_eq!(frames(&out).len(), 1 + 2);
     // The receiver still needs 18 symbols; at 10% duty the next over waits for the bucket to refill.
     let session = FrameHeader::decode(&frames(&out)[0]).unwrap().0.session;
@@ -341,7 +342,7 @@ fn duty_cycle_limits_over_size_and_spacing() {
     );
     let mut out = Vec::new();
     a.on_deadline(t, &mut out);
-    // No OFFER this time, so three frames fit: 0.3 s + 3 x 1.48 s < 5 s.
+    // No OFFER this time, so three frames fit: 0.3 s + 3 x 1.64 s < 5.5 s.
     assert_eq!(frames(&out).len(), 3);
 }
 

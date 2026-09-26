@@ -5,7 +5,7 @@
 use hm_core::{Millis, Output};
 use hm_ident::Identity;
 use hm_sim::metrics::Percentiles;
-use hm_sim::{ChannelId, Loss, RadioParams, Report, Sim};
+use hm_sim::{ChannelId, Csma, Loss, RadioParams, Report, Sim};
 use hm_wire::Callsign;
 use hm_xfer::{object_id, Command, Config, Event, Receipt, Xfer};
 
@@ -143,6 +143,10 @@ fn exit_criterion_1kb_at_10_percent_loss() {
     assert!(rate >= 0.99, "success {rate}");
 }
 
+/// hm's own machinery (frame headers, OFFER and ACK, key-ups) must stay under
+/// 20% of airtime. The link's framing (AX.25 header, frame check, flags, bit
+/// stuffing) is reported beside it: it belongs to the bearer, and IL2P or
+/// another modem would change it.
 #[test]
 fn exit_criterion_overhead_5kb_clean() {
     let o = run(1, 5000, Loss::None, Loss::None, 0.0, Millis::from_secs(600));
@@ -151,21 +155,24 @@ fn exit_criterion_overhead_5kb_clean() {
     let air = &t.airtime;
     let total = air.total_us() as f64;
     let useful_us = 5000.0 * 8.0 * 1e6 / 1200.0;
+    let share = |us: u64| us as f64 / total * 100.0;
     let machinery = (air.txdelay_us + air.overhead_us + air.control_us) as f64 / total;
     eprintln!(
-        "5 kB clean: {:.1} s on air, {:.1} s to deliver; headers+preambles {:.1}%, OFFER+ACK {:.1}%, \
-         TXDELAY {:.1}%, symbols {:.1}% of which useful {:.1}% of all airtime",
+        "5 kB clean: {:.1} s on air, {:.1} s to deliver; AX.25 framing and stuffing {:.1}%, \
+         hm headers and preambles {:.1}%, OFFER+ACK {:.1}%, TXDELAY+TXTAIL {:.1}%, \
+         symbols {:.1}% of which useful {:.1}% of all airtime",
         total / 1e6,
         o.latency.unwrap().0 as f64 / 1e3,
-        air.overhead_us as f64 / total * 100.0,
-        air.control_us as f64 / total * 100.0,
-        air.txdelay_us as f64 / total * 100.0,
-        air.payload_us as f64 / total * 100.0,
+        share(air.link_us),
+        share(air.overhead_us),
+        share(air.control_us),
+        share(air.txdelay_us),
+        share(air.payload_us),
         useful_us / total * 100.0,
     );
     assert!(
         machinery <= 0.20,
-        "headers, ACKs, control and TXDELAY take {:.1}%",
+        "hm headers, ACKs, control and key-ups take {:.1}%",
         machinery * 100.0
     );
 }
@@ -299,4 +306,161 @@ fn two_senders_to_one_node_without_csma() {
         p.max as f64 / 1e3
     );
     assert_eq!(both, 30);
+}
+
+/// With two stations, a frame lost to half-duplex means one keyed up while the
+/// other was still sending: the receiver misjudged the end of an over (or the
+/// sender the end of an ACK). Long overs with lost frames are where the
+/// prediction is stretched furthest.
+#[test]
+fn nobody_talks_over_an_over() {
+    let (mut talked_over, mut delivered) = (0, 0);
+    for seed in 0..40 {
+        let o = run(
+            seed,
+            8000,
+            Loss::Bernoulli(0.15),
+            Loss::Bernoulli(0.15),
+            0.0,
+            Millis::from_secs(3600),
+        );
+        talked_over += o.report.total().lost_half_duplex;
+        delivered += (o.received == 1 && o.delivered) as u32;
+    }
+    eprintln!("8 kB at 15% loss, 40 runs: {delivered} delivered, {talked_over} frames talked over");
+    assert_eq!(delivered, 40);
+    assert_eq!(
+        talked_over, 0,
+        "a station keyed up during the other's transmission"
+    );
+}
+
+struct Busy {
+    delivered: usize,
+    last: Option<Millis>,
+    collisions: u64,
+}
+
+/// `senders` stations and a hub, all hearing each other at `snr_db`. Each sender
+/// has a 1.5 kB object for the hub, queued within the first 5 s.
+fn busy_channel(seed: u64, senders: usize, snr_db: f64, csma: bool) -> Busy {
+    let mut sim = XferSim::new(seed, RadioParams::VHF_1200);
+    let names: Vec<String> = (0..senders).map(|i| format!("SA{i}KAM")).collect();
+    let hub_rng = sim.machine_rng(99);
+    let all: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let hub = sim.add_node(station("SO5KM-1", hub_rng, &all));
+    let mut nodes = vec![hub];
+    for (i, n) in names.iter().enumerate() {
+        let rng = sim.machine_rng(i as u64);
+        nodes.push(sim.add_node(station(n, rng, &["SO5KM-1"])));
+    }
+    for (i, &a) in nodes.iter().enumerate() {
+        for &b in &nodes[i + 1..] {
+            sim.link(a, b, Loss::afsk_1200(snr_db));
+        }
+    }
+    if csma {
+        for &n in &nodes {
+            sim.set_csma(n, 0, Some(Csma::DEFAULT));
+        }
+    }
+    let mut g = hm_core::DetRng::from_seed(seed ^ 0xB05);
+    for (i, &n) in nodes[1..].iter().enumerate() {
+        sim.command_at(
+            Millis(g.below(5_000)),
+            n,
+            Command::Send {
+                to: call("SO5KM-1"),
+                object: object(1500, seed * 100 + i as u64),
+                precedence: 0,
+            },
+        );
+    }
+    sim.run_until(Millis::from_secs(3600));
+    let got: Vec<Millis> = sim
+        .events()
+        .iter()
+        .filter(|(_, n, e)| *n != hub && matches!(e, Event::Delivered { .. }))
+        .map(|(t, _, _)| *t)
+        .collect();
+    Busy {
+        delivered: got.len(),
+        last: got.iter().max().copied(),
+        collisions: sim.report().total().lost_collision,
+    }
+}
+
+/// Stations that hear each other share one channel: with carrier sense they
+/// mostly take turns. What collides still is two stations keying up within
+/// the carrier-detect delay of each other.
+#[test]
+fn busy_channel_with_and_without_csma() {
+    let (senders, runs) = (4, 20);
+    let mut line = Vec::new();
+    let mut coll = [0u64; 2];
+    let mut p50 = [0u64; 2];
+    for (k, csma) in [false, true].into_iter().enumerate() {
+        let mut last = Vec::new();
+        for seed in 0..runs {
+            let b = busy_channel(seed, senders, 9.0, csma);
+            assert_eq!(b.delivered, senders, "seed {seed}, csma {csma}");
+            last.push(b.last.unwrap().0);
+            coll[k] += b.collisions;
+        }
+        let p = Percentiles::of(&last).unwrap();
+        p50[k] = p.p50;
+        line.push(format!(
+            "{}: all delivered in {runs}/{runs}, last p50 {:.0} s max {:.0} s, {:.1} frames collided per run",
+            if csma { "CSMA" } else { "no CSMA" },
+            p.p50 as f64 / 1e3,
+            p.max as f64 / 1e3,
+            coll[k] as f64 / runs as f64
+        ));
+    }
+    eprintln!(
+        "{senders} stations to one hub at 9 dB, 1.5 kB each:\n  {}",
+        line.join("\n  ")
+    );
+    assert!(
+        coll[1] * 2 < coll[0],
+        "carrier sense should halve collisions: {coll:?}"
+    );
+    assert!(p50[1] * 3 < p50[0] * 2, "and finish sooner: {p50:?}");
+}
+
+/// 2 kB over links at the SNRs where the built-in modem goes from marginal to
+/// clean, with its measured loss: short ACKs survive where long DATA frames do not.
+#[test]
+fn transfers_over_the_measured_modem() {
+    let n = trials().min(100);
+    let mut report = Vec::new();
+    for snr in [7.0, 8.0, 9.0] {
+        let (mut ok, mut lat) = (0u64, Vec::new());
+        for seed in 0..n {
+            let o = run(
+                seed,
+                2000,
+                Loss::afsk_1200(snr),
+                Loss::afsk_1200(snr),
+                0.0,
+                Millis::from_secs(3600),
+            );
+            assert!(o.received <= 1, "seed {seed}: duplicate delivery");
+            if o.received == 1 && o.delivered {
+                ok += 1;
+                lat.push(o.latency.unwrap().0);
+            }
+        }
+        let p = Percentiles::of(&lat).unwrap();
+        report.push(format!(
+            "{snr} dB: {ok}/{n} delivered, latency p50 {:.1} s p95 {:.1} s",
+            p.p50 as f64 / 1e3,
+            p.p95 as f64 / 1e3
+        ));
+        assert_eq!(ok, n, "{snr} dB");
+    }
+    eprintln!(
+        "2 kB over the AFSK 1200 modem's measured loss:\n  {}",
+        report.join("\n  ")
+    );
 }

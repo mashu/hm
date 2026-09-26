@@ -4,6 +4,9 @@ use hm_wire::{Ack, Callsign, Dest};
 
 type BeaconSim = Sim<Beacon, BeaconCmd, BeaconEvent>;
 
+/// 1200 bit/s with 300 ms TXDELAY and nothing else, for exact timings.
+const PLAIN: RadioParams = RadioParams::raw(1200, Millis(300));
+
 fn heard_by(sim: &BeaconSim, node: NodeId) -> Vec<(Millis, Port, u8, u32)> {
     sim.events()
         .iter()
@@ -59,7 +62,8 @@ fn same_seed_same_run() {
 /// Pins the whole simulator (RNG, airtime, collision and loss rules, event
 /// order) across platforms and Rust versions. If a deliberate change to the
 /// simulator moves this value, update it in the same commit and say why.
-/// Last change: ports and channels added to the trace (Phase 0, part 2).
+/// Last change: the network runs on `VHF_1200` with AX.25 overhead, bit
+/// stuffing and TXTAIL (Phase 1, sim framing).
 #[test]
 fn busy_network_trace_is_pinned() {
     let r = busy_network(1);
@@ -72,7 +76,7 @@ fn busy_network_trace_is_pinned() {
     );
 }
 
-const BUSY_TRACE: u64 = 0x21f7_ad0e_ad01_a58d;
+const BUSY_TRACE: u64 = 0x2869_a242_a9ea_1370;
 
 #[test]
 #[ignore]
@@ -85,12 +89,12 @@ fn print_busy_network_report() {
 
 #[test]
 fn airtime_and_delivery_time() {
-    let mut sim = BeaconSim::new(0, RadioParams::VHF_1200);
+    let mut sim = BeaconSim::new(0, PLAIN);
     let a = sim.add_node(Beacon::silent(1, 30));
     let b = sim.add_node(Beacon::silent(2, 30));
     sim.link(a, b, Loss::None);
     // 300 ms TXDELAY + 30 bytes * 8 / 1200 bit/s = 300 + 200 ms.
-    assert_eq!(RadioParams::VHF_1200.airtime(30), Millis(500));
+    assert_eq!(PLAIN.airtime(30), Millis(500));
     sim.command_at(Millis(1000), a, BeaconCmd::SendNow);
     sim.run_until(Millis::from_secs(5));
     assert_eq!(heard_by(&sim, b), vec![(Millis(1500), 0, 1, 0)]);
@@ -98,8 +102,162 @@ fn airtime_and_delivery_time() {
 }
 
 #[test]
+fn hdlc_framing_adds_overhead_stuffing_and_tail() {
+    let p = RadioParams::VHF_1200;
+    // 0x00 never stuffs; 0xFF stuffs after every fifth 1 bit.
+    assert_eq!(stuffed_bits(&[0x00; 50]), 0);
+    assert_eq!(stuffed_bits(&[0xFF; 5]), 8);
+    assert_eq!(stuffed_bits(&[0x1F, 0xF8]), 2); // a run of five at each end
+    assert_eq!(stuffed_bits(&[0xF0, 0x01]), 1); // four 1s, then the fifth in the next byte
+                                                // 30 bytes + 19 overhead = 392 bits = 326.7 ms, plus 300 ms TXDELAY and 14 ms TXTAIL.
+    assert_eq!(p.airtime_of(&[0; 30], true), Millis(300 + 14 + 327));
+    assert_eq!(p.airtime_of(&[0; 30], false), Millis(327));
+    // 30 bytes of 0xFF: 48 stuffed bits = 40 ms more.
+    assert_eq!(p.airtime_of(&[0xFF; 30], false), Millis(367));
+    assert_eq!(p.airtime(30), p.airtime_of(&[0; 30], true));
+
+    let mut sim = BeaconSim::new(0, p);
+    let a = sim.add_node(Beacon::silent(1, 10));
+    sim.command_at(Millis(0), a, BeaconCmd::SendRaw(0, vec![0xFF; 30]));
+    sim.command_at(Millis(0), a, BeaconCmd::SendRaw(0, vec![0x00; 30]));
+    sim.run_until(Millis::from_secs(5));
+    let air = sim.report().total().airtime;
+    assert_eq!(air.txdelay_us, 314_000, "TXDELAY and TXTAIL once per key-up");
+    // 19 bytes of link overhead each and 48 stuffed bits: 200 + 152 bits at
+    // 833.33 µs, rounded down per frame. No hm headers in these frames.
+    assert_eq!(air.link_us, 166_666 + 126_666);
+    assert_eq!(air.overhead_us, 0);
+    assert_eq!(air.unknown_us, 400_000);
+}
+
+#[test]
+fn measured_modem_loss_grows_with_frame_length() {
+    // Beacons of 20 and 300 bytes at 7 dB SNR, each to its own receiver so
+    // they never collide: the long one is lost far more often.
+    let mut sim = BeaconSim::new(4, RadioParams::VHF_1200);
+    let mut lost = Vec::new();
+    for (i, len) in [(1u8, 20usize), (2, 300)] {
+        let tx = sim.add_node(Beacon::periodic(
+            i,
+            len,
+            Millis::from_secs(10),
+            3_000,
+            DetRng::from_seed(i as u64),
+        ));
+        let rx = sim.add_node(Beacon::silent(10 + i, 10));
+        sim.link_one_way(tx, rx, Loss::afsk_1200(7.0));
+        lost.push((tx, rx, len));
+    }
+    sim.run_until(Millis::from_secs(20_000));
+    let share = |(tx, rx, _): (NodeId, NodeId, usize)| {
+        1.0 - heard_by(&sim, rx).len() as f64 / sim.report().nodes[tx].frames_sent as f64
+    };
+    let (short, long) = (share(lost[0]), share(lost[1]));
+    // On air: the frame plus 19 bytes of AX.25 framing.
+    let (want_short, want_long) = (afsk_1200::CURVE.loss(7.0, 39), afsk_1200::CURVE.loss(7.0, 319));
+    assert!(
+        (short - want_short).abs() < 0.03,
+        "short: {short} vs {want_short}"
+    );
+    assert!((long - want_long).abs() < 0.05, "long: {long} vs {want_long}");
+    assert!(long > 3.0 * short);
+}
+
+/// A sends a 300-byte frame (about 2.6 s); B, with CSMA, asks to send while
+/// A is on air. C hears both.
+fn csma_pair(b_asks_at: Millis, b_hears_a: bool) -> (BeaconSim, NodeId, NodeId, NodeId) {
+    let mut sim = BeaconSim::new(0, PLAIN);
+    let a = sim.add_node(Beacon::silent(1, 300));
+    let b = sim.add_node(Beacon::silent(2, 30));
+    let c = sim.add_node(Beacon::silent(3, 30));
+    if b_hears_a {
+        sim.link(a, b, Loss::None);
+    }
+    sim.link(a, c, Loss::None);
+    sim.link(b, c, Loss::None);
+    // Always key up on a clear slot, so the timing is exact.
+    let csma = Csma {
+        persist: 255,
+        ..Csma::DEFAULT
+    };
+    sim.set_csma(b, 0, Some(csma));
+    sim.command_at(Millis(1000), a, BeaconCmd::SendNow);
+    sim.command_at(b_asks_at, b, BeaconCmd::SendNow);
+    sim.command_at(b_asks_at, b, BeaconCmd::SendNow);
+    sim.run_until(Millis::from_secs(20));
+    (sim, a, b, c)
+}
+
+#[test]
+fn csma_waits_for_the_channel_and_sends_in_one_key_up() {
+    // A is on air from 1.0 s to 3.3 s (300 ms + 2000 ms). B asks at 1.5 s, hears
+    // the carrier, and tries each 100 ms slot: 1.5, 1.6, ... 3.3 is the first clear one.
+    let (sim, _, _, c) = csma_pair(Millis(1500), true);
+    let a_end = Millis(1000) + PLAIN.airtime(300);
+    assert_eq!(a_end, Millis(3300));
+    let t = PLAIN.airtime(30);
+    assert_eq!(
+        heard_by(&sim, c),
+        vec![
+            (a_end, 0, 1, 0),
+            // Both of B's frames in one key-up: only one TXDELAY.
+            (a_end + t, 0, 2, 0),
+            (a_end + t + PLAIN.airtime_keyed(30), 0, 2, 1),
+        ]
+    );
+    assert_eq!(sim.report().total().lost_collision, 0);
+}
+
+#[test]
+fn csma_does_not_hear_a_carrier_younger_than_the_detect_delay() {
+    // B asks 50 ms after A keyed up: no carrier detected yet, so B keys up and
+    // both frames are lost at C.
+    let (sim, _, _, c) = csma_pair(Millis(1050), true);
+    assert!(heard_by(&sim, c).is_empty());
+    assert_eq!(sim.report().total().lost_collision, 3);
+}
+
+#[test]
+fn csma_cannot_help_hidden_terminals() {
+    let (sim, _, _, c) = csma_pair(Millis(1500), false);
+    assert!(heard_by(&sim, c).is_empty());
+    assert_eq!(sim.report().total().lost_collision, 3);
+}
+
+#[test]
+fn csma_frames_waiting_are_dropped_when_the_station_goes_down() {
+    let mut sim = BeaconSim::new(0, PLAIN);
+    let a = sim.add_node(Beacon::silent(1, 300));
+    let b = sim.add_node(Beacon::silent(2, 30));
+    sim.link(a, b, Loss::None);
+    sim.set_csma(b, 0, Some(Csma::DEFAULT));
+    sim.command_at(Millis(0), a, BeaconCmd::SendNow);
+    sim.command_at(Millis(500), b, BeaconCmd::SendNow);
+    sim.set_up_at(Millis(1000), b, false);
+    sim.set_up_at(Millis(1100), b, true);
+    sim.run_until(Millis::from_secs(20));
+    assert_eq!(sim.report().nodes[b].frames_sent, 0);
+}
+
+#[test]
+fn csma_switched_off_while_waiting_sends_at_once() {
+    let mut sim = BeaconSim::new(0, PLAIN);
+    let a = sim.add_node(Beacon::silent(1, 300));
+    let b = sim.add_node(Beacon::silent(2, 30));
+    sim.link(a, b, Loss::None);
+    sim.set_csma(b, 0, Some(Csma::DEFAULT));
+    sim.command_at(Millis(0), a, BeaconCmd::SendNow);
+    sim.command_at(Millis(500), b, BeaconCmd::SendNow);
+    sim.run_until(Millis(1000));
+    assert_eq!(sim.report().nodes[b].frames_sent, 0, "waiting for A to finish");
+    sim.set_csma(b, 0, None);
+    sim.run_until(Millis(1200));
+    assert_eq!(sim.report().nodes[b].frames_sent, 1);
+}
+
+#[test]
 fn back_to_back_frames_queue_on_the_radio() {
-    let mut sim = BeaconSim::new(0, RadioParams::VHF_1200);
+    let mut sim = BeaconSim::new(0, PLAIN);
     let a = sim.add_node(Beacon::silent(1, 30));
     let b = sim.add_node(Beacon::silent(2, 30));
     sim.link(a, b, Loss::None);
@@ -121,7 +279,7 @@ fn back_to_back_frames_queue_on_the_radio() {
 
 #[test]
 fn hidden_terminals_collide_at_the_middle_station() {
-    let mut sim = BeaconSim::new(0, RadioParams::VHF_1200);
+    let mut sim = BeaconSim::new(0, PLAIN);
     let a = sim.add_node(Beacon::silent(1, 30));
     let b = sim.add_node(Beacon::silent(2, 30));
     let c = sim.add_node(Beacon::silent(3, 30));
@@ -141,7 +299,7 @@ fn hidden_terminals_collide_at_the_middle_station() {
 
 #[test]
 fn half_duplex_stations_miss_each_other() {
-    let mut sim = BeaconSim::new(0, RadioParams::VHF_1200);
+    let mut sim = BeaconSim::new(0, PLAIN);
     let a = sim.add_node(Beacon::silent(1, 30));
     let b = sim.add_node(Beacon::silent(2, 30));
     sim.link(a, b, Loss::None);
@@ -154,12 +312,8 @@ fn half_duplex_stations_miss_each_other() {
 
 #[test]
 fn channels_are_isolated_and_radios_independent() {
-    let mut sim = BeaconSim::new(0, RadioParams::VHF_1200);
-    let hf = sim.add_channel(RadioParams {
-        bitrate_bps: 600,
-        txdelay: Millis(100),
-        phy_overhead_bytes: 0,
-    });
+    let mut sim = BeaconSim::new(0, PLAIN);
+    let hf = sim.add_channel(RadioParams::raw(600, Millis(100)));
     let node = sim.add_node_on(
         Beacon::silent(1, 30).on_ports(&[0, 1]),
         &[(0, ChannelId(0)), (1, hf)],
@@ -216,7 +370,7 @@ fn clock_inverse_is_exact() {
 
 #[test]
 fn drifting_clocks_shift_timers() {
-    let mut sim = BeaconSim::new(0, RadioParams::VHF_1200);
+    let mut sim = BeaconSim::new(0, PLAIN);
     let fast = sim.add_node(Beacon::periodic(1, 10, Millis(1000), 0, DetRng::from_seed(1)));
     let slow = sim.add_node(Beacon::periodic(2, 10, Millis(1000), 0, DetRng::from_seed(1)));
     sim.set_clock(
@@ -241,7 +395,7 @@ fn drifting_clocks_shift_timers() {
 
 #[test]
 fn clock_offset_delays_first_deadline() {
-    let mut sim = BeaconSim::new(0, RadioParams::VHF_1200);
+    let mut sim = BeaconSim::new(0, PLAIN);
     let a = sim.add_node(Beacon::periodic(1, 10, Millis(5000), 0, DetRng::from_seed(1)));
     let b = sim.add_node(Beacon::silent(2, 10));
     sim.link(a, b, Loss::None);
@@ -254,13 +408,13 @@ fn clock_offset_delays_first_deadline() {
         },
     );
     sim.run_until(Millis(4000));
-    let t = RadioParams::VHF_1200.airtime(10);
+    let t = PLAIN.airtime(10);
     assert_eq!(heard_by(&sim, b), vec![(Millis(2000) + t, 0, 1, 0)]);
 }
 
 #[test]
 fn corrupted_frames_are_delivered_with_bit_errors() {
-    let mut sim = BeaconSim::new(3, RadioParams::VHF_1200);
+    let mut sim = BeaconSim::new(3, PLAIN);
     let a = sim.add_node(Beacon::silent(1, 40));
     let b = sim.add_node(Beacon::silent(2, 40));
     sim.link(a, b, Loss::None);
@@ -291,7 +445,7 @@ fn corrupted_frames_are_delivered_with_bit_errors() {
 
 #[test]
 fn partitions_cut_links_until_healed() {
-    let mut sim = BeaconSim::new(0, RadioParams::VHF_1200);
+    let mut sim = BeaconSim::new(0, PLAIN);
     let a = sim.add_node(Beacon::periodic(1, 10, Millis(1000), 0, DetRng::from_seed(1)));
     let b = sim.add_node(Beacon::silent(2, 10));
     let c = sim.add_node(Beacon::silent(3, 10));
@@ -315,14 +469,7 @@ fn hourly_loss_models_band_openings() {
     for h in open_afternoons.iter_mut().skip(12) {
         *h = 0.0;
     }
-    let mut sim = BeaconSim::new(
-        0,
-        RadioParams {
-            bitrate_bps: 300,
-            txdelay: Millis(50),
-            phy_overhead_bytes: 0,
-        },
-    );
+    let mut sim = BeaconSim::new(0, RadioParams::raw(300, Millis(50)));
     let a = sim.add_node(Beacon::periodic(
         1,
         10,
@@ -344,7 +491,7 @@ fn hourly_loss_models_band_openings() {
 
 #[test]
 fn airtime_is_split_by_purpose() {
-    let mut sim = BeaconSim::new(0, RadioParams::VHF_1200);
+    let mut sim = BeaconSim::new(0, PLAIN);
     let a = sim.add_node(Beacon::silent(1, 10));
     let h = FrameHeader {
         ftype: FrameType::Data,
@@ -382,14 +529,7 @@ fn airtime_is_split_by_purpose() {
 #[test]
 fn gilbert_elliott_matches_theory_and_is_bursty() {
     let (p_gb, p_bg, lg, lb) = (0.05, 0.25, 0.01, 0.8);
-    let mut sim = BeaconSim::new(
-        9,
-        RadioParams {
-            bitrate_bps: 9600,
-            txdelay: Millis(10),
-            phy_overhead_bytes: 0,
-        },
-    );
+    let mut sim = BeaconSim::new(9, RadioParams::raw(9600, Millis(10)));
     let a = sim.add_node(Beacon::periodic(1, 10, Millis(100), 0, DetRng::from_seed(1)));
     let b = sim.add_node(Beacon::silent(2, 10));
     sim.link_one_way(
@@ -425,7 +565,7 @@ fn gilbert_elliott_matches_theory_and_is_bursty() {
 
 #[test]
 fn stations_that_are_down_hear_nothing() {
-    let mut sim = BeaconSim::new(0, RadioParams::VHF_1200);
+    let mut sim = BeaconSim::new(0, PLAIN);
     let a = sim.add_node(Beacon::periodic(
         1,
         20,
@@ -457,7 +597,7 @@ fn machines_that_never_advance_their_deadline_are_caught() {
             Some(Millis::ZERO)
         }
     }
-    let mut sim: Sim<Stuck, BeaconCmd, BeaconEvent> = Sim::new(0, RadioParams::VHF_1200);
+    let mut sim: Sim<Stuck, BeaconCmd, BeaconEvent> = Sim::new(0, PLAIN);
     sim.add_node(Stuck);
     sim.run_until(Millis(1));
 }
@@ -465,7 +605,7 @@ fn machines_that_never_advance_their_deadline_are_caught() {
 #[test]
 #[should_panic(expected = "has no radio")]
 fn transmitting_on_a_missing_port_is_a_setup_error() {
-    let mut sim = BeaconSim::new(0, RadioParams::VHF_1200);
+    let mut sim = BeaconSim::new(0, PLAIN);
     let a = sim.add_node(Beacon::silent(1, 10));
     sim.command_at(Millis(0), a, BeaconCmd::SendRaw(7, vec![1, 2, 3]));
     sim.run_until(Millis(1));

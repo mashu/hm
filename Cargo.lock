@@ -772,8 +772,11 @@ dependencies = [
 name = "hm-sim"
 version = "0.1.0"
 dependencies = [
+ "hm-bearer",
  "hm-core",
+ "hm-modem-afsk",
  "hm-wire",
+ "libm",
 ]
 
 [[package]]

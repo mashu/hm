@@ -127,6 +127,12 @@ pub struct Config {
     /// Link bitrate and key-up delay, used to predict when overs end.
     pub bitrate_bps: u32,
     pub txdelay: Millis,
+    /// Bytes the link adds to every frame on air: 19 for an AX.25 UI frame
+    /// (16-byte header, 2-byte frame check, closing flag).
+    pub frame_overhead_bytes: u16,
+    /// Allowance for HDLC bit stuffing, per mille of the frame's bits (random
+    /// data stuffs about 16; 0 on links without stuffing).
+    pub stuffing_permille: u16,
     /// Most DATA frames in one over.
     pub max_burst: u8,
     /// Frame loss assumed at least, per mille, when sizing bursts.
@@ -160,6 +166,8 @@ impl Config {
             symbol_size: 200,
             bitrate_bps: 1200,
             txdelay: Millis(300),
+            frame_overhead_bytes: 19,
+            stuffing_permille: 20,
             max_burst: 16,
             redundancy_permille: 20,
             max_rounds: 12,
@@ -181,6 +189,9 @@ impl Config {
         if self.bitrate_bps == 0 || self.max_burst == 0 || self.max_rounds == 0 {
             return Err("bitrate, max_burst and max_rounds must be positive");
         }
+        if self.stuffing_permille > 1000 {
+            return Err("stuffing allowance must be at most 1000 per mille");
+        }
         if self.duty_cycle_permille == 0 || self.duty_cycle_permille > 1000 {
             return Err("duty cycle must be 1..=1000 per mille");
         }
@@ -193,9 +204,12 @@ impl Config {
         Ok(())
     }
 
-    /// Airtime of `len` bytes with the transmitter already keyed.
-    fn air(&self, len: usize) -> Millis {
-        Millis((len as u64 * 8 * 1000).div_ceil(self.bitrate_bps as u64))
+    /// Airtime of `frames` frames of `len` bytes with the transmitter already
+    /// keyed, link overhead and bit stuffing included.
+    fn air(&self, frames: usize, len: usize) -> Millis {
+        let bits = frames as u64 * (len as u64 + self.frame_overhead_bytes as u64) * 8;
+        let bits = bits + (bits * self.stuffing_permille as u64).div_ceil(1000);
+        Millis((bits * 1000).div_ceil(self.bitrate_bps as u64))
     }
 
     fn data_frame_len(&self, symbol_size: usize) -> usize {
@@ -585,10 +599,10 @@ impl Xfer {
             burst_size(o.need, loss, cap)
         };
         let t = self.cfg.symbol_size as usize;
-        let frame_air = self.cfg.air(self.cfg.data_frame_len(t));
+        let frame_air = self.cfg.air(1, self.cfg.data_frame_len(t));
         let mut fixed = self.cfg.txdelay;
         if o.offer_next {
-            fixed += self.cfg.air(HEADER_LEN + hm_wire::OFFER_LEN);
+            fixed += self.cfg.air(1, HEADER_LEN + hm_wire::OFFER_LEN);
         }
         // An over never costs more than the bucket holds (but always carries a symbol).
         let n = if self.cfg.duty_cycle_permille < 1000 {
@@ -639,7 +653,7 @@ impl Xfer {
         self.tokens_ms -= cost.0 as i64;
 
         // The peer answers after our over: its guard, its key-up, a full ACK, our slack.
-        let ack_air = self.cfg.txdelay + self.cfg.air(HEADER_LEN + 7 + 8 + hm_wire::RECEIPT_LEN);
+        let ack_air = self.cfg.txdelay + self.cfg.air(1, HEADER_LEN + 7 + 8 + hm_wire::RECEIPT_LEN);
         let jitter = Millis(self.rng.below(self.cfg.ack_guard.0 + 1));
         let until = now + cost + self.cfg.ack_guard + ack_air + self.cfg.ack_guard + jitter;
         let o = self.active.as_mut().expect("checked");
@@ -730,7 +744,7 @@ impl Xfer {
 
     fn ack_at(&self, now: Millis, remaining: u8, symbol_size: usize) -> Millis {
         let remaining = remaining.min(MAX_REMAINING_TRUSTED) as usize;
-        now + self.cfg.air(remaining * self.cfg.data_frame_len(symbol_size)) + self.cfg.ack_guard
+        now + self.cfg.air(remaining, self.cfg.data_frame_len(symbol_size)) + self.cfg.ack_guard
     }
 
     /// We answer once every over we are hearing has ended, so an ACK never

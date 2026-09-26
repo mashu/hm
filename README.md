@@ -14,7 +14,7 @@ clear, identities signed.
 | `hm-wire` | Base-40 callsigns, 18-byte frame header, ACK payload, object ids |
 | `hm-ident` | Ed25519 identities, signed envelopes, callsign binding records, attestations |
 | `hm-bundle` | Messages: build, seal, open, verify; receipts; attachment references |
-| `hm-sim` | Discrete-event simulator: multiple channels and radios per station, airtime with keyed-PTT bursts, half-duplex, hidden-terminal collisions, Bernoulli / Gilbert–Elliott / hourly HF loss, outages, partitions, clock drift, corrupted frames, airtime split by purpose, delivery and latency metrics |
+| `hm-sim` | Discrete-event simulator: multiple channels and radios per station, airtime with keyed-PTT bursts and AX.25/HDLC framing checked against the modulator, half-duplex, p-persistent CSMA with a measured carrier-detect delay, hidden-terminal collisions, Bernoulli / Gilbert–Elliott / hourly HF loss or the built-in modem's measured loss by SNR and frame length, outages, partitions, clock drift, corrupted frames, airtime split by purpose, delivery and latency metrics |
 | `hm-bearer` | KISS framing (streaming decoder) and AX.25 UI encapsulation for Direwolf and hardware TNCs |
 | `hm-xfer` | Fountain-coded (RaptorQ) transfer engine: OFFER + symbol bursts, ACKs with the missing count, hash-verified delivery, signed delivery receipts, duplicate suppression, per-sender resource limits, loss-adaptive burst sizing, random exponential backoff, airtime budget |
 | `hm-store` | Persistent store on `redb` (pure Rust, crash-safe): content-addressed messages, inbox, outbox ordered by precedence, retries with exponential backoff, exactly-once across restarts |
@@ -25,7 +25,9 @@ clear, identities signed.
 
 Phase 1 still to do: an on-air test, IL2P framing and better decoding deep in noise for
 the built-in modem, stream modems (Mercury, ARDOP, VARA) as radio bearers, KISS over serial,
-CTRL session open/close, and the Dioxus interface with a setup wizard. Relaying mail through
+CTRL session open/close, the Dioxus interface with a setup wizard, and ACK timeouts that allow
+for time an over spends waiting for a busy channel (in the simulator, frames on a shared channel
+wait up to a minute, and senders probe again before their over has gone out). Relaying mail through
 other nodes is Phase 2.
 
 ## Run a station
@@ -130,12 +132,21 @@ TNC's key-up delay differs from 300 ms, set `--txdelay` to match.
 
 ## Measured (simulator, 1200 bd, 300 ms TXDELAY)
 
+The simulated channel sends frames as the built-in modem does: AX.25 UI header,
+frame check, flags and bit stuffing included (within 0.02% of the modulator's
+airtime). SNR is measured in a 3 kHz bandwidth.
+
 | Scenario | Result | Reproduce |
 | --- | --- | --- |
-| 1 kB, 10% frame loss both ways, 10,000 trials | 100% delivered, 0 duplicates, every receipt verified; latency p50 8.1 s, p95 21.2 s | `HM_XFER_TRIALS=10000 cargo test -p hm-xfer --release --test sim exit_criterion_1kb -- --nocapture` |
-| 5 kB, clean link | headers and preambles 10.2%, OFFER and ACK with receipt 2.1%, TXDELAY 2.9%; 81.5% of airtime is useful payload | `cargo test -p hm-xfer --release --test sim exit_criterion_overhead -- --nocapture` |
+| 1 kB, 10% frame loss both ways, 10,000 trials | 100% delivered, 0 duplicates, every receipt verified; latency p50 9.0 s, p95 23.0 s | `HM_XFER_TRIALS=10000 cargo test -p hm-xfer --release --test sim exit_criterion_1kb -- --nocapture` |
+| 5 kB, clean link | hm headers and preambles 9.2%, OFFER and ACK with receipt 1.9%, TXDELAY and TXTAIL 2.8%; AX.25 framing and bit stuffing 9.5%; 73.7% of airtime is useful payload | `cargo test -p hm-xfer --release --test sim exit_criterion_overhead -- --nocapture` |
 | 2 kB, bursty loss (Gilbert–Elliott, ~12% mean) | 100/100 delivered | `cargo test -p hm-xfer --release --test sim bursty -- --nocapture` |
-| Two hidden senders to one node, no CSMA | 30/30 both delivered, last within 153 s | `cargo test -p hm-xfer --release --test sim two_senders -- --nocapture` |
+| Two hidden senders to one node, no CSMA | 30/30 both delivered, last within 193 s | `cargo test -p hm-xfer --release --test sim two_senders -- --nocapture` |
+| 2 kB over the modem's measured loss at 7 / 8 / 9 dB SNR | 100/100 delivered at each; latency p50 26.1 / 17.2 / 17.1 s | `cargo test -p hm-xfer --release --test sim measured_modem -- --nocapture` |
+| Four stations to one hub, 1.5 kB each, 9 dB, all hear each other | without CSMA: last delivery p50 294 s, 181 receptions lost to collisions per run; with CSMA: p50 112 s, 76 lost, all from stations keying up within the 125 ms carrier-detect delay of each other | `cargo test -p hm-xfer --release --test sim busy_channel -- --nocapture` |
+| Receiver never keys up during an over, 8 kB at 15% loss | 0 frames talked over in 40 runs | `cargo test -p hm-xfer --release --test sim nobody_talks -- --nocapture` |
+| Modem frame loss vs SNR, 48 kHz, white noise | 50% of 40-byte frames lost at 5.5 dB, 41% of 360-byte frames at 7 dB, none above 9.5 dB; table in `crates/hm-sim/src/afsk_1200.rs` | `HM_WRITE_CURVE=1 cargo test -p hm-sim --release --test afsk afsk_1200_curve -- --ignored` |
+| Modem carrier detect | 68–101 ms after key-up at 7–20 dB SNR | `cargo test -p hm-sim --release --test afsk carrier_detect -- --nocapture` |
 | Modem vs Direwolf 1.7, `gen_packets -n 100` at 11–48 kHz | 241 frames decoded vs 236 for Direwolf's better profile (102%) | `cargo test -p hm-modem-afsk --release --test modem -- --nocapture` (needs `direwolf` installed) |
 | Modem vs Direwolf 1.7, held out: tilt ±6 dB/octave, SNR down to −4 dB | 322 vs 335 (96%); behind Direwolf deep in the noise | same |
 | Modem interop | Direwolf decodes 50/50 of our frames, clean and at 12 dB SNR | same |
@@ -160,6 +171,7 @@ cargo install --path crates/hm-cli   # installs the `hm` command
 | --- | --- | --- | --- |
 | Test vectors | `cargo run -q -p hm-bundle --example vectors \| python3 tools/check_vectors.py` (needs `pip install blake3 pynacl cbor2`) | yes | |
 | Simulator vs independent oracle | `HM_SEEDS=10000 cargo test -p hm-sim --release --test oracle` | 100 seeds | 10,000 seeds |
+| Simulated channel vs the modem | airtime of AX.25 frames against the modulator's output; carrier-detect delay against the demodulator; the frame-loss table re-measured (`cargo test -p hm-sim --release --test afsk -- --include-ignored`) | airtime, carrier detect | loss table |
 | Decoder mutations (no panic, no forgery) | `HM_MUTATIONS=1000000 cargo test -p hm-bundle --release --test mutations` | 5,000 | 1,000,000 |
 | Coverage-guided fuzzing | `cd fuzz && cargo +nightly fuzz run <target>`; targets: frame, ack, envelope, bundle, binding, callsign, kiss, ax25, xfer | compile only | 10 min per target |
 | Cross-platform determinism | pinned trace hash of a reference simulation | Linux, Windows, macOS | |
@@ -170,7 +182,7 @@ cargo install --path crates/hm-cli   # installs the `hm` command
 
 The oracle test builds random two-channel networks with every fault type and
 replays the simulator's log through channel rules written independently of the
-simulator. The mutation test checks that any mutated message which still
+simulator, bit stuffing and carrier sense included. The mutation test checks that any mutated message which still
 verifies carries exactly the original signed bytes.
 
 ## Design rules
