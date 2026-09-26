@@ -21,10 +21,10 @@ clear, identities signed.
 | `hm-net` | Internet links: QUIC with mutual TLS 1.3 on Ed25519 station keys (only trusted stations connect), automatic redial, one stream per bundle with a signed receipt |
 | `hm-modem-afsk` | Our own AFSK 1200 modem (Bell 202), pure Rust and `no_std`: HDLC framing and CRC, multi-slicer demodulator with per-tone AGC and PLL clock recovery, carrier detect |
 | `hm-rig` | Radio hardware: sound cards through `cpal` (ALSA, CoreAudio, WASAPI); PTT by rigctld (Hamlib CAT), serial RTS/DTR, CM108 GPIO (AIOC, Digirig) or VOX; a virtual radio channel for tests |
-| `hm-cli` | The `hm` command: `node` (the station daemon: radio and/or internet links, web interface, JSON API with access token), `keygen`, `whoami`, `send`, `listen`; a KISS-over-TCP link and a real-time driver |
+| `hm-cli` | The `hm` command: `node` (the station daemon: radio and/or internet links, web interface, JSON API with access token), `keygen`, `whoami`, `send`, `listen`; KISS links over TCP or a serial port, and a real-time driver |
 
 Phase 1 still to do: an on-air test, IL2P framing and better decoding deep in noise for
-the built-in modem, stream modems (Mercury, ARDOP, VARA) as radio bearers, KISS over serial,
+the built-in modem, stream modems (Mercury, ARDOP, VARA) as radio bearers,
 CTRL session open/close, and the Dioxus interface with a setup wizard. Relaying mail through
 other nodes is Phase 2.
 
@@ -40,6 +40,12 @@ the sent log with each message's delivery state, and a form to queue messages. T
 is also kept beside the store (`station.token`); the page asks for it if you open the
 plain address. The node keeps every message in `station.db` and retries undelivered mail
 with growing delays (1 minute doubling to an hour, 12 attempts).
+
+Every 10 minutes (`--beacon-minutes`, 0 for none) the node sends a signed beacon on the
+radio: its callsign and key, whether it has internet links, and the stations it has heard in
+the last hour. The status page lists every station heard, and for those that beacon whether
+their key matches your trust file. A beacon never adds a key to the trust file; a key that
+differs from the listed one is logged as a warning.
 
 ### The built-in modem
 
@@ -85,7 +91,7 @@ the queue; passing mail on through other nodes comes in Phase 2.
 
 | Method | Path | |
 | --- | --- | --- |
-| GET | `/api/status` | callsign, key, radio and internet state, estimated delivery rate per station and link |
+| GET | `/api/status` | callsign, key, radio and internet state, estimated delivery rate per station and link, stations heard on the radio with their beacons |
 | GET | `/api/messages?direction=in\|out&limit=n` | newest first, with delivery state and link |
 | POST | `/api/send` | `{"to", "text", "subject"?, "precedence"?}` → `201 {"id"}` |
 | POST | `/api/read/{id}` | mark an inbound message read |
@@ -128,6 +134,21 @@ transmission carries your station identification, and Direwolf's own CSMA (`PERS
 plus SSID 0–15. If transfers time out on a slow or busy channel, raise `--guard`; if your
 TNC's key-up delay differs from 300 ms, set `--txdelay` to match.
 
+## A hardware TNC on a serial port
+
+`--kiss` also takes a serial port, for TNCs such as a NinoTNC, Mobilinkd, TNC-Pi or a
+TNC-2 in KISS mode:
+
+```sh
+hm node --trust trusted.txt --kiss serial:/dev/ttyUSB0:57600
+hm send --kiss /dev/ttyACM0 --to SO5KM-1 --text "via a hardware TNC"   # 9600 Bd
+hm listen --kiss COM3 --trust trusted.txt                              # Windows
+```
+
+A hardware TNC keys the radio and waits for a clear channel itself, so on opening the port
+`hm` sends it the key-up delay, persistence and slot time (`--txdelay`, `--persist`,
+`--slottime`) as KISS parameters. The TNC must already be in KISS mode.
+
 ## Measured (simulator, 1200 bd, 300 ms TXDELAY)
 
 The simulated channel sends frames as the built-in modem does: AX.25 UI header,
@@ -165,15 +186,20 @@ cargo install --path crates/hm-cli   # installs the `hm` command
 
 ## Verification
 
-| What | How | Every push | Nightly |
+Windows and macOS are slow on CI, so the tests run there only for a release tag
+(`git tag v0.1.0 && git push origin v0.1.0`) or when the ci workflow is run by hand
+(Actions > ci > Run workflow); everything else runs on Linux.
+
+| What | How | Every pull request and push to main (Linux) | Nightly |
 | --- | --- | --- | --- |
 | Test vectors | `cargo run -q -p hm-bundle --example vectors \| python3 tools/check_vectors.py` (needs `pip install blake3 pynacl cbor2`) | yes | |
 | Simulator vs independent oracle | `HM_SEEDS=10000 cargo test -p hm-sim --release --test oracle` | 100 seeds | 10,000 seeds |
 | Simulated channel vs the modem | airtime of AX.25 frames against the modulator's output; carrier-detect delay against the demodulator; the frame-loss table re-measured (`cargo test -p hm-sim --release --test afsk -- --include-ignored`) | airtime, carrier detect | loss table |
 | Decoder mutations (no panic, no forgery) | `HM_MUTATIONS=1000000 cargo test -p hm-bundle --release --test mutations` | 5,000 | 1,000,000 |
-| Coverage-guided fuzzing | `cd fuzz && cargo +nightly fuzz run <target>`; targets: frame, ack, envelope, bundle, binding, callsign, kiss, ax25, xfer | compile only | 10 min per target |
-| Cross-platform determinism | pinned trace hash of a reference simulation | Linux, Windows, macOS | |
+| Coverage-guided fuzzing | `cd fuzz && cargo +nightly fuzz run <target>`; targets: frame, ack, envelope, bundle, binding, callsign, kiss, ax25, xfer, beacon | compile only | 10 min per target |
+| Cross-platform determinism | pinned trace hash of a reference simulation | Linux; Windows and macOS on release tags | |
 | End to end over TCP | fake KISS TNC relaying frames (with drops and APRS noise) between `hm listen` and `hm send` processes | yes | |
+| KISS over serial | pseudo-terminals as serial TNCs: channel-access parameters on opening, frames both ways, the port released on close, `hm send` and `hm listen` delivering through two serial TNCs | Linux; macOS on release tags | |
 | Built-in modem link | stations on a virtual radio channel in real time: carrier sense defers to a busy channel, PTT only around transmissions, one key-up per burst, two nodes exchanging mail | yes | |
 | Internet links | QUIC stations on localhost: delivery with verified receipts, rejection, impostors and wrong server keys refused, redial after restart | yes | |
 | Station nodes | `hm node` instances driven only through the HTTP API: radio delivery, restart, store-and-forward, internet-only nodes, radio failing over to the internet | yes | |

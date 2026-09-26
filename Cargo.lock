@@ -720,6 +720,7 @@ dependencies = [
  "hm-xfer",
  "serde",
  "serde_json",
+ "serialport",
  "tokio",
 ]
 

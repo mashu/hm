@@ -1,6 +1,6 @@
 //! Runtime pieces for a real radio behind a KISS TNC (Direwolf, NinoTNC, ...).
 //!
-//! - [`kiss_tcp`]: a KISS-over-TCP link carrying hm frames inside AX.25 UI frames.
+//! - [`kiss_link`]: a KISS TNC over TCP or a serial port, carrying hm frames inside AX.25 UI frames.
 //! - [`sound_link`]: the built-in modem on a sound card, with PTT and CSMA.
 //! - [`driver`]: runs any sans-IO [`hm_core::Machine`] in real time over a link.
 //! - [`files`]: station key files and trust files.
@@ -13,7 +13,7 @@
 pub mod driver;
 pub mod files;
 pub mod hex;
-pub mod kiss_tcp;
+pub mod kiss_link;
 pub mod node;
 pub mod sound_link;
 pub mod station;

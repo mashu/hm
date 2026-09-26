@@ -40,6 +40,8 @@ use hm_wire::{
 };
 use raptorq::{Decoder, EncodingPacket, ObjectTransmissionInformation, PayloadId, SourceBlockEncoder};
 
+pub mod beacon;
+
 /// BLAKE3 `derive_key` context for the object hash carried in OFFER.
 pub const HASH_CONTEXT: &str = "hm-net 2026-09 xfer v0";
 /// RaptorQ symbol alignment; symbol sizes must be multiples of it.

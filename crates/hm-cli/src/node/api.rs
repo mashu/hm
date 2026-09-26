@@ -111,6 +111,25 @@ struct StatusView {
     internet_listen: Option<String>,
     internet_peers: Vec<String>,
     estimates: Vec<Estimate>,
+    /// Stations heard on the radio lately, most recent first.
+    heard: Vec<HeardView>,
+}
+
+/// A station heard on the radio. `key` and the other beacon fields are
+/// `null` until a beacon from it has been heard.
+#[derive(Serialize)]
+struct HeardView {
+    station: String,
+    /// Seconds since any frame from it was heard.
+    ago: u64,
+    /// "trusted", "unknown" or "mismatch": its beacon's key against the trust file.
+    key: Option<&'static str>,
+    offers: Option<Vec<&'static str>>,
+    beacon_ago: Option<u64>,
+    /// Its clock minus ours, seconds.
+    clock_offset: Option<i64>,
+    /// Stations its beacon says it has heard.
+    hears: Option<Vec<String>>,
 }
 
 async fn status(State(s): State<AppState>) -> Json<StatusView> {
@@ -132,6 +151,24 @@ async fn status(State(s): State<AppState>) -> Json<StatusView> {
                 success: (p * 1000.0).round() / 1000.0,
             })
             .collect(),
+        heard: {
+            let now = unix_now();
+            st.heard
+                .iter()
+                .map(|h| {
+                    let b = h.beacon.as_ref();
+                    HeardView {
+                        station: h.call.to_string(),
+                        ago: now.saturating_sub(h.last),
+                        key: b.map(|b| b.key.as_str()),
+                        offers: b.map(|b| b.offers()),
+                        beacon_ago: b.map(|b| now.saturating_sub(b.at)),
+                        clock_offset: b.map(|b| b.clock_offset),
+                        hears: b.map(|b| b.heard.iter().map(|x| x.call.to_string()).collect()),
+                    }
+                })
+                .collect()
+        },
     })
 }
 

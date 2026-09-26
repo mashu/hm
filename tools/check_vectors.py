@@ -144,6 +144,19 @@ def check(text: str) -> None:
     receiver.verify(statement, receipt)
     print("ok  receipt ACK (signature by the receiver)")
 
+    # Beacon: broadcast, session and index 0, flags, key, time, heard list,
+    # and a signature over "hm/beacon-sig/v0" || source callsign || body.
+    s_b = section(text, "## Beacon")
+    b = bytes.fromhex(re.search(r"beacon ([0-9a-f]+)", s_b).group(1))
+    assert b[0] == 0x04 and unpack(b[1:7]) == "SA0KAM-10" and b[7:13] == b"\xff" * 6
+    assert b[13:18] == bytes(5), "session and index 0"
+    p = b[18:]
+    assert p[0] == 0x01 and p[1:33] == me.encode(), "flags and key"
+    assert int.from_bytes(p[33:37], "big") == 1_790_000_000 and p[37] == 1
+    assert unpack(p[38:44]) == "SO5KM-1" and p[44] == 3 and len(p) == 38 + 7 + 64
+    me.verify(b"hm/beacon-sig/v0" + b[1:7] + p[:45], p[45:])
+    print("ok  beacon (layout, signature)")
+
 
 if __name__ == "__main__":
     check(sys.stdin.read())

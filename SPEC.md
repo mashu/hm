@@ -52,7 +52,7 @@ callsign is always in clear.
 | 1 | ACK | section 3 |
 | 2 | SYNC | set reconciliation (defined in Phase 2) |
 | 3 | CTRL | first byte is the message type: 0x01 OFFER (section 7); others reserved |
-| 4 | BEACON | presence and identification (defined later in Phase 1) |
+| 4 | BEACON | presence and identification (section 8) |
 
 Receivers drop frames with an unknown version or type.
 
@@ -225,7 +225,32 @@ and per sender (8 and 2 by default). When full, evict the least valuable
 transfer: not finished before finished, no OFFER before OFFER seen, then fewest
 symbols, then least recently heard.
 
-## 8. KISS and AX.25 encapsulation
+## 8. Beacons
+
+A station announces itself with a BEACON frame: destination broadcast, session
+and index 0 (receivers ignore both). Payload, 102 + 7n bytes:
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 1 | flags: 0x01 mailbox (holds mail for other stations), 0x02 relay (passes mail on, Phase 2), 0x04 internet (has internet links); other bits 0 |
+| 1 | 32 | the station's Ed25519 key |
+| 33 | 4 | Unix time in seconds when sent |
+| 37 | 1 | n, stations heard (at most 16) |
+| 38 | 7n | per station heard: callsign (6), minutes since last heard (1; 255 = 255 or more) |
+| 38 + 7n | 64 | signature by the key over `"hm/beacon-sig/v0" \|\| header source callsign (6) \|\| bytes 0 to 37 + 7n` |
+
+Rules:
+
+- Drop a beacon whose signature does not verify with the key it carries. One that
+  verifies proves only that its sender holds that key.
+- Never learn a key from a beacon. Compare it with the trust file instead: the
+  listed key (trusted), no key for the station (unknown), or another key
+  (mismatch: an impostor, or a station with a new key; worth a warning).
+- Recommended: beacon every 10 minutes with ±10% jitter, the first one at a random
+  moment 5 to 30 s after the radio comes up; list stations heard in the last hour,
+  most recent first.
+
+## 9. KISS and AX.25 encapsulation
 
 KISS TNCs (Direwolf, NinoTNC, radios with a built-in TNC) carry AX.25 frames.
 On that path every hm frame is the information field of an AX.25 UI frame:
@@ -246,7 +271,7 @@ destination or PID.
 KISS framing is standard: FEND 0xC0, FESC 0xDB, TFEND 0xDC, TFESC 0xDD. The type
 byte holds the TNC port in its high nibble and command 0 (data).
 
-## 9. Internet links
+## 10. Internet links
 
 Stations may also link over the internet. A link is a QUIC connection (RFC 9000)
 with TLS 1.3, ALPN `hm-net/1`, and mutual authentication by station key:
@@ -277,7 +302,7 @@ A receiver accepts only bundles addressed to its callsign whose signatures do
 not fail against its trust file. Delivery therefore means the same on every
 link: the receiver signed for exactly these bytes.
 
-## 10. Forward compatibility
+## 11. Forward compatibility
 
 - Unknown map keys are ignored when decoding.
 - Unknown `kind`, `prec` and `codec` values decode as "other" and are kept.
@@ -285,7 +310,7 @@ link: the receiver signed for exactly these bytes.
 - Because ids and signatures cover raw bytes, older nodes route and verify bundles
   written by newer software.
 
-## 11. Test vectors
+## 12. Test vectors
 
 Generated with `cargo run -p hm-bundle --example vectors`, verified by
 `tools/check_vectors.py` (reference BLAKE3, libsodium, cbor2).
@@ -330,10 +355,13 @@ data  0000004f8af6fb001b97cbd86bf2b400000000007700825832a70000014600004f8af6fb02
 ## Receipt ACK from SO5KM-1 (secret 0x0c x 32) for that transfer
 public key 0b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e39f2d
 ack   01001b97cbd86b00004f8af6fbf2b4000000000080ff00000126a90b587084a21311b09926955fc1657ddf7c42bcd35089e157a8f522ae8b7fdef4005e57dfc38369d6f4e7ee8c50ba3f1b1fb1659e1139f6b4bc0d8783a6ea8ed55498b5025204
+
+## Beacon from SA0KAM-10 (secret 0x0b x 32, mailbox, heard SO5KM-1 3 min ago)
+beacon 04a53e713ef6fbffffffffffff00000000000166be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a6ab13b8001001b97cbd86b034060a211fb2a7a54a688a72c170c26005d25d1f2bcb17ec6c80dc371411e9637d02badd8c9026a2c7c804b3102f2c4dc65f8a450ba6d938f2059cbbdc4440301
 ```
 
-## 12. Not yet specified
+## 13. Not yet specified
 
-CTRL session open/close with feature bits and BEACON payloads (later in Phase 1);
+CTRL session open/close with feature bits (later in Phase 1);
 SYNC reconciliation messages and the node directory (Phase 2); body compression
 dictionaries (codec 1, reserved).

@@ -5,6 +5,7 @@
 //! hm whoami
 //! hm listen --kiss 127.0.0.1:8001 --trust trusted.txt
 //! hm send --kiss 127.0.0.1:8001 --to SO5KM-1 --text "73 de SA0KAM"
+//! hm send --kiss serial:/dev/ttyUSB0:57600 --to SO5KM-1 --text "via a hardware TNC"
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -15,7 +16,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use hm_bundle::Precedence;
 use hm_cli::driver::Flow;
 use hm_cli::files::{KeyFile, Trust};
-use hm_cli::kiss_tcp::KissLink;
+use hm_cli::kiss_link::{KissLink, KissTarget, TncParams};
 use hm_cli::station::{self, LinkTiming, SendOutcome, Station, Verification};
 use hm_wire::Callsign;
 use hm_xfer::Receipt;
@@ -93,6 +94,10 @@ enum Cmd {
         /// Relative cost of a delivery attempt over the internet.
         #[arg(long, default_value_t = 2.0)]
         internet_cost: f64,
+        /// Send a signed BEACON (presence and identification) about this often
+        /// on the radio, in minutes; 0 sends none.
+        #[arg(long, default_value_t = 10)]
+        beacon_minutes: u64,
     },
     /// List the sound cards the built-in modem can use.
     AudioDevices,
@@ -114,7 +119,9 @@ struct StationArgs {
     /// SSID to operate as (0-15); the key file holds the base call.
     #[arg(long, default_value_t = 0)]
     ssid: u8,
-    /// KISS TCP server, e.g. Direwolf's KISSPORT.
+    /// KISS TNC: a TCP server such as Direwolf's KISSPORT (`HOST:PORT`), or a
+    /// hardware TNC on a serial port (`serial:DEVICE[:BAUD]`, or just `/dev/ttyUSB0`
+    /// or `COM3` at 9600 Bd).
     #[arg(long, default_value = "127.0.0.1:8001")]
     kiss: String,
     /// TNC port (Direwolf channel) to use.
@@ -128,16 +135,17 @@ struct StationArgs {
     /// `rts:DEVICE`, `dtr:DEVICE` or `cm108:HIDRAW[:GPIO]`.
     #[arg(long, default_value = "vox")]
     ptt: String,
-    /// CSMA persistence with the built-in modem: transmit chance per clear slot is (p+1)/256.
+    /// CSMA persistence with the built-in modem or a serial TNC: transmit chance
+    /// per clear slot is (p+1)/256.
     #[arg(long, default_value_t = 63)]
     persist: u8,
-    /// CSMA slot time in milliseconds.
+    /// CSMA slot time in milliseconds (built-in modem or serial TNC).
     #[arg(long, default_value_t = 100)]
     slottime: u64,
     /// Link bitrate, for predicting when overs end.
     #[arg(long, default_value_t = 1200)]
     bitrate: u32,
-    /// TNC key-up delay in milliseconds.
+    /// Key-up delay in milliseconds; also sent to a serial TNC.
     #[arg(long, default_value_t = 300)]
     txdelay: u64,
     /// Extra slack around predicted over ends, in milliseconds.
@@ -153,6 +161,24 @@ impl StationArgs {
             guard_ms: self.guard,
             max_rounds: 12,
         }
+    }
+
+    fn kiss_target(&self) -> Result<KissTarget, String> {
+        KissTarget::parse(&self.kiss)
+    }
+
+    fn tnc_params(&self) -> TncParams {
+        TncParams {
+            txdelay_ms: self.txdelay as u32,
+            persist: self.persist,
+            slot_ms: self.slottime as u32,
+        }
+    }
+
+    fn open_kiss(&self, me: Callsign) -> Result<KissLink, String> {
+        let target = self.kiss_target()?;
+        KissLink::open(&target, me, self.tnc_port, self.tnc_params())
+            .map_err(|e| format!("{}: {e}", target.describe()))
     }
 
     fn open(&self) -> Result<(KeyFile, Callsign), String> {
@@ -227,7 +253,7 @@ fn send(
     let bundle =
         station::build_bundle(&key, me, to, text, subject, prec.into()).map_err(|e| e.to_string())?;
     let object = bundle.to_vec();
-    let mut link = KissLink::connect(&s.kiss, me, s.tnc_port).map_err(|e| format!("{}: {e}", s.kiss))?;
+    let mut link = s.open_kiss(me)?;
     eprintln!("{me} -> {to}: {} bytes, bundle {}", object.len(), bundle.id());
     let prec_u8 = Precedence::from(prec).to_u8();
     let st = Station {
@@ -265,10 +291,11 @@ fn send(
 fn listen(s: &StationArgs, trust: Option<&Path>) -> Result<(), String> {
     let (key, me) = s.open()?;
     let trust = load_trust(trust)?;
-    let mut link = KissLink::connect(&s.kiss, me, s.tnc_port).map_err(|e| format!("{}: {e}", s.kiss))?;
+    let mut link = s.open_kiss(me)?;
     eprintln!(
         "Listening as {me} on {} (TNC port {}). Ctrl-C to stop.",
-        s.kiss, s.tnc_port
+        s.kiss_target()?.describe(),
+        s.tnc_port
     );
     let st = Station {
         key: &key,
@@ -354,6 +381,7 @@ fn node(
     listen: Option<std::net::SocketAddr>,
     peers: &[String],
     costs: hm_cli::node::choose::Costs,
+    beacon_minutes: u64,
 ) -> Result<(), String> {
     let (key, me) = s.open()?;
     let trust = load_trust(trust)?;
@@ -365,13 +393,19 @@ fn node(
         listen: listen.unwrap_or_else(|| "0.0.0.0:0".parse().expect("valid")),
         peers,
     });
+    let kiss_target = match no_radio || s.audio.is_some() {
+        true => None,
+        false => Some(s.kiss_target()?),
+    };
     let radio = (!no_radio).then(|| {
-        let link = match &s.audio {
-            None => hm_cli::node::RadioLink::Kiss {
-                addr: s.kiss.clone(),
+        let link = match (&s.audio, kiss_target) {
+            (None, Some(target)) => hm_cli::node::RadioLink::Kiss {
+                target,
                 tnc_port: s.tnc_port,
+                params: s.tnc_params(),
             },
-            Some(device) => {
+            (None, None) => unreachable!("a KISS target is parsed whenever there is radio without --audio"),
+            (Some(device), _) => {
                 let (device, spec) = (device.clone(), s.ptt.clone());
                 let describe = format!("sound card {device}, PTT {spec}");
                 hm_cli::node::RadioLink::Modem {
@@ -393,6 +427,7 @@ fn node(
         hm_cli::node::RadioConfig {
             link,
             timing: s.timing(),
+            beacon_every: (beacon_minutes > 0).then(|| Duration::from_secs(60 * beacon_minutes)),
         }
     });
     if radio.is_none() && internet.is_none() {
@@ -467,6 +502,7 @@ fn main() -> ExitCode {
             peers,
             radio_cost,
             internet_cost,
+            beacon_minutes,
         } => node(
             station,
             trust.as_deref(),
@@ -479,6 +515,7 @@ fn main() -> ExitCode {
                 radio: *radio_cost,
                 internet: *internet_cost,
             },
+            *beacon_minutes,
         ),
     };
     match result {

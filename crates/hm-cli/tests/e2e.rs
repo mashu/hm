@@ -14,7 +14,7 @@ use hm_bearer::{ax25, kiss};
 use hm_bundle::Precedence;
 use hm_cli::driver::Flow;
 use hm_cli::files::{KeyFile, Trust};
-use hm_cli::kiss_tcp::KissLink;
+use hm_cli::kiss_link::KissLink;
 use hm_cli::station::{self, LinkTiming, Message, SendOutcome, Station, Verification};
 use hm_wire::Callsign;
 

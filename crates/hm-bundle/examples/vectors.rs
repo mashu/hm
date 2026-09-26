@@ -9,7 +9,8 @@ use hm_bearer::{ax25, kiss};
 use hm_bundle::{Address, Bundle, Kind, Precedence};
 use hm_core::{DetRng, Input, Machine, Millis, Output};
 use hm_ident::{Attestation, BindingRecord, Identity, BINDING, BUNDLE};
-use hm_wire::{Ack, Callsign, Dest, FrameHeader, FrameType};
+use hm_wire::{Ack, Callsign, Dest, FrameHeader, FrameType, Heard, FLAG_MAILBOX};
+use hm_xfer::beacon::beacon_frame;
 use hm_xfer::{object_id, Command, Config, Xfer};
 
 fn hex(b: &[u8]) -> String {
@@ -145,4 +146,18 @@ fn main() {
             println!("ack   {}", hex(&data));
         }
     }
+
+    println!("\n## Beacon from SA0KAM-10 (secret 0x0b x 32, mailbox, heard SO5KM-1 3 min ago)");
+    let beacon = beacon_frame(
+        &Identity::from_secret([11; 32]),
+        call("SA0KAM-10"),
+        FLAG_MAILBOX,
+        1_790_000_000,
+        vec![Heard {
+            call: call("SO5KM-1"),
+            minutes: 3,
+        }],
+    )
+    .unwrap();
+    println!("beacon {}", hex(&beacon));
 }
