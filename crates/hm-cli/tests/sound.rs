@@ -267,35 +267,31 @@ fn framed_link(ether: &Ether, me: &str, framing: Framing) -> SoundLink {
     SoundLink::start(call(me), audio(ether), ptt(&Recorder::default()), csma).unwrap()
 }
 
+fn hm_frame(i: u8) -> Vec<u8> {
+    hm_wire::FrameHeader {
+        ftype: hm_wire::FrameType::Data,
+        src: call("SA0KAM"),
+        dst: hm_wire::Dest::Station(call("SO5KM")),
+        session: 1,
+        index: i as u32,
+    }
+    .frame(&[i; 120])
+    .unwrap()
+}
+
 /// In heavy noise, frames sent in IL2P arrive where the same frames in AX.25
-/// are lost. `auto` picks IL2P only for a station that said it decodes it.
+/// are lost.
 #[test]
 fn il2p_gets_through_noise_that_stops_ax25() {
     let noise: f32 = std::env::var("HM_NOISE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.25);
-    let delivered = |framing: Framing, seed: u64, tell: bool| {
-        let ether = Ether::new(FS, noise, seed);
+    let delivered = |framing: Framing| {
+        let ether = Ether::new(FS, noise, 7);
         let mut a = framed_link(&ether, "SA0KAM", framing);
         let mut b = framed_link(&ether, "SO5KM", Framing::Ax25);
-        if tell {
-            a.peer_features(call("SO5KM"), a.features());
-        }
-        // hm-shaped frames to SO5KM: the header names the destination.
-        let frames: Vec<Vec<u8>> = (0..12u8)
-            .map(|i| {
-                hm_wire::FrameHeader {
-                    ftype: hm_wire::FrameType::Data,
-                    src: call("SA0KAM"),
-                    dst: hm_wire::Dest::Station(call("SO5KM")),
-                    session: 1,
-                    index: i as u32,
-                }
-                .frame(&[i; 120])
-                .unwrap()
-            })
-            .collect();
+        let frames: Vec<Vec<u8>> = (0..12).map(hm_frame).collect();
         for f in &frames {
             a.send(f).unwrap();
             thread::sleep(Duration::from_millis(1200));
@@ -303,11 +299,38 @@ fn il2p_gets_through_noise_that_stops_ax25() {
         let got = collect(&mut b, Duration::from_secs(3));
         frames.iter().filter(|f| got.contains(f)).count()
     };
-    let ax25 = delivered(Framing::Ax25, 7, false);
-    let il2p = delivered(Framing::Il2p, 7, false);
-    let auto_told = delivered(Framing::Auto, 7, true);
-    let auto_untold = delivered(Framing::Auto, 7, false);
-    eprintln!("noise {noise}: AX.25 {ax25}/12, IL2P {il2p}/12, auto (told) {auto_told}/12, auto (not told) {auto_untold}/12");
+    let (ax25, il2p) = (delivered(Framing::Ax25), delivered(Framing::Il2p));
+    eprintln!("noise {noise}: AX.25 {ax25}/12, IL2P {il2p}/12");
     assert!(il2p >= ax25 + 4, "IL2P {il2p} vs AX.25 {ax25}");
-    assert!(auto_told >= ax25 + 4 && auto_untold <= ax25 + 2);
+}
+
+/// `auto` sends IL2P to a station that said it decodes it, and AX.25 to others.
+#[test]
+fn auto_framing_follows_what_the_peer_decodes() {
+    let ether = Ether::new(FS, 0.0, 8);
+    let mut a = framed_link(&ether, "SA0KAM", Framing::Auto);
+    let mut tap = ether.port();
+    let mut demod = hm_modem_afsk::Demodulator::new(hm_modem_afsk::DemodulatorConfig::new(FS));
+    let mut listen = |until: Duration| {
+        let end = Instant::now() + until;
+        let (mut audio, mut frames) = (Vec::new(), Vec::new());
+        while Instant::now() < end {
+            audio.clear();
+            tap.capture(&mut audio, Duration::from_millis(20)).unwrap();
+            demod.process(&audio, &mut frames);
+        }
+        (demod.frames(), demod.il2p_frames())
+    };
+    a.send(&hm_frame(1)).unwrap();
+    assert_eq!(listen(Duration::from_secs(3)), (1, 0), "not told: AX.25");
+    a.peer_features(call("SO5KM"), a.features());
+    a.send(&hm_frame(2)).unwrap();
+    assert_eq!(listen(Duration::from_secs(3)), (2, 1), "told: IL2P");
+    a.peer_features(call("SO5KM"), 0);
+    a.send(&hm_frame(3)).unwrap();
+    assert_eq!(
+        listen(Duration::from_secs(3)),
+        (3, 1),
+        "told otherwise: AX.25 again"
+    );
 }

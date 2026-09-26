@@ -107,6 +107,7 @@ pub struct Demodulator {
     recent: Vec<(u32, u64)>,
     dedupe_window: u64,
     frames: u64,
+    il2p_frames: u64,
 }
 
 fn checksum(f: &[u8]) -> u32 {
@@ -158,6 +159,7 @@ impl Demodulator {
             recent: Vec::new(),
             dedupe_window: (fs * 0.5) as u64,
             frames: 0,
+            il2p_frames: 0,
             cfg,
         }
     }
@@ -169,6 +171,11 @@ impl Demodulator {
     /// Frames decoded so far.
     pub fn frames(&self) -> u64 {
         self.frames
+    }
+
+    /// How many of those came in IL2P (the rest in HDLC).
+    pub fn il2p_frames(&self) -> u64 {
+        self.il2p_frames
     }
 
     /// Carrier detect: some slicer sees a regular 1200-baud bit stream.
@@ -207,9 +214,9 @@ impl Demodulator {
                 // Middle of a bit: decide it. HDLC undoes NRZI; IL2P takes it as it is.
                 let bit = (sign == s.prev_level) as u8;
                 s.prev_level = sign;
-                let hdlc = s.deframer.push(bit);
-                let il2p = s.il2p.push(sign as u8);
-                for frame in hdlc.into_iter().chain(il2p) {
+                let hdlc = s.deframer.push(bit).map(|f| (f, false));
+                let il2p = s.il2p.push(sign as u8).map(|f| (f, true));
+                for (frame, is_il2p) in hdlc.into_iter().chain(il2p) {
                     let sum = checksum(&frame);
                     let now = self.samples;
                     let window = self.dedupe_window;
@@ -217,6 +224,7 @@ impl Demodulator {
                     if !self.recent.iter().any(|(h, _)| *h == sum) {
                         self.recent.push((sum, now));
                         self.frames += 1;
+                        self.il2p_frames += is_il2p as u64;
                         out.push(frame);
                     }
                 }
