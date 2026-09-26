@@ -683,3 +683,70 @@ fn one_sender_cannot_hold_more_than_its_share() {
     }
     assert_eq!(b.incoming.len(), b.cfg.max_incoming_per_sender);
 }
+
+/// A sender waiting for its ACK that hears an over between other stations
+/// keeps waiting until its own over could have followed that one and been
+/// answered: the link may have held our over back for the busy channel.
+#[test]
+fn other_traffic_extends_the_wait_for_an_ack() {
+    let mut a = engine("SA0KAM");
+    let mut out = Vec::new();
+    a.handle(
+        Millis(0),
+        Input::Command(Command::Send {
+            to: call("SO5KM-1"),
+            object: vec![7; 1500],
+            precedence: 0,
+        }),
+        &mut out,
+    );
+    assert!(!frames(&out).is_empty());
+    let first = a.next_deadline().unwrap();
+
+    // SP5AAA sends SP5BBB a DATA frame with 10 more to come in its over.
+    let pre = DataPreamble {
+        object_len: 4000,
+        remaining: 10,
+    };
+    let mut payload = pre.to_bytes().unwrap().to_vec();
+    payload.extend_from_slice(&[0u8; 200]);
+    let other = FrameHeader {
+        ftype: FrameType::Data,
+        src: call("SP5AAA"),
+        dst: Dest::Station(call("SP5BBB")),
+        session: 9,
+        index: 3,
+    }
+    .frame(&payload)
+    .unwrap();
+    let heard = Millis(5_000);
+    a.handle(heard, Input::Frame { port: 0, data: other }, &mut out);
+    let later = a.next_deadline().unwrap();
+    let cfg = &a.cfg;
+    let over_end = heard + cfg.air(10, cfg.data_frame_len(200));
+    let o = a.active.as_ref().unwrap();
+    assert!(later > first);
+    assert_eq!(
+        later,
+        over_end + cfg.ack_guard + o.last_cost + cfg.ack_guard + a.ack_air() + cfg.ack_guard
+    );
+
+    // Frames from our peer to us are its answer, not other traffic: even one
+    // the engine ignores (another session) leaves the wait as it is.
+    let before = a.next_deadline().unwrap();
+    let stray = FrameHeader {
+        ftype: FrameType::Ack,
+        src: call("SO5KM-1"),
+        dst: Dest::Station(call("SA0KAM")),
+        session: o.session.wrapping_add(1),
+        index: 0,
+    }
+    .frame(&Ack::default().to_vec().unwrap())
+    .unwrap();
+    a.handle(
+        Millis(before.0 - 1),
+        Input::Frame { port: 0, data: stray },
+        &mut out,
+    );
+    assert_eq!(a.next_deadline().unwrap(), before);
+}

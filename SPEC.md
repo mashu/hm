@@ -207,6 +207,13 @@ nothing about who received it.
 
 - Size each over as the smallest n for which P[at least `need` of n frames arrive] ≥ 0.9, at the estimated loss rate.
 - Update the loss estimate from each ACK.
+- Count an ACK as late only after the time the over, a guard, the peer's key-up
+  and ACK, and another guard would take. Predict airtime with the link's
+  per-frame overhead (19 bytes for AX.25 UI) and an allowance for bit stuffing.
+- The link may hold an over back while the channel is busy. While waiting for
+  an ACK, on hearing any frame other than the peer's to us, wait at least until
+  that traffic could have ended (for DATA, the frames it says remain), followed
+  by our whole over and the peer's answer.
 - With no ACK in time, wait a random backoff drawn uniformly from
   [0, (last over's airtime + guard) · 2^min(misses, 5)]. Then send an OFFER and
   at most two symbols as a probe.

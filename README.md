@@ -25,9 +25,7 @@ clear, identities signed.
 
 Phase 1 still to do: an on-air test, IL2P framing and better decoding deep in noise for
 the built-in modem, stream modems (Mercury, ARDOP, VARA) as radio bearers, KISS over serial,
-CTRL session open/close, the Dioxus interface with a setup wizard, and ACK timeouts that allow
-for time an over spends waiting for a busy channel (in the simulator, frames on a shared channel
-wait up to a minute, and senders probe again before their over has gone out). Relaying mail through
+CTRL session open/close, and the Dioxus interface with a setup wizard. Relaying mail through
 other nodes is Phase 2.
 
 ## Run a station
@@ -141,9 +139,9 @@ airtime). SNR is measured in a 3 kHz bandwidth.
 | 1 kB, 10% frame loss both ways, 10,000 trials | 100% delivered, 0 duplicates, every receipt verified; latency p50 9.0 s, p95 23.0 s | `HM_XFER_TRIALS=10000 cargo test -p hm-xfer --release --test sim exit_criterion_1kb -- --nocapture` |
 | 5 kB, clean link | hm headers and preambles 9.2%, OFFER and ACK with receipt 1.9%, TXDELAY and TXTAIL 2.8%; AX.25 framing and bit stuffing 9.5%; 73.7% of airtime is useful payload | `cargo test -p hm-xfer --release --test sim exit_criterion_overhead -- --nocapture` |
 | 2 kB, bursty loss (Gilbert–Elliott, ~12% mean) | 100/100 delivered | `cargo test -p hm-xfer --release --test sim bursty -- --nocapture` |
-| Two hidden senders to one node, no CSMA | 30/30 both delivered, last within 193 s | `cargo test -p hm-xfer --release --test sim two_senders -- --nocapture` |
+| Two hidden senders to one node, no CSMA | 30/30 both delivered, last within 199 s | `cargo test -p hm-xfer --release --test sim two_senders -- --nocapture` |
 | 2 kB over the modem's measured loss at 7 / 8 / 9 dB SNR | 100/100 delivered at each; latency p50 26.1 / 17.2 / 17.1 s | `cargo test -p hm-xfer --release --test sim measured_modem -- --nocapture` |
-| Four stations to one hub, 1.5 kB each, 9 dB, all hear each other | without CSMA: last delivery p50 294 s, 181 receptions lost to collisions per run; with CSMA: p50 112 s, 76 lost, all from stations keying up within the 125 ms carrier-detect delay of each other | `cargo test -p hm-xfer --release --test sim busy_channel -- --nocapture` |
+| Four stations to one hub, 1.5 kB each, 9 dB, all hear each other | without CSMA: last delivery p50 231 s, 4.8 overs per object, 124 receptions lost to collisions per run; with CSMA: p50 131 s, 1.9 overs per object, 47 lost, all from stations keying up within the 125 ms carrier-detect delay of each other | `cargo test -p hm-xfer --release --test sim busy_channel -- --nocapture` |
 | Receiver never keys up during an over, 8 kB at 15% loss | 0 frames talked over in 40 runs | `cargo test -p hm-xfer --release --test sim nobody_talks -- --nocapture` |
 | Modem frame loss vs SNR, 48 kHz, white noise | 50% of 40-byte frames lost at 5.5 dB, 41% of 360-byte frames at 7 dB, none above 9.5 dB; table in `crates/hm-sim/src/afsk_1200.rs` | `HM_WRITE_CURVE=1 cargo test -p hm-sim --release --test afsk afsk_1200_curve -- --ignored` |
 | Modem carrier detect | 68–101 ms after key-up at 7–20 dB SNR | `cargo test -p hm-sim --release --test afsk carrier_detect -- --nocapture` |

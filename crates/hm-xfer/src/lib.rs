@@ -653,7 +653,7 @@ impl Xfer {
         self.tokens_ms -= cost.0 as i64;
 
         // The peer answers after our over: its guard, its key-up, a full ACK, our slack.
-        let ack_air = self.cfg.txdelay + self.cfg.air(1, HEADER_LEN + 7 + 8 + hm_wire::RECEIPT_LEN);
+        let ack_air = self.ack_air();
         let jitter = Millis(self.rng.below(self.cfg.ack_guard.0 + 1));
         let until = now + cost + self.cfg.ack_guard + ack_air + self.cfg.ack_guard + jitter;
         let o = self.active.as_mut().expect("checked");
@@ -949,11 +949,47 @@ impl Xfer {
         self.seen.retain(|_, until| *until > now);
     }
 
+    /// While we wait for an ACK, other traffic on the channel means our over
+    /// may not have gone out yet: the link waits for a clear channel before
+    /// keying up, and we are not told when it does. Wait as if the over starts
+    /// when that traffic ends. If it had gone out already, this costs at most
+    /// one over's time, while the channel is busy anyway.
+    fn hear_traffic(&mut self, now: Millis, h: &FrameHeader, payload: &[u8]) {
+        let traffic_end = match (h.ftype, DataPreamble::decode(payload)) {
+            (FrameType::Data, Ok((pre, symbol))) => {
+                let remaining = pre.remaining.min(MAX_REMAINING_TRUSTED) as usize;
+                now + self.cfg.air(remaining, self.cfg.data_frame_len(symbol.len()))
+            }
+            _ => now,
+        };
+        let ack_air = self.ack_air();
+        let guard = self.cfg.ack_guard;
+        let Some(o) = self.active.as_mut() else { return };
+        if h.src == o.to && h.dst == Dest::Station(self.cfg.me) {
+            return; // our peer answering us
+        }
+        if let OutState::Waiting { until } = o.state {
+            let later = traffic_end + guard + o.last_cost + guard + ack_air + guard;
+            o.state = OutState::Waiting {
+                until: until.max(later),
+            };
+        }
+    }
+
+    /// Airtime of an ACK with a receipt, key-up included.
+    fn ack_air(&self) -> Millis {
+        self.cfg.txdelay + self.cfg.air(1, HEADER_LEN + 7 + 8 + hm_wire::RECEIPT_LEN)
+    }
+
     fn on_frame(&mut self, now: Millis, data: &[u8], out: &mut Vec<Output<Event>>) {
         let Ok((h, payload)) = FrameHeader::decode(data) else {
             return;
         };
-        if h.dst != Dest::Station(self.cfg.me) || h.src == self.cfg.me {
+        if h.src == self.cfg.me {
+            return;
+        }
+        self.hear_traffic(now, &h, payload);
+        if h.dst != Dest::Station(self.cfg.me) {
             return;
         }
         match h.ftype {

@@ -339,6 +339,8 @@ struct Busy {
     delivered: usize,
     last: Option<Millis>,
     collisions: u64,
+    /// Overs sent per delivered object, probes included.
+    rounds: f64,
 }
 
 /// `senders` stations and a hub, all hearing each other at `snr_db`. Each sender
@@ -377,28 +379,35 @@ fn busy_channel(seed: u64, senders: usize, snr_db: f64, csma: bool) -> Busy {
         );
     }
     sim.run_until(Millis::from_secs(3600));
-    let got: Vec<Millis> = sim
+    let got: Vec<(Millis, u8)> = sim
         .events()
         .iter()
-        .filter(|(_, n, e)| *n != hub && matches!(e, Event::Delivered { .. }))
-        .map(|(t, _, _)| *t)
+        .filter(|(_, n, _)| *n != hub)
+        .filter_map(|(t, _, e)| match e {
+            Event::Delivered { rounds, .. } => Some((*t, *rounds)),
+            _ => None,
+        })
         .collect();
     Busy {
         delivered: got.len(),
-        last: got.iter().max().copied(),
+        last: got.iter().map(|g| g.0).max(),
         collisions: sim.report().total().lost_collision,
+        rounds: got.iter().map(|g| g.1 as f64).sum::<f64>() / got.len().max(1) as f64,
     }
 }
 
 /// Stations that hear each other share one channel: with carrier sense they
 /// mostly take turns. What collides still is two stations keying up within
-/// the carrier-detect delay of each other.
+/// the carrier-detect delay of each other. Overs held back for the busy
+/// channel are not given up on: a 1.5 kB object needs one over, and senders
+/// that probe again before their over has gone out would need several.
 #[test]
 fn busy_channel_with_and_without_csma() {
     let (senders, runs) = (4, 20);
     let mut line = Vec::new();
     let mut coll = [0u64; 2];
     let mut p50 = [0u64; 2];
+    let mut rounds = [0f64; 2];
     for (k, csma) in [false, true].into_iter().enumerate() {
         let mut last = Vec::new();
         for seed in 0..runs {
@@ -406,14 +415,17 @@ fn busy_channel_with_and_without_csma() {
             assert_eq!(b.delivered, senders, "seed {seed}, csma {csma}");
             last.push(b.last.unwrap().0);
             coll[k] += b.collisions;
+            rounds[k] += b.rounds / runs as f64;
         }
         let p = Percentiles::of(&last).unwrap();
         p50[k] = p.p50;
         line.push(format!(
-            "{}: all delivered in {runs}/{runs}, last p50 {:.0} s max {:.0} s, {:.1} frames collided per run",
+            "{}: all delivered in {runs}/{runs}, last p50 {:.0} s max {:.0} s, {:.2} overs per object, \
+             {:.1} receptions lost to collisions per run",
             if csma { "CSMA" } else { "no CSMA" },
             p.p50 as f64 / 1e3,
             p.max as f64 / 1e3,
+            rounds[k],
             coll[k] as f64 / runs as f64
         ));
     }
@@ -426,6 +438,7 @@ fn busy_channel_with_and_without_csma() {
         "carrier sense should halve collisions: {coll:?}"
     );
     assert!(p50[1] * 3 < p50[0] * 2, "and finish sooner: {p50:?}");
+    assert!(rounds[1] < 2.5, "overs per object with CSMA: {:.2}", rounds[1]);
 }
 
 /// 2 kB over links at the SNRs where the built-in modem goes from marginal to
