@@ -249,13 +249,18 @@ byte holds the TNC port in its high nibble and command 0 (data).
 ## 9. Internet links
 
 Stations may also link over the internet. A link is a QUIC connection (RFC 9000)
-with TLS 1.3, ALPN `hm-net/0`, and mutual authentication by station key:
+with TLS 1.3, ALPN `hm-net/1`, and mutual authentication by station key:
 
 - Each station presents a self-signed X.509 certificate whose subject public key
   is its Ed25519 station key. Only Ed25519 handshake signatures are used.
 - Each side accepts the other only if that key is one it trusts, and names the
   peer by the callsign bound to the key. Certificate names, issuers and validity
   periods carry no meaning.
+- The dialer's TLS 1.3 handshake completes before the listener has checked the
+  dialer's certificate. Once the listener has accepted the dialer, it opens a
+  unidirectional stream and sends `"HMOK"`. The dialer counts the link as up
+  only after receiving it; a listener that refuses the dialer closes the
+  connection instead.
 - Either side may open streams on a link, whichever side dialled.
 
 One bundle travels on one bidirectional stream:

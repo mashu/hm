@@ -140,7 +140,13 @@ async fn stations_outside_the_trust_file_cannot_connect() {
         i_accept,
     )
     .unwrap();
-    assert!(!wait_connected(&impostor, "SO5KM").await, "handshake refused");
+    // The impostor's side of the TLS 1.3 handshake finishes before B has
+    // checked its certificate, so watch closely: it must never count the
+    // link as up, not even for the moment until B's refusal arrives.
+    for _ in 0..3000 {
+        assert!(!impostor.is_connected(call("SO5KM")), "handshake refused");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     assert!(b.connected().is_empty());
     assert!(matches!(
         impostor.deliver(call("SO5KM"), b"x").await,

@@ -7,7 +7,12 @@
 //! authority and no central server.
 //!
 //! One endpoint both listens and dials; configured peers are redialled when
-//! their connection drops. A bundle travels on its own bidirectional stream:
+//! their connection drops. In TLS 1.3 the dialer finishes its handshake before
+//! the listener has checked the dialer's certificate, so the listener, once it
+//! has accepted the dialer, confirms it on a unidirectional stream (`"HMOK"`);
+//! only then does the dialer count the link as up.
+//!
+//! A bundle travels on its own bidirectional stream:
 //!
 //! ```text
 //! sender   -> "HMD0" | length u32 BE | object bytes
@@ -36,8 +41,12 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 
 /// Application protocol name negotiated in the TLS handshake.
-pub const ALPN: &[u8] = b"hm-net/0";
+pub const ALPN: &[u8] = b"hm-net/1";
 const MAGIC: &[u8; 4] = b"HMD0";
+/// The listener's confirmation that it accepted the dialer.
+const ACCEPTED: &[u8; 4] = b"HMOK";
+/// How long a dialer waits for the listener to confirm it.
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest object accepted over the internet.
 pub const MAX_OBJECT: usize = 1024 * 1024;
 const REDIAL_EVERY: Duration = Duration::from_secs(3);
@@ -400,6 +409,11 @@ async fn accept_loop(net: Arc<Net>) {
         let net = net.clone();
         tokio::spawn(async move {
             if let Ok(conn) = incoming.await {
+                // The handshake is done on our side, so the dialer's key is
+                // one we trust: tell it so before it counts the link as up.
+                if net.peer_of(&conn).is_some() && confirm(&conn).await.is_err() {
+                    return;
+                }
                 net.register(conn);
             }
         });
@@ -414,16 +428,38 @@ async fn dial_loop(net: Arc<Net>, peers: Vec<(Callsign, SocketAddr)>) {
             }
             if let Ok(connecting) = net.endpoint.connect(*addr, "hm-net") {
                 if let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(5), connecting).await {
-                    if net.peer_of(&conn).map(|c| c.base()) == Some(call.base()) {
+                    if net.peer_of(&conn).map(|c| c.base()) != Some(call.base()) {
+                        conn.close(1u32.into(), b"unexpected station");
+                    } else if confirmed(&conn).await {
                         net.register(conn);
                     } else {
-                        conn.close(1u32.into(), b"unexpected station");
+                        conn.close(1u32.into(), b"not accepted");
                     }
                 }
             }
         }
         tokio::time::sleep(REDIAL_EVERY).await;
     }
+}
+
+/// Listener side: confirm to the dialer that it was accepted.
+async fn confirm(conn: &Connection) -> Result<(), String> {
+    let mut s = conn.open_uni().await.map_err(|e| e.to_string())?;
+    s.write_all(ACCEPTED).await.map_err(|e| e.to_string())?;
+    s.finish().map_err(|e| e.to_string())
+}
+
+/// Dialer side: whether the listener confirmed it accepted us. A listener that
+/// refuses our key closes the connection instead.
+async fn confirmed(conn: &Connection) -> bool {
+    let wait = async {
+        let mut s = conn.accept_uni().await.ok()?;
+        s.read_to_end(ACCEPTED.len()).await.ok()
+    };
+    matches!(
+        tokio::time::timeout(CONFIRM_TIMEOUT, wait).await,
+        Ok(Some(msg)) if msg == ACCEPTED
+    )
 }
 
 async fn serve_connection(net: Arc<Net>, peer: Callsign, conn: Connection) {
