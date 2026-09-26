@@ -219,3 +219,54 @@ async fn reconnects_after_the_peer_restarts() {
     a.deliver(call("SO5KM"), b"after restart").await.unwrap();
     assert_eq!(b2_log.lock().unwrap().len(), 1);
 }
+
+/// Two stations of one operator, SA0KAM-1 and SA0KAM-2, with their own keys,
+/// both linked to one hub: each is its own link, and each receives only what
+/// is sent to it, with a receipt from its own key.
+#[tokio::test]
+async fn two_ssids_link_to_one_hub_at_once() {
+    let (hub_accept, _) = recorder(Verdict::Stored);
+    let hub = Net::start(
+        cfg("SO5KM", 2, &[("SA0KAM-1", 11), ("SA0KAM-2", 12)], vec![]),
+        hub_accept,
+    )
+    .unwrap();
+    let addr = hub.local_addr().unwrap();
+    let mut logs = Vec::new();
+    let mut stations = Vec::new();
+    for (me, secret) in [("SA0KAM-1", 11), ("SA0KAM-2", 12)] {
+        let (accept, log) = recorder(Verdict::Stored);
+        let n = Net::start(
+            cfg(me, secret, &[("SO5KM", 2)], vec![(call("SO5KM"), addr)]),
+            accept,
+        )
+        .unwrap();
+        assert!(wait_connected(&n, "SO5KM").await, "{me} links to the hub");
+        logs.push(log);
+        stations.push(n);
+    }
+    assert!(wait_connected(&hub, "SA0KAM-1").await && wait_connected(&hub, "SA0KAM-2").await);
+    let mut linked = hub.connected();
+    linked.sort();
+    assert_eq!(linked, vec![call("SA0KAM-1"), call("SA0KAM-2")]);
+
+    hub.deliver(call("SA0KAM-2"), b"to two")
+        .await
+        .expect("receipt from SA0KAM-2's key");
+    hub.deliver(call("SA0KAM-1"), b"to one")
+        .await
+        .expect("receipt from SA0KAM-1's key");
+    assert_eq!(
+        logs[0].lock().unwrap().as_slice(),
+        &[(call("SO5KM"), b"to one".to_vec())]
+    );
+    assert_eq!(
+        logs[1].lock().unwrap().as_slice(),
+        &[(call("SO5KM"), b"to two".to_vec())]
+    );
+    // A station the hub has no link or key for is not reached through its sibling.
+    assert!(matches!(
+        hub.deliver(call("SA0KAM-3"), b"x").await,
+        Err(NetError::NotConnected)
+    ));
+}

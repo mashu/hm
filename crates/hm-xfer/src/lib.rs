@@ -113,6 +113,11 @@ pub fn receipt_statement(receiver: Callsign, sender: Callsign, session: u16, id:
     m
 }
 
+/// The key for a station: its own, else its base callsign's.
+fn key_for(keys: &BTreeMap<Callsign, PublicKey>, call: Callsign) -> Option<&PublicKey> {
+    keys.get(&call).or_else(|| keys.get(&call.base()))
+}
+
 /// The hash a transfer is verified against.
 pub fn object_id(bytes: &[u8]) -> ObjectId {
     ObjectId(blake3::derive_key(HASH_CONTEXT, bytes))
@@ -404,9 +409,10 @@ impl Xfer {
         &self.cfg
     }
 
-    /// Trust `key` for `call` (any SSID): its receipts are then required and checked.
+    /// Trust `key` for `call`: its receipts are then required and checked. A
+    /// callsign without an SSID covers every SSID that has no key of its own.
     pub fn trust(&mut self, call: Callsign, key: PublicKey) {
-        self.keys.insert(call.base(), key);
+        self.keys.insert(call, key);
     }
 
     /// Completion ACKs ignored because their receipt did not verify.
@@ -683,7 +689,7 @@ impl Xfer {
         }
         o.timeouts = 0;
         if ack.need == 0 || ack.completed.contains(&o.id.prefix8()) {
-            let receipt = match self.keys.get(&o.to.base()) {
+            let receipt = match key_for(&self.keys, o.to) {
                 None => Receipt::Unverified,
                 Some(key) => {
                     let statement = receipt_statement(o.to, self.cfg.me, o.session, &o.id);

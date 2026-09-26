@@ -87,6 +87,24 @@ keeps failing, the internet carries it until radio works again. The sent log sho
 link delivered each message. Mail to a station you have no working link to waits in
 the queue; passing mail on through other nodes comes in Phase 2.
 
+### Several stations under one callsign
+
+Every SSID is a station of its own, so you can run more than one node, for example a home
+station and a server:
+
+```sh
+hm keygen --call SA0KAM-1 --out home.key     # one key per station
+hm keygen --call SA0KAM-2 --out server.key
+hm whoami --key home.key                     # SA0KAM-1 <key>: a trust-file line
+```
+
+Mail to SA0KAM-2 goes to that node only. In a trust file, a line with an SSID names exactly
+that station; a line without one (as from a key made with `--call SA0KAM`) covers every SSID
+that has no line of its own, which keeps older key files working with `--ssid`. A node that
+only uses the internet does not transmit, so it needs no licence; any name of up to 9
+letters, digits, `-`, `/` or `.` works (`KAMHOME`), but use your callsign on anything
+with a radio.
+
 ### The API
 
 | Method | Path | |

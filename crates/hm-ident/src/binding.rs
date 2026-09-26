@@ -12,8 +12,9 @@ const ATTEST_PREFIX: &[u8] = b"hm/attest/v0";
 
 /// "This key speaks for this callsign", signed by the key itself.
 ///
-/// The callsign is always the base call (no `-SSID`); every SSID of a station
-/// shares one identity. A record with a higher `seq` replaces older ones.
+/// A callsign with an SSID binds that station only; one without binds every
+/// SSID that has no record of its own. A record with a higher `seq` replaces
+/// older ones.
 ///
 /// CBOR map:
 /// `0 v`, `1 callsign`, `2 key`, `3 seq`, `4 created` (Unix seconds),
@@ -67,9 +68,9 @@ impl Attestation {
     /// `attester` (station `by`) vouches for `callsign` ↔ `key`.
     pub fn make(by: Callsign, attester: &Identity, callsign: Callsign, key: &PublicKey) -> Attestation {
         Attestation {
-            by: by.base(),
+            by,
             by_key: attester.public(),
-            sig: attester.sign(&attest_statement(callsign.base(), key)),
+            sig: attester.sign(&attest_statement(callsign, key)),
         }
     }
 
@@ -82,7 +83,7 @@ impl BindingRecord {
     pub fn new(callsign: Callsign, key: PublicKey, seq: u64, created: u64) -> BindingRecord {
         BindingRecord {
             v: BINDING_VERSION,
-            callsign: callsign.base(),
+            callsign,
             key,
             seq,
             created,
@@ -94,9 +95,6 @@ impl BindingRecord {
     fn check(&self) -> Result<(), IdentError> {
         if self.v != BINDING_VERSION {
             return Err(IdentError::UnsupportedVersion(self.v));
-        }
-        if self.callsign != self.callsign.base() {
-            return Err(IdentError::Invalid("binding callsign must not carry an SSID"));
         }
         if self.homes.as_ref().is_some_and(|h| h.is_empty())
             || self.attestations.as_ref().is_some_and(|a| a.is_empty())
@@ -185,7 +183,8 @@ mod tests {
         let me = Identity::from_secret([11; 32]);
         let mut rec = BindingRecord::new(call("SA0KAM-7"), me.public(), 1, 1_790_000_000);
         rec.homes = Some(vec![call("SA0KAM-10"), call("SO5KM-10")]);
-        assert_eq!(rec.callsign, call("SA0KAM"));
+        // The record binds this one station: SSIDs are stations of their own.
+        assert_eq!(rec.callsign, call("SA0KAM-7"));
         let signed = rec.clone().seal(&me).unwrap();
         let back = SignedBinding::decode(&signed.to_vec()).unwrap();
         assert_eq!(back.record(), &rec);
@@ -245,13 +244,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_lists_and_ssids_are_rejected() {
+    fn empty_lists_are_rejected() {
         let me = Identity::from_secret([11; 32]);
         let mut rec = BindingRecord::new(call("SA0KAM"), me.public(), 1, 0);
         rec.homes = Some(vec![]);
         assert!(rec.seal(&me).is_err());
         let mut rec = BindingRecord::new(call("SA0KAM"), me.public(), 1, 0);
-        rec.callsign = call("SA0KAM-7");
+        rec.attestations = Some(vec![]);
         assert!(rec.seal(&me).is_err());
     }
 }

@@ -29,8 +29,10 @@ Valid values are 1 … 40⁹−1 with no zero digit below the most significant o
 every value maps to exactly one string. On the wire: the low 6 bytes of the value,
 big-endian. `FF FF FF FF FF FF` means broadcast in frame headers.
 
-An SSID is written as a suffix, `SA0KAM-7`. Identity is bound to the base call
-(`SA0KAM`); all SSIDs of a station share one key.
+An SSID is written as a suffix, `SA0KAM-7`. Every SSID is a station of its own
+and may have its own key, so one operator can run several stations (SA0KAM-1 and
+SA0KAM-2). A key bound to a callsign without an SSID speaks for every SSID of it
+that has no key of its own. Mail addressed to SA0KAM-2 is for that station only.
 
 ## 2. Radio frame header (18 bytes)
 
@@ -95,7 +97,7 @@ CBOR map:
 | Key | Field | Type |
 | --- | --- | --- |
 | 0 | v | uint, 0 |
-| 1 | callsign | bstr(6), base call without SSID |
+| 1 | callsign | bstr(6); with an SSID, that station only; without, every SSID lacking a record of its own |
 | 2 | key | bstr(32), Ed25519 public key |
 | 3 | seq | uint; a higher value replaces older records |
 | 4 | created | uint, Unix seconds |
@@ -279,7 +281,8 @@ with TLS 1.3, ALPN `hm-net/1`, and mutual authentication by station key:
 - Each station presents a self-signed X.509 certificate whose subject public key
   is its Ed25519 station key. Only Ed25519 handshake signatures are used.
 - Each side accepts the other only if that key is one it trusts, and names the
-  peer by the callsign bound to the key. Certificate names, issuers and validity
+  peer by the callsign bound to the key (with its SSID, if the trust entry has one;
+  two stations sharing one callsign can link at once if each has its own key). Certificate names, issuers and validity
   periods carry no meaning.
 - The dialer's TLS 1.3 handshake completes before the listener has checked the
   dialer's certificate. Once the listener has accepted the dialer, it opens a

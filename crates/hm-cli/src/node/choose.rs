@@ -117,7 +117,7 @@ impl Chooser {
 
     /// Evidence for `(peer, bearer)` faded to time `now` (Unix seconds).
     fn faded(&self, peer: Callsign, b: Bearer, now: u64) -> (f64, f64) {
-        match self.arms.get(&(peer.base(), b)) {
+        match self.arms.get(&(peer, b)) {
             None => (0.0, 0.0),
             Some(a) => {
                 let f = 0.5f64.powf(now.saturating_sub(a.at) as f64 / self.half_life_secs);
@@ -147,7 +147,7 @@ impl Chooser {
             failures: f + (!success) as u8 as f64,
             at: now,
         };
-        self.arms.insert((peer.base(), b), arm);
+        self.arms.insert((peer, b), arm);
     }
 
     /// Posterior mean success rate, for display.
