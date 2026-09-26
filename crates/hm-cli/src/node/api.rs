@@ -18,14 +18,16 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use hm_bundle::{Address, Opened, Precedence};
 use hm_store::{Direction, Record, Store};
 use hm_wire::{Callsign, ObjectId};
 use serde::{Deserialize, Serialize};
 
+use super::trust::SharedTrust;
 use super::{NodeConfig, Status};
+use crate::files::Trust;
 use crate::station::{build_bundle, unix_now};
 
 #[derive(Clone)]
@@ -33,6 +35,7 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub cfg: Arc<NodeConfig>,
     pub status: Arc<Mutex<Status>>,
+    pub trust: Arc<SharedTrust>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -41,6 +44,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/messages", get(messages))
         .route("/api/send", post(send))
         .route("/api/read/{id}", post(mark_read))
+        .route("/api/trust", get(list_trust).post(add_trust))
+        .route("/api/trust/{station}", delete(remove_trust))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new().route("/", get(index)).merge(api).with_state(state)
 }
@@ -315,5 +320,82 @@ async fn mark_read(State(s): State<AppState>, Path(id): Path<String>) -> Result<
         Ok(()) => Ok(StatusCode::NO_CONTENT),
         Err(hm_store::Error::NotFound) => Err(ApiError(StatusCode::NOT_FOUND, "no such message".into())),
         Err(e) => Err(internal(e)),
+    }
+}
+
+#[derive(Serialize)]
+struct TrustedView {
+    station: String,
+    key: String,
+}
+
+#[derive(Serialize)]
+struct TrustList {
+    /// The trust file changes are saved to; `null` when the node has none, and
+    /// changes last until it restarts.
+    file: Option<String>,
+    stations: Vec<TrustedView>,
+}
+
+async fn list_trust(State(s): State<AppState>) -> Json<TrustList> {
+    Json(TrustList {
+        file: s.trust.file().map(|p| p.display().to_string()),
+        stations: s
+            .trust
+            .get()
+            .iter()
+            .map(|(c, k)| TrustedView {
+                station: c.to_string(),
+                key: crate::hex::encode(&k.0),
+            })
+            .collect(),
+    })
+}
+
+/// A line as `hm whoami` prints it (`CALL KEY`), or the two parts apart.
+#[derive(Deserialize)]
+struct TrustRequest {
+    line: Option<String>,
+    station: Option<String>,
+    key: Option<String>,
+}
+
+async fn add_trust(
+    State(s): State<AppState>,
+    Json(req): Json<TrustRequest>,
+) -> Result<(StatusCode, Json<TrustedView>), ApiError> {
+    let line = match (req.line, req.station, req.key) {
+        (Some(l), None, None) => l,
+        (None, Some(c), Some(k)) => format!("{c} {k}"),
+        _ => return Err(bad("give `line`, or `station` and `key`")),
+    };
+    let (call, key) = Trust::parse_line(&line)
+        .map_err(bad)?
+        .ok_or_else(|| bad("empty line"))?;
+    s.trust.add(call, key).map_err(internal)?;
+    super::log(format!("trusted {call} (through the API)"));
+    Ok((
+        StatusCode::CREATED,
+        Json(TrustedView {
+            station: call.to_string(),
+            key: crate::hex::encode(&key.0),
+        }),
+    ))
+}
+
+async fn remove_trust(
+    State(s): State<AppState>,
+    Path(station): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let call = Callsign::parse(&station).map_err(|e| bad(format!("station: {e}")))?;
+    match s.trust.remove(call).map_err(internal)? {
+        true => {
+            super::log(format!("no longer trusting {call} (through the API)"));
+            Ok(StatusCode::NO_CONTENT)
+        }
+        false => Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("{call} has no line of its own in the trust list"),
+        )),
     }
 }

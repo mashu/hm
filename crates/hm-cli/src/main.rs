@@ -390,6 +390,7 @@ fn node(
     beacon_minutes: u64,
 ) -> Result<(), String> {
     let (key, me) = s.open()?;
+    let trust_file = trust.map(Path::to_path_buf);
     let trust = load_trust(trust)?;
     let peers = peers
         .iter()
@@ -443,6 +444,7 @@ fn node(
     let cfg = hm_cli::node::NodeConfig {
         key,
         trust,
+        trust_file,
         me,
         radio,
         internet,

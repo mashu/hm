@@ -107,28 +107,49 @@ impl KeyFile {
 }
 
 /// Public keys of stations whose messages we can verify.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Trust {
     keys: BTreeMap<Callsign, PublicKey>,
 }
 
 impl Trust {
+    /// One trust-file line: `None` for a blank line or a comment.
+    pub fn parse_line(line: &str) -> Result<Option<(Callsign, PublicKey)>, String> {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return Ok(None);
+        }
+        let (call, key) = line
+            .split_once(char::is_whitespace)
+            .ok_or("expected `CALL PUBLICKEY`")?;
+        let call = Callsign::parse(call).map_err(|e| e.to_string())?;
+        let key = hex::decode_32(key.trim())?;
+        Ok(Some((call, PublicKey(key))))
+    }
+
     pub fn parse(text: &str) -> io::Result<Trust> {
         let mut t = Trust::default();
         for (n, line) in text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
+            if let Some((call, key)) =
+                Trust::parse_line(line).map_err(|e| invalid(format!("trust file line {}: {e}", n + 1)))?
+            {
+                t.keys.insert(call, key);
             }
-            let (call, key) = line
-                .split_once(char::is_whitespace)
-                .ok_or_else(|| invalid(format!("trust file line {}: expected `CALL PUBLICKEY`", n + 1)))?;
-            let call =
-                Callsign::parse(call).map_err(|e| invalid(format!("trust file line {}: {e}", n + 1)))?;
-            let key = hex::decode_32(key).map_err(|e| invalid(format!("trust file line {}: {e}", n + 1)))?;
-            t.keys.insert(call, PublicKey(key));
         }
         Ok(t)
+    }
+
+    /// Stop trusting the line for exactly `call`; true if there was one.
+    pub fn remove(&mut self, call: Callsign) -> bool {
+        self.keys.remove(&call).is_some()
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
     }
 
     pub fn load(path: &Path) -> io::Result<Trust> {
@@ -155,9 +176,79 @@ impl Trust {
     }
 }
 
+/// Set the line for exactly `call` in the trust file at `path` to `key`, or
+/// remove it with `None`. Comments and every other line are kept as they are;
+/// a new station goes at the end. The file is replaced atomically.
+pub fn edit_trust_file(path: &Path, call: Callsign, key: Option<PublicKey>) -> io::Result<()> {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let new_line = key.map(|k| format!("{call} {}", hex::encode(&k.0)));
+    let mut out = Vec::new();
+    let mut placed = false;
+    for line in text.lines() {
+        match Trust::parse_line(line) {
+            Ok(Some((c, _))) if c == call => {
+                if let (Some(l), false) = (&new_line, placed) {
+                    out.push(l.clone());
+                    placed = true;
+                }
+            }
+            _ => out.push(line.to_string()),
+        }
+    }
+    if let (Some(l), false) = (new_line, placed) {
+        out.push(l);
+    }
+    let mut body = out.join("\n");
+    body.push('\n');
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, body)?;
+    fs::rename(&tmp, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_file_edits_keep_comments_and_other_lines() {
+        let call = |s: &str| Callsign::parse(s).unwrap();
+        let path = std::env::temp_dir().join(format!("hm-trust-edit-{}.txt", std::process::id()));
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        fs::write(
+            &path,
+            format!(
+                "# my friends\nSO5KM {}\n\n# club\nSP5AAA {}\n",
+                hex::encode(&a),
+                hex::encode(&a)
+            ),
+        )
+        .unwrap();
+        // Replace in place, add at the end, remove.
+        edit_trust_file(&path, call("SO5KM"), Some(PublicKey(b))).unwrap();
+        edit_trust_file(&path, call("SA0KAM-2"), Some(PublicKey(a))).unwrap();
+        edit_trust_file(&path, call("SP5AAA"), None).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "# my friends\nSO5KM {}\n\n# club\nSA0KAM-2 {}\n",
+                hex::encode(&b),
+                hex::encode(&a)
+            )
+        );
+        let t = Trust::parse(&text).unwrap();
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.key_for(call("SO5KM-3")), Some(PublicKey(b)));
+        fs::remove_file(&path).unwrap();
+        // A missing file is created.
+        edit_trust_file(&path, call("SO5KM"), Some(PublicKey(a))).unwrap();
+        assert_eq!(Trust::load(&path).unwrap().len(), 1);
+        fs::remove_file(&path).unwrap();
+    }
 
     #[test]
     fn key_file_roundtrip_keeps_the_ssid() {

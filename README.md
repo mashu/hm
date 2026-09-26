@@ -87,6 +87,14 @@ keeps failing, the internet carries it until radio works again. The sent log sho
 link delivered each message. Mail to a station you have no working link to waits in
 the queue; passing mail on through other nodes comes in Phase 2.
 
+### Trusting stations while the node runs
+
+Trusted stations can change without a restart: add or remove them on the web page (or through
+the API), or edit the `--trust` file, which the node reads again within a second or two of
+any change. Changes made on the page are written to that file, keeping your comments. A
+station taken off the list loses its internet link at once. A trust file that does not
+parse is logged and ignored, and the node keeps the stations it trusted before.
+
 ### Several stations under one callsign
 
 Every SSID is a station of its own, so you can run more than one node, for example a home
@@ -113,6 +121,9 @@ with a radio.
 | GET | `/api/messages?direction=in\|out&limit=n` | newest first, with delivery state and link |
 | POST | `/api/send` | `{"to", "text", "subject"?, "precedence"?}` → `201 {"id"}` |
 | POST | `/api/read/{id}` | mark an inbound message read |
+| GET | `/api/trust` | trusted stations and the trust file they are saved to |
+| POST | `/api/trust` | `{"line": "SO5KM-1 8a1e…"}` (as `hm whoami` prints it) → `201` |
+| DELETE | `/api/trust/{station}` | stop trusting a station → `204` |
 
 Every `/api` request needs `Authorization: Bearer <token>`. The API is plain HTTP and
 listens on localhost by default; to use the web interface from another machine, put it

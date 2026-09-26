@@ -173,6 +173,7 @@ fn start(ether: &Ether, key: &KeyFile, me: &str, peer: &KeyFile, db: &Tmp) -> no
     node::start(NodeConfig {
         key: KeyFile::parse(&key.to_text()).unwrap(),
         trust,
+        trust_file: None,
         me: call(me),
         radio: Some(RadioConfig {
             link: RadioLink::Modem {
