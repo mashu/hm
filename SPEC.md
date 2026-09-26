@@ -230,22 +230,24 @@ symbols, then least recently heard.
 ## 8. Beacons
 
 A station announces itself with a BEACON frame: destination broadcast, session
-and index 0 (receivers ignore both). Payload, 102 + 7n bytes:
+and index 0 (receivers ignore both). Payload, 108 + 7n bytes:
 
 | Offset | Size | Field |
 | --- | --- | --- |
 | 0 | 1 | flags: 0x01 mailbox (holds mail for other stations), 0x02 relay (passes mail on, Phase 2), 0x04 internet (has internet links); other bits 0 |
 | 1 | 32 | the station's Ed25519 key |
 | 33 | 4 | Unix time in seconds when sent |
-| 37 | 1 | n, stations heard (at most 16) |
-| 38 | 7n | per station heard: callsign (6), minutes since last heard (1; 255 = 255 or more) |
-| 38 + 7n | 64 | signature by the key over `"hm/beacon-sig/v0" \|\| header source callsign (6) \|\| bytes 0 to 37 + 7n` |
+| 37 | 6 | Maidenhead locator: 4 or 6 characters in upper-case ASCII (`JO89` or `JO89XI`), a 4-character one followed by two zero bytes; all zero when the station gives none |
+| 43 | 1 | n, stations heard (at most 16) |
+| 44 | 7n | per station heard: callsign (6), minutes since last heard (1; 255 = 255 or more) |
+| 44 + 7n | 64 | signature by the key over `"hm/beacon-sig/v0" \|\| header source callsign (6) \|\| bytes 0 to 43 + 7n` |
 
 Rules:
 
+- Drop a beacon with a malformed locator (letters A–R, digits, then A–X).
 - Drop a beacon whose signature does not verify with the key it carries. One that
   verifies proves only that its sender holds that key.
-- Never learn a key from a beacon. Compare it with the trust file instead: the
+- Never learn a key from a beacon. Compare it with the trusted keys instead: the
   listed key (trusted), no key for the station (unknown), or another key
   (mismatch: an impostor, or a station with a new key; worth a warning).
 - Recommended: beacon every 10 minutes with ±10% jitter, the first one at a random
@@ -359,8 +361,8 @@ data  0000004f8af6fb001b97cbd86bf2b400000000007700825832a70000014600004f8af6fb02
 public key 0b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e39f2d
 ack   01001b97cbd86b00004f8af6fbf2b4000000000080ff00000126a90b587084a21311b09926955fc1657ddf7c42bcd35089e157a8f522ae8b7fdef4005e57dfc38369d6f4e7ee8c50ba3f1b1fb1659e1139f6b4bc0d8783a6ea8ed55498b5025204
 
-## Beacon from SA0KAM-10 (secret 0x0b x 32, mailbox, heard SO5KM-1 3 min ago)
-beacon 04a53e713ef6fbffffffffffff00000000000166be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a6ab13b8001001b97cbd86b034060a211fb2a7a54a688a72c170c26005d25d1f2bcb17ec6c80dc371411e9637d02badd8c9026a2c7c804b3102f2c4dc65f8a450ba6d938f2059cbbdc4440301
+## Beacon from SA0KAM-10 (secret 0x0b x 32, mailbox, JO89xi, heard SO5KM-1 3 min ago)
+beacon 04a53e713ef6fbffffffffffff00000000000166be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a6ab13b804a4f3839584901001b97cbd86b036310c680632414ca1c334f57df9df4b445475c36b99df19b143662928e5b8bdb1a2d9709298a363a5c9781d062ccba553c8b2b75e4a78d978bb209f6f2fac302
 ```
 
 ## 13. Not yet specified

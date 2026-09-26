@@ -26,12 +26,14 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use hm_ident::PublicKey;
-use hm_wire::Callsign;
+use hm_wire::{Callsign, Locator};
 use serde::{Deserialize, Serialize};
 use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
 
 use crate::files::Trust;
 use crate::hex;
+use crate::kiss_link::{KissTarget, TncParams};
+use crate::station::LinkTiming;
 
 pub const DEFAULT_PATH: &str = "station.toml";
 
@@ -56,6 +58,8 @@ pub struct StationSettings {
     pub store: PathBuf,
     /// Address of the web page and API.
     pub http: String,
+    /// Maidenhead grid locator sent in beacons (`JO89` or `JO89xi`).
+    pub locator: Option<String>,
 }
 
 impl Default for StationSettings {
@@ -65,6 +69,7 @@ impl Default for StationSettings {
             ssid: 0,
             store: "station.db".into(),
             http: "127.0.0.1:8080".into(),
+            locator: None,
         }
     }
 }
@@ -107,6 +112,50 @@ impl Default for RadioSettings {
             guard_ms: 1500,
             beacon_minutes: 10,
         }
+    }
+}
+
+impl RadioSettings {
+    /// Link timing for the transfer engine.
+    pub fn timing(&self) -> LinkTiming {
+        LinkTiming {
+            bitrate_bps: self.bitrate,
+            txdelay_ms: self.txdelay_ms,
+            guard_ms: self.guard_ms,
+            max_rounds: 12,
+        }
+    }
+
+    /// Channel-access parameters a hardware TNC is given.
+    pub fn tnc_params(&self) -> TncParams {
+        TncParams {
+            txdelay_ms: self.txdelay_ms as u32,
+            persist: self.persist,
+            slot_ms: self.slottime_ms as u32,
+        }
+    }
+
+    /// The settings that take a new radio link to change: all but the beacon interval.
+    pub fn link_settings(&self) -> RadioSettings {
+        RadioSettings {
+            beacon_minutes: 0,
+            ..self.clone()
+        }
+    }
+
+    /// Check what can be checked without opening anything.
+    pub fn check(&self) -> Result<(), String> {
+        KissTarget::parse(&self.kiss).map_err(|e| format!("radio.kiss: {e}"))?;
+        if self.bitrate == 0 {
+            return Err("radio.bitrate must be above 0".into());
+        }
+        if self.tnc_port > 15 {
+            return Err("radio.tnc_port is 0 to 15".into());
+        }
+        if self.ptt.trim().is_empty() {
+            return Err("radio.ptt is empty (use \"vox\" for none)".into());
+        }
+        Ok(())
     }
 }
 
@@ -181,6 +230,8 @@ impl Config {
         let c: Config = toml::from_str(text).map_err(|e| e.to_string())?;
         c.trust()?;
         c.peers()?;
+        c.locator()?;
+        c.radio.check()?;
         Ok(c)
     }
 
@@ -194,6 +245,16 @@ impl Config {
             t.insert(call, PublicKey(key));
         }
         Ok(t)
+    }
+
+    /// The station's grid locator, checked.
+    pub fn locator(&self) -> Result<Option<Locator>, String> {
+        self.station
+            .locator
+            .as_deref()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| Locator::parse(l).map_err(|e| format!("station.locator {l:?}: {e}")))
+            .transpose()
     }
 
     /// The internet peers, callsigns checked (addresses are looked up when dialled).
@@ -397,6 +458,54 @@ fn trust_entries(doc: &mut DocumentMut) -> &mut ArrayOfTables {
     item.as_array_of_tables_mut().expect("an array of tables")
 }
 
+/// Write the `[radio]` settings of `new` that differ from `old` (the
+/// beacon interval aside), in one checked edit.
+pub fn set_radio(path: &Path, old: &RadioSettings, new: &RadioSettings) -> io::Result<()> {
+    let mut doc = read_doc(path)?;
+    let t = table(&mut doc, "radio");
+    let mut put = |key: &str, v: toml_edit::Value| {
+        let mut v = v;
+        if let Some(o) = t.get(key).and_then(|i| i.as_value()) {
+            *v.decor_mut() = o.decor().clone();
+        }
+        t[key] = Item::Value(v);
+    };
+    if old.enabled != new.enabled {
+        put("enabled", new.enabled.into());
+    }
+    if old.kiss != new.kiss {
+        put("kiss", new.kiss.as_str().into());
+    }
+    if old.tnc_port != new.tnc_port {
+        put("tnc_port", i64::from(new.tnc_port).into());
+    }
+    if old.ptt != new.ptt {
+        put("ptt", new.ptt.as_str().into());
+    }
+    if old.persist != new.persist {
+        put("persist", i64::from(new.persist).into());
+    }
+    for (key, o, n) in [
+        ("slottime_ms", old.slottime_ms, new.slottime_ms),
+        ("bitrate", u64::from(old.bitrate), u64::from(new.bitrate)),
+        ("txdelay_ms", old.txdelay_ms, new.txdelay_ms),
+        ("guard_ms", old.guard_ms, new.guard_ms),
+    ] {
+        if o != n {
+            put(key, (n as i64).into());
+        }
+    }
+    if old.audio != new.audio {
+        match &new.audio {
+            Some(a) => put("audio", a.as_str().into()),
+            None => {
+                t.remove("audio");
+            }
+        }
+    }
+    write_doc(path, &doc)
+}
+
 /// Replace the internet peers.
 pub fn set_peers(path: &Path, peers: &[(Callsign, String)]) -> io::Result<()> {
     let mut doc = read_doc(path)?;
@@ -421,6 +530,7 @@ pub fn starter(call: Callsign, key: &Path) -> String {
 # ssid = 1                  when the key file names a callsign without an SSID
 # store = "station.db"
 # http = "127.0.0.1:8080"   the web page; keep it on localhost unless behind HTTPS
+# locator = "JO89xi"        your grid square, sent in beacons
 [station]
 key = {key:?}
 

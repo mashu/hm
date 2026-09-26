@@ -82,13 +82,17 @@ The node applies these at once, without a restart:
   by editing `[[trust]]`. A station taken off the list loses its internet link at once.
 - **Delivery**: link costs and retry timing.
 - **Internet peers**: which stations the node dials.
-- **Beacon interval**.
+- **Radio**: everything under `[radio]` (TNC or sound card, PTT, key-up delay, channel
+  access, turning the radio on or off). The node closes the old link and opens the new
+  one; mail on its way over the old link is retried on the new one.
+- **Beacon interval** and **grid locator**.
 
 Changes made on the web page are written to `station.toml`, keeping its comments and layout.
 The node also notices when the file is edited by hand, within a second or two. A file that
 does not parse is logged and ignored, and the node keeps the settings it was using. The
-radio, the internet listen address, the web address and the store are read at start-up;
-change them in the file and restart.
+internet listen address, the web address and the store are read at start-up; change them
+in the file and restart. Settings given on the command line stay in force for that run,
+even when the file changes; the web page lists them.
 
 ### The web page
 
@@ -100,9 +104,10 @@ The node keeps every message in `station.db` and retries undelivered mail with g
 delays (1 minute doubling to an hour, 12 attempts, set in `[delivery]`).
 
 Every 10 minutes (`beacon_minutes`, 0 for none) the node sends a signed beacon on the
-radio: its callsign and key, whether it has internet links, and the stations it has heard in
-the last hour. The status page lists every station heard, and for those that beacon whether
-their key matches the one you trust. A beacon never adds a trusted station; a key that
+radio: its callsign and key, its grid locator (`locator = "JO89xi"` under `[station]`),
+whether it has internet links, and the stations it has heard in the last hour. The status
+page lists every station heard, with the distance and bearing to those that give a locator,
+and for those that beacon whether their key matches the one you trust. A beacon never adds a trusted station; a key that
 differs from the trusted one is logged as a warning.
 
 ### The built-in modem
@@ -188,7 +193,7 @@ with a radio.
 | POST | `/api/trust` | `{"line": "SO5KM-1 8a1e…", "note"?}` (as `hm whoami` prints it) → `201` |
 | DELETE | `/api/trust/{station}` | stop trusting a station → `204` |
 | GET | `/api/settings` | the settings in use: `live` ones, and those that take a restart |
-| PATCH | `/api/settings` | any of `beacon_minutes`, `radio_cost`, `internet_cost`, `retry_first_secs`, `retry_max_secs`, `retry_attempts`, `peers` (`[{"station", "address"}]`) → the new settings; saved to `station.toml` |
+| PATCH | `/api/settings` | any of `beacon_minutes`, `radio_cost`, `internet_cost`, `retry_first_secs`, `retry_max_secs`, `retry_attempts`, `peers` (`[{"station", "address"}]`), `locator` (`""` for none), `radio` (any `[radio]` fields) → the new settings; saved to `station.toml` |
 
 Every `/api` request needs `Authorization: Bearer <token>`. The API is plain HTTP and
 listens on localhost by default; to use the web interface from another machine, put it

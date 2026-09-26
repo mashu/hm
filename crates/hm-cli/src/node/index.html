@@ -104,6 +104,10 @@
   .peer input:first-child { text-transform: uppercase; }
   .peer button, #add-peer { margin: 0; padding: 0.2rem 0.6rem; font-size: 0.85rem; background: none; color: var(--ink); border-width: 1px; }
   #add-peer { margin-top: 0.5rem; }
+  label.check { display: flex; gap: 0.5rem; align-items: center; font-weight: 600; }
+  label.check input { width: auto; }
+  details { margin-top: 0.75rem; }
+  summary { cursor: pointer; color: var(--muted); }
   #settings-note { font-size: 0.9rem; color: var(--muted); margin: 0.5rem 0 0; min-height: 1.4em; }
   #settings-note.ok { color: var(--ok); } #settings-note.bad { color: var(--bad); }
   dl.fixed { margin: 0.75rem 0 0; font-size: 0.9rem; color: var(--muted); display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.1rem 0.75rem; }
@@ -159,10 +163,38 @@
     <div id="settings-section" aria-labelledby="settings-title">
       <h2 id="settings-title">Settings</h2>
       <form id="settings-form" autocomplete="off">
-        <fieldset id="beacon-set">
-          <legend>Beacon</legend>
-          <label for="beacon_minutes">Every <span class="hint">(minutes; 0 turns it off)</span></label>
-          <input id="beacon_minutes" type="number" min="0" step="1" required>
+        <fieldset>
+          <legend>Station</legend>
+          <label for="locator">Grid locator <span class="hint">(like JO89xi; sent in beacons, empty for none)</span></label>
+          <input id="locator" maxlength="6" spellcheck="false" pattern="[A-Ra-r]{2}[0-9]{2}([A-Xa-x]{2})?">
+        </fieldset>
+        <fieldset>
+          <legend>Radio</legend>
+          <label class="check"><input id="r-enabled" type="checkbox"> Use a radio</label>
+          <div id="radio-fields">
+            <label for="r-kiss">KISS TNC <span class="hint">(Direwolf <code>127.0.0.1:8001</code>, or <code>serial:/dev/ttyUSB0:9600</code>)</span></label>
+            <input id="r-kiss" spellcheck="false">
+            <label for="r-audio">Sound card <span class="hint">(the built-in modem instead of a TNC; empty for a TNC)</span></label>
+            <input id="r-audio" spellcheck="false" placeholder="default">
+            <label for="r-ptt">PTT <span class="hint">(built-in modem: vox, rigctld, rts:/dev/ttyUSB0, cm108:/dev/hidraw0)</span></label>
+            <input id="r-ptt" spellcheck="false">
+            <div class="pair">
+              <div><label for="r-txdelay_ms">Key-up delay <span class="hint">(ms)</span></label><input id="r-txdelay_ms" type="number" min="0" step="10"></div>
+              <div><label for="r-tnc_port">TNC port</label><input id="r-tnc_port" type="number" min="0" max="15" step="1"></div>
+            </div>
+            <details>
+              <summary>Channel access and timing</summary>
+              <div class="pair">
+                <div><label for="r-persist">Persistence <span class="hint">(0–255)</span></label><input id="r-persist" type="number" min="0" max="255" step="1"></div>
+                <div><label for="r-slottime_ms">Slot time <span class="hint">(ms)</span></label><input id="r-slottime_ms" type="number" min="0" step="10"></div>
+                <div><label for="r-bitrate">Bit rate <span class="hint">(bd)</span></label><input id="r-bitrate" type="number" min="1" step="1"></div>
+                <div><label for="r-guard_ms">Guard <span class="hint">(ms)</span></label><input id="r-guard_ms" type="number" min="0" step="10"></div>
+              </div>
+            </details>
+            <label for="beacon_minutes">Beacon every <span class="hint">(minutes; 0 turns it off)</span></label>
+            <input id="beacon_minutes" type="number" min="0" step="1" required>
+          </div>
+          <p class="hint" id="radio-note"></p>
         </fieldset>
         <fieldset>
           <legend>Delivery</legend>
@@ -288,6 +320,8 @@ const KEY = {
   mismatch: ["Key differs from the one you trust: an impostor, or a new key", "bad"],
 };
 
+const compass = (deg) => ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][Math.round(deg / 45) % 8] + " (" + deg + "°)";
+
 function renderHeard(list) {
   const ul = document.getElementById("heard");
   ul.replaceChildren();
@@ -298,6 +332,10 @@ function renderHeard(list) {
   for (const h of list) {
     const li = el("li");
     li.append(el("span", "who", h.station), el("span", "when", " · " + ago(h.ago)));
+    if (h.locator) {
+      const where = h.distance_km !== null ? " · " + h.locator + ", " + h.distance_km + " km " + compass(h.bearing) : " · " + h.locator;
+      li.append(el("span", "when", where));
+    }
     if (h.key) {
       const [text, cls] = KEY[h.key] || [h.key, "warn"];
       li.append(el("span", "detail " + cls, text));
@@ -363,6 +401,8 @@ document.getElementById("trust-form").addEventListener("submit", async (ev) => {
   loadTrust();
 });
 
+const radioText = ["kiss", "audio", "ptt"];
+const radioNumbers = ["txdelay_ms", "tnc_port", "persist", "slottime_ms", "bitrate", "guard_ms"];
 const liveFields = ["beacon_minutes", "radio_cost", "internet_cost", "retry_first_secs", "retry_max_secs", "retry_attempts"];
 let settingsFile = null;
 
@@ -390,10 +430,19 @@ function showSettings(v) {
   // Leave the form alone while someone is editing it.
   if (f.contains(document.activeElement) && document.activeElement.tagName === "INPUT") return;
   for (const k of liveFields) document.getElementById(k).value = v.live[k];
+  document.getElementById("locator").value = v.live.locator || "";
+  const r = v.live.radio;
+  document.getElementById("r-enabled").checked = r.enabled;
+  for (const k of radioText.concat(radioNumbers)) document.getElementById("r-" + k).value = r[k];
+  document.getElementById("radio-fields").hidden = !r.enabled;
+  document.getElementById("radio-note").textContent = v.radio_applies_now
+    ? "Radio changes open the new link at once."
+    : "Radio changes are saved and take a restart of the node.";
   document.getElementById("peers").replaceChildren(...v.live.peers.map(peerRow));
   const fixed = v.restart_to_change;
-  const rows = [["Radio", fixed.radio || "off"], ["Internet", fixed.internet_listen ? "listening on " + fixed.internet_listen : "not listening"],
+  const rows = [["Internet", fixed.internet_listen ? "listening on " + fixed.internet_listen : "not listening"],
     ["Web page", fixed.http], ["Store", fixed.store], ["Saved to", v.file || "nowhere: changes last until restart"]];
+  if (v.overridden.length) rows.push(["For this run", "set on the command line: " + v.overridden.join(", ") + " (changes to these are saved, and used once the node runs without them)"]);
   const dl = document.getElementById("fixed");
   dl.replaceChildren();
   for (const [k, val] of rows) dl.append(el("dt", null, k), el("dd", null, val));
@@ -406,6 +455,10 @@ async function loadSettings() {
   } catch (e) { /* the status line already says the node is unreachable */ }
 }
 
+document.getElementById("r-enabled").addEventListener("change", (ev) => {
+  document.getElementById("radio-fields").hidden = !ev.target.checked;
+});
+
 document.getElementById("add-peer").addEventListener("click", () => {
   const row = peerRow({ station: "", address: "" });
   document.getElementById("peers").append(row);
@@ -416,6 +469,10 @@ document.getElementById("settings-form").addEventListener("submit", async (ev) =
   ev.preventDefault();
   const body = {};
   for (const k of liveFields) body[k] = Number(document.getElementById(k).value);
+  body.locator = document.getElementById("locator").value.trim();
+  body.radio = { enabled: document.getElementById("r-enabled").checked };
+  for (const k of radioText) body.radio[k] = document.getElementById("r-" + k).value.trim();
+  for (const k of radioNumbers) body.radio[k] = Number(document.getElementById("r-" + k).value);
   body.peers = [...document.querySelectorAll("#peers .peer")]
     .map((row) => { const [c, a] = row.querySelectorAll("input"); return { station: c.value.trim().toUpperCase(), address: a.value.trim() }; })
     .filter((p) => p.station || p.address);
@@ -436,12 +493,12 @@ async function loadStatus() {
     me = s.call;
     document.getElementById("call").textContent = s.call;
     document.title = s.call + " · hm-net";
-    const radio = s.radio === null ? "No radio." : s.radio ? "Radio up: " + s.radio_via + "." : "Radio down (" + s.radio_via + ").";
+    const grid = s.locator ? s.locator + ". " : "";
+    const radio = grid + (s.radio === null ? "No radio." : s.radio ? "Radio up: " + s.radio_via + "." : "Radio down (" + s.radio_via + ").");
     const peers = s.internet_peers.length ? "linked to " + s.internet_peers.join(", ") : "no stations linked";
     const net = s.internet_listen ? " Internet: " + peers + "." : "";
     document.getElementById("station-line").textContent = radio + net + " Your line for other stations: " + s.trust_line;
     document.getElementById("heard-section").hidden = s.radio === null;
-    document.getElementById("beacon-set").hidden = s.radio === null;
     renderHeard(s.heard);
     document.getElementById("token-form").hidden = true;
   } catch (e) {

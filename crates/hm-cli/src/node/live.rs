@@ -10,10 +10,10 @@ use std::time::SystemTime;
 
 use hm_ident::PublicKey;
 use hm_store::RetryPolicy;
-use hm_wire::Callsign;
+use hm_wire::{Callsign, Locator};
 
 use super::choose::Costs;
-use crate::config::{self, Config};
+use crate::config::{self, Config, RadioSettings};
 use crate::files::Trust;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -26,6 +26,10 @@ pub struct Live {
     /// Seconds between beacons; 0 sends none. (Minutes in station.toml.)
     pub beacon_secs: u64,
     pub peers: Vec<(Callsign, String)>,
+    /// Grid locator sent in beacons.
+    pub locator: Option<Locator>,
+    /// `[radio]`: a change opens a new radio link (see `node::RadioBuilder`).
+    pub radio: RadioSettings,
 }
 
 impl Live {
@@ -49,6 +53,8 @@ impl Live {
             },
             beacon_secs: c.radio.beacon_minutes.saturating_mul(60),
             peers: c.peers()?,
+            locator: c.locator()?,
+            radio: c.radio.clone(),
         })
     }
 
@@ -70,7 +76,14 @@ pub struct Change {
     pub retry_max_secs: Option<u64>,
     pub retry_attempts: Option<u32>,
     pub peers: Option<Vec<(Callsign, String)>>,
+    /// `Some(None)` removes the locator.
+    pub locator: Option<Option<Locator>>,
+    /// The whole `[radio]` section as it should be (beacon interval aside).
+    pub radio: Option<RadioSettings>,
 }
+
+/// Command-line settings for this run, applied over the file each time it is read.
+pub type Overrides = std::sync::Arc<dyn Fn(&mut Config) + Send + Sync>;
 
 pub struct LiveConfig {
     /// The settings in use and a version bumped on every change.
@@ -80,6 +93,7 @@ pub struct LiveConfig {
     /// because some file systems keep times to the second only). Also held
     /// while editing, so two edits cannot lose each other's change.
     seen: Mutex<Option<(SystemTime, u64)>>,
+    overrides: Option<Overrides>,
 }
 
 fn fingerprint(path: &Path) -> Option<(SystemTime, u64)> {
@@ -99,7 +113,14 @@ impl LiveConfig {
             current: RwLock::new((live, 0)),
             file,
             seen: Mutex::new(seen),
+            overrides: None,
         }
+    }
+
+    /// Apply `o` over the file every time it is read.
+    pub fn with_overrides(mut self, o: Option<Overrides>) -> LiveConfig {
+        self.overrides = o;
+        self
     }
 
     pub fn get(&self) -> Live {
@@ -125,8 +146,11 @@ impl LiveConfig {
         true
     }
 
-    fn read_file(path: &Path) -> Result<Live, String> {
-        let c = Config::load(path).map_err(|e| e.to_string())?;
+    fn read_file(&self, path: &Path) -> Result<Live, String> {
+        let mut c = Config::load(path).map_err(|e| e.to_string())?;
+        if let Some(o) = &self.overrides {
+            o(&mut c);
+        }
         Live::from_config(&c).map_err(|e| format!("{}: {e}", path.display()))
     }
 
@@ -143,7 +167,7 @@ impl LiveConfig {
             }
             *seen = now;
         }
-        match LiveConfig::read_file(path) {
+        match self.read_file(path) {
             Ok(live) => self.replace(live).then_some(Ok(())),
             Err(e) => Some(Err(e)),
         }
@@ -161,7 +185,7 @@ impl LiveConfig {
             Some(path) => {
                 edit(path)?;
                 *seen = fingerprint(path);
-                self.replace(LiveConfig::read_file(path).map_err(invalid)?);
+                self.replace(self.read_file(path).map_err(invalid)?);
             }
             None => {
                 let mut live = self.get();
@@ -212,6 +236,12 @@ impl LiveConfig {
         if c.retry_attempts == Some(0) || c.retry_first_secs == Some(0) {
             return bad("retries need at least one attempt and a delay of at least a second");
         }
+        if let Some(r) = &c.radio {
+            if let Err(e) = r.check() {
+                return bad(&e);
+            }
+        }
+        let radio_now = self.get().radio;
         let edit = |p: &Path| -> io::Result<()> {
             if let Some(v) = c.beacon_minutes {
                 config::set_value(p, "radio", "beacon_minutes", v as i64)?;
@@ -232,6 +262,14 @@ impl LiveConfig {
             }
             if let Some(peers) = &c.peers {
                 config::set_peers(p, peers)?;
+            }
+            if let Some(r) = &c.radio {
+                config::set_radio(p, &radio_now, r)?;
+            }
+            match c.locator {
+                Some(Some(l)) => config::set_value(p, "station", "locator", l.to_string())?,
+                Some(None) => config::unset_value(p, "station", "locator")?,
+                None => {}
             }
             Ok(())
         };
@@ -258,6 +296,15 @@ impl LiveConfig {
             if let Some(p) = c2.peers {
                 l.peers = p;
             }
+            if let Some(g) = c2.locator {
+                l.locator = g;
+            }
+            if let Some(r) = c2.radio {
+                l.radio = RadioSettings {
+                    beacon_minutes: l.radio.beacon_minutes,
+                    ..r
+                };
+            }
         })
     }
 }
@@ -274,7 +321,10 @@ mod tests {
     fn edits_are_saved_and_outside_edits_are_picked_up() {
         let path = std::env::temp_dir().join(format!("hm-live-{}.toml", std::process::id()));
         std::fs::write(&path, "# my station\n[radio]\nbeacon_minutes = 10 # every ten\n").unwrap();
-        let live = LiveConfig::new(LiveConfig::read_file(&path).unwrap(), Some(path.clone()));
+        let live = LiveConfig::new(
+            Live::from_config(&Config::load(&path).unwrap()).unwrap(),
+            Some(path.clone()),
+        );
         assert_eq!((live.get().trust.len(), live.version()), (0, 0));
 
         live.add_trust(call("SO5KM-1"), PublicKey([1; 32]), Some("Jan"))
@@ -345,5 +395,27 @@ mod tests {
         );
         assert!(live.remove_trust(call("SO5KM")).unwrap());
         assert_eq!(live.reload_if_changed(), None);
+    }
+
+    #[test]
+    fn command_line_overrides_outlast_edits_to_the_file() {
+        let path = std::env::temp_dir().join(format!("hm-live-o-{}.toml", std::process::id()));
+        std::fs::write(&path, "[radio]\nbeacon_minutes = 10\nkiss = \"127.0.0.1:8001\"\n").unwrap();
+        let o: Overrides = std::sync::Arc::new(|c: &mut Config| c.radio.kiss = "127.0.0.1:9001".into());
+        let mut c = Config::load(&path).unwrap();
+        o(&mut c);
+        let live =
+            LiveConfig::new(Live::from_config(&c).unwrap(), Some(path.clone())).with_overrides(Some(o));
+        live.add_trust(call("SO5KM"), PublicKey([1; 32]), None).unwrap();
+        live.change(Change {
+            beacon_minutes: Some(5),
+            ..Change::default()
+        })
+        .unwrap();
+        let l = live.get();
+        assert_eq!((l.radio.kiss.as_str(), l.beacon_secs), ("127.0.0.1:9001", 300));
+        // The file keeps its own value.
+        assert!(std::fs::read_to_string(&path).unwrap().contains("127.0.0.1:8001"));
+        std::fs::remove_file(&path).unwrap();
     }
 }

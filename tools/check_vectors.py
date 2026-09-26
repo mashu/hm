@@ -144,7 +144,7 @@ def check(text: str) -> None:
     receiver.verify(statement, receipt)
     print("ok  receipt ACK (signature by the receiver)")
 
-    # Beacon: broadcast, session and index 0, flags, key, time, heard list,
+    # Beacon: broadcast, session and index 0, flags, key, time, locator, heard list,
     # and a signature over "hm/beacon-sig/v0" || source callsign || body.
     s_b = section(text, "## Beacon")
     b = bytes.fromhex(re.search(r"beacon ([0-9a-f]+)", s_b).group(1))
@@ -152,9 +152,10 @@ def check(text: str) -> None:
     assert b[13:18] == bytes(5), "session and index 0"
     p = b[18:]
     assert p[0] == 0x01 and p[1:33] == me.encode(), "flags and key"
-    assert int.from_bytes(p[33:37], "big") == 1_790_000_000 and p[37] == 1
-    assert unpack(p[38:44]) == "SO5KM-1" and p[44] == 3 and len(p) == 38 + 7 + 64
-    me.verify(b"hm/beacon-sig/v0" + b[1:7] + p[:45], p[45:])
+    assert int.from_bytes(p[33:37], "big") == 1_790_000_000
+    assert p[37:43] == b"JO89XI" and p[43] == 1, "locator and heard count"
+    assert unpack(p[44:50]) == "SO5KM-1" and p[50] == 3 and len(p) == 44 + 7 + 64
+    me.verify(b"hm/beacon-sig/v0" + b[1:7] + p[:51], p[51:])
     print("ok  beacon (layout, signature)")
 
 

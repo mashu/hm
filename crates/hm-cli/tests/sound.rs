@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use hm_cli::config::RadioSettings;
 use hm_cli::driver::Link;
 use hm_cli::files::{KeyFile, Trust};
 use hm_cli::node::choose::Costs;
@@ -184,8 +185,12 @@ fn start(ether: &Ether, key: &KeyFile, me: &str, peer: &KeyFile, db: &Tmp) -> no
             },
             beacon_secs: 0,
             peers: vec![],
+            locator: None,
+            radio: RadioSettings::default(),
         },
         config_file: None,
+        overrides: None,
+        overridden: vec![],
         me: call(me),
         radio: Some(RadioConfig {
             link: RadioLink::Modem {
@@ -201,6 +206,7 @@ fn start(ether: &Ether, key: &KeyFile, me: &str, peer: &KeyFile, db: &Tmp) -> no
                 max_rounds: 12,
             },
         }),
+        radio_builder: None,
         internet: None,
         store: db.0.clone(),
         http: "127.0.0.1:0".parse().unwrap(),
