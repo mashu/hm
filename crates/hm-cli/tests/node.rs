@@ -377,6 +377,14 @@ fn internet_only_nodes_exchange_mail_both_ways() {
         trust_file: None,
     });
     assert!(get(a.http_addr, "/api/status")["radio"].is_null());
+    // The server's page listens for changes; it hears of the message at once.
+    let mut events = TcpStream::connect(server.http_addr).unwrap();
+    write!(
+        events,
+        "GET /api/events HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {TOKEN}\r\nAccept: text/event-stream\r\n\r\n"
+    )
+    .unwrap();
+    events.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
     send(a.http_addr, json!({"to": "SO5KM", "text": "via the internet"}));
     let sent = delivered(a.http_addr, 1, "internet delivery");
     assert_eq!(
@@ -384,10 +392,37 @@ fn internet_only_nodes_exchange_mail_both_ways() {
         (Some(true), Some("internet"))
     );
     assert_eq!(inbox(server.http_addr)[0]["text"], "via the internet");
+    let mut seen = String::new();
+    let mut buf = [0u8; 1024];
+    while !seen.contains("data: message") {
+        let n = events.read(&mut buf).expect("an event within 30 s");
+        assert!(n > 0, "event stream closed: {seen}");
+        seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+    }
+    assert!(seen.contains("text/event-stream"), "{seen}");
     // The server never dialled; it answers over the link SA0KAM opened.
     send(server.http_addr, json!({"to": "SA0KAM", "text": "and back"}));
     delivered(server.http_addr, 1, "delivery back");
     assert_eq!(inbox(a.http_addr)[0]["text"], "and back");
+    // One conversation, both ways, newest first; mail with a subject is not chat.
+    send(
+        a.http_addr,
+        json!({"to": "SO5KM", "subject": "Sked", "text": "40 m at 19Z?"}),
+    );
+    let chat = get(a.http_addr, "/api/messages?direction=all&peer=SO5KM&kind=chat");
+    let lines: Vec<(&str, &str)> = chat
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| (m["direction"].as_str().unwrap(), m["text"].as_str().unwrap()))
+        .collect();
+    assert_eq!(lines, vec![("in", "and back"), ("out", "via the internet")]);
+    let mail = get(a.http_addr, "/api/messages?direction=all&kind=mail");
+    assert_eq!(mail.as_array().unwrap().len(), 1);
+    assert!(get(a.http_addr, "/api/messages?direction=all&peer=SP5AAA")
+        .as_array()
+        .unwrap()
+        .is_empty());
     a.stop().unwrap();
     server.stop().unwrap();
 }

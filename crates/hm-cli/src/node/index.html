@@ -6,228 +6,337 @@
 <title>hm-net station</title>
 <style>
   :root {
-    --ink: #1b2a33; --muted: #5b6b73; --paper: #f5f7f6; --sheet: #ffffff;
-    --rule: #c9d3d6; --focus: #1f6fb2; --ok: #1e7a46; --warn: #9a6400; --bad: #b3261e;
+    --ink: #17232b; --muted: #5a6a72; --paper: #eef2f1; --sheet: #ffffff; --raised: #f7f9f8;
+    --rule: #cfd8da; --focus: #1f6fb2; --accent: #0f5c8c; --accent-ink: #ffffff;
+    --ok: #1e7a46; --warn: #9a6400; --bad: #b3261e;
+    --mine: #0f5c8c; --mine-ink: #ffffff; --theirs: #ffffff; --theirs-ink: #17232b;
     --priority: #c99a00; --immediate: #d0620a; --flash: #c62828;
+    --radius: 10px;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --ink: #e3eaec; --muted: #9aabb2; --paper: #121a1f; --sheet: #182329;
-      --rule: #2c3b43; --focus: #6fb0e8; --ok: #5ec48a; --warn: #e0b04a; --bad: #f07a72;
+      --ink: #e3eaec; --muted: #98aab1; --paper: #0f171b; --sheet: #162127; --raised: #1b2830;
+      --rule: #2a3a42; --focus: #6fb0e8; --accent: #4f9fd6; --accent-ink: #0b1418;
+      --ok: #5ec48a; --warn: #e0b04a; --bad: #f07a72;
+      --mine: #2c6f9c; --mine-ink: #f2f7fa; --theirs: #1f2d35; --theirs-ink: #e3eaec;
     }
   }
   * { box-sizing: border-box; }
+  html, body { height: 100%; }
   body {
     margin: 0; background: var(--paper); color: var(--ink);
     font: 16px/1.5 "Atkinson Hyperlegible", "Segoe UI", system-ui, -apple-system, sans-serif;
     font-variant-numeric: tabular-nums;
+    display: flex; flex-direction: column; min-height: 100vh;
   }
-  header { padding: 1.5rem clamp(1rem, 4vw, 2.5rem) 1rem; border-bottom: 2px solid var(--ink); }
-  h1 { margin: 0; font-size: clamp(2rem, 6vw, 3.25rem); line-height: 1; letter-spacing: 0.04em; font-weight: 800; }
-  .station-line { margin: 0.4rem 0 0; color: var(--muted); font-size: 0.95rem; overflow-wrap: anywhere; }
-  main {
-    display: grid; gap: 2rem; padding: 1.5rem clamp(1rem, 4vw, 2.5rem) 3rem;
-    grid-template-columns: minmax(0, 22rem) minmax(0, 1fr); align-items: start;
-  }
-  @media (max-width: 52rem) { main { grid-template-columns: minmax(0, 1fr); } }
-  h2 { font-size: 1.15rem; margin: 0 0 0.75rem; }
-  form { background: var(--sheet); border: 1px solid var(--rule); padding: 1rem; }
-  label { display: block; font-weight: 600; margin: 0.75rem 0 0.25rem; }
-  label:first-of-type { margin-top: 0; }
-  .hint { font-weight: 400; color: var(--muted); }
-  input, textarea, select, button { font: inherit; color: inherit; }
-  input, textarea, select {
-    width: 100%; padding: 0.5rem 0.6rem; background: var(--paper); border: 1px solid var(--rule); border-radius: 2px;
-  }
-  textarea { min-height: 8rem; resize: vertical; }
-  #to { text-transform: uppercase; font-weight: 700; letter-spacing: 0.04em; }
-  button {
-    margin-top: 1rem; padding: 0.6rem 1rem; border: 2px solid var(--ink); background: var(--ink);
-    color: var(--paper); font-weight: 700; cursor: pointer; border-radius: 2px;
-  }
+  button, input, textarea, select { font: inherit; color: inherit; }
   :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
-  #form-status { margin: 0.75rem 0 0; min-height: 1.5em; }
-  .tabs { display: flex; gap: 0; border-bottom: 1px solid var(--rule); margin-bottom: 0.25rem; }
-  .tabs button {
-    margin: 0; background: none; color: var(--muted); border: 0; border-bottom: 3px solid transparent;
-    padding: 0.5rem 0.9rem; font-weight: 600;
+  [hidden] { display: none !important; }
+  code { font-size: 0.9em; }
+
+  /* Top bar */
+  header.bar {
+    background: var(--sheet); border-bottom: 1px solid var(--rule);
+    padding: 0.75rem clamp(1rem, 3vw, 2rem) 0; position: sticky; top: 0; z-index: 2;
   }
-  .tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--ink); }
+  .who-am-i { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem 1rem; }
+  h1 { margin: 0; font-size: clamp(1.6rem, 4.5vw, 2.2rem); line-height: 1.1; letter-spacing: 0.04em; font-weight: 800; }
+  .chips { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.1rem 0.6rem; border-radius: 999px;
+    border: 1px solid var(--rule); font-size: 0.85rem; color: var(--muted); background: var(--raised);
+  }
+  .chip::before { content: ""; width: 0.55rem; height: 0.55rem; border-radius: 50%; background: var(--muted); }
+  .chip.ok::before { background: var(--ok); } .chip.warn::before { background: var(--warn); } .chip.bad::before { background: var(--bad); }
+  .chip.plain::before { display: none; }
+  nav.tabs { display: flex; gap: 0.25rem; margin-top: 0.6rem; overflow-x: auto; }
+  nav.tabs a {
+    padding: 0.5rem 0.9rem; color: var(--muted); text-decoration: none; font-weight: 700;
+    border-bottom: 3px solid transparent; white-space: nowrap;
+  }
+  nav.tabs a[aria-current="page"] { color: var(--ink); border-bottom-color: var(--accent); }
+  .badge {
+    display: inline-block; min-width: 1.3rem; padding: 0 0.35rem; margin-left: 0.3rem; border-radius: 999px;
+    background: var(--accent); color: var(--accent-ink); font-size: 0.75rem; text-align: center; line-height: 1.3rem;
+  }
+
+  main { flex: 1; display: flex; flex-direction: column; padding: 1rem clamp(1rem, 3vw, 2rem) 2rem; gap: 1rem; }
+  .view { width: 100%; max-width: 72rem; margin: 0 auto; }
+  h2 { font-size: 1.1rem; margin: 0 0 0.6rem; }
+  .card { background: var(--sheet); border: 1px solid var(--rule); border-radius: var(--radius); padding: 1rem; }
+  .hint { font-weight: 400; color: var(--muted); }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .empty { color: var(--muted); padding: 1rem 0; }
+  label { display: block; font-weight: 600; margin: 0.75rem 0 0.25rem; }
+  input, textarea, select {
+    width: 100%; padding: 0.5rem 0.6rem; background: var(--raised); border: 1px solid var(--rule); border-radius: 6px;
+  }
+  textarea { resize: vertical; }
+  .btn {
+    display: inline-block; margin-top: 1rem; padding: 0.55rem 1rem; border: 0; border-radius: 6px;
+    background: var(--accent); color: var(--accent-ink); font-weight: 700; cursor: pointer; text-decoration: none;
+  }
+  .btn.quiet { background: none; color: var(--ink); border: 1px solid var(--rule); font-weight: 600; }
+  .btn.small { margin: 0; padding: 0.15rem 0.6rem; font-size: 0.85rem; }
+  #token-form { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; max-width: 40rem; margin: 0.5rem 0 0.75rem; }
+  #token-form label { margin: 0; flex-basis: 100%; }
+  #token-form input { flex: 1 1 16rem; width: auto; }
+  #token-form .btn { margin: 0; }
+
+  /* Chat */
+  .chat { display: grid; grid-template-columns: minmax(14rem, 20rem) minmax(0, 1fr); gap: 1rem; height: calc(100vh - 11rem); min-height: 26rem; }
+  .convos { display: flex; flex-direction: column; min-height: 0; padding: 0; overflow: hidden; }
+  .convos form { display: flex; gap: 0.4rem; padding: 0.75rem; border-bottom: 1px solid var(--rule); }
+  .convos form input { text-transform: uppercase; }
+  .convos form .btn { margin: 0; }
+  .convos ul { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
+  .convos li a {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 0.5rem; padding: 0.65rem 0.9rem;
+    color: inherit; text-decoration: none; border-bottom: 1px solid var(--rule);
+  }
+  .convos li a[aria-current="true"] { background: var(--raised); box-shadow: inset 3px 0 0 var(--accent); }
+  .convos .name { font-weight: 800; letter-spacing: 0.03em; }
+  .convos .time { color: var(--muted); font-size: 0.8rem; }
+  .convos .last { grid-column: 1 / -1; color: var(--muted); font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .convos li.empty { padding: 1rem; }
+  .thread { display: flex; flex-direction: column; min-height: 0; padding: 0; overflow: hidden; }
+  .thread-head { display: flex; align-items: center; gap: 0.75rem; padding: 0.7rem 1rem; border-bottom: 1px solid var(--rule); flex-wrap: wrap; }
+  .thread-head h2 { margin: 0; letter-spacing: 0.04em; }
+  .thread-head .sub { color: var(--muted); font-size: 0.85rem; }
+  .back { display: none; }
+  .lines { list-style: none; margin: 0; padding: 1rem; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 0.35rem; }
+  .lines .day { align-self: center; color: var(--muted); font-size: 0.8rem; margin: 0.5rem 0; }
+  .bubble {
+    max-width: min(34rem, 85%); padding: 0.45rem 0.75rem; border-radius: 14px; white-space: pre-wrap; overflow-wrap: anywhere;
+    background: var(--theirs); color: var(--theirs-ink); border: 1px solid var(--rule); align-self: flex-start;
+  }
+  .bubble.mine { background: var(--mine); color: var(--mine-ink); border-color: transparent; align-self: flex-end; }
+  .bubble .meta { display: block; font-size: 0.75rem; opacity: 0.8; margin-top: 0.15rem; text-align: right; }
+  .bubble.failed { outline: 2px solid var(--bad); }
+  .bubble.unverified .meta { color: var(--warn); opacity: 1; }
+  .composer { display: flex; gap: 0.5rem; padding: 0.75rem; border-top: 1px solid var(--rule); align-items: end; }
+  .composer textarea { min-height: 2.6rem; max-height: 10rem; resize: none; }
+  .composer .btn { margin: 0; }
+  .placeholder { margin: auto; color: var(--muted); text-align: center; padding: 2rem; }
+  @media (max-width: 48rem) {
+    .chat { grid-template-columns: minmax(0, 1fr); height: calc(100vh - 10rem); }
+    .chat.open .convos { display: none; }
+    .chat:not(.open) .thread { display: none; }
+    .back { display: inline-block; }
+  }
+
+  /* Mail */
+  .mail { display: grid; grid-template-columns: minmax(0, 22rem) minmax(0, 1fr); gap: 1rem; align-items: start; }
+  @media (max-width: 52rem) { .mail { grid-template-columns: minmax(0, 1fr); } }
+  #to { text-transform: uppercase; font-weight: 700; letter-spacing: 0.04em; }
+  .subtabs { display: flex; border-bottom: 1px solid var(--rule); margin-bottom: 0.25rem; }
+  .subtabs button { background: none; border: 0; border-bottom: 3px solid transparent; padding: 0.5rem 0.9rem; font-weight: 700; color: var(--muted); cursor: pointer; }
+  .subtabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
   ol.log { list-style: none; margin: 0; padding: 0; }
   ol.log li {
     display: grid; grid-template-columns: 5.5rem 7rem minmax(0, 1fr); gap: 0.25rem 1rem;
     padding: 0.7rem 0.5rem 0.7rem 0.9rem; border-bottom: 1px solid var(--rule); border-left: 4px solid transparent;
   }
-  ol.log li.p1 { border-left-color: var(--priority); }
-  ol.log li.p2 { border-left-color: var(--immediate); }
-  ol.log li.p3 { border-left-color: var(--flash); }
+  ol.log li.p1 { border-left-color: var(--priority); } ol.log li.p2 { border-left-color: var(--immediate); } ol.log li.p3 { border-left-color: var(--flash); }
   ol.log li.unread .body { font-weight: 700; }
+  ol.log li.empty { display: block; }
   @media (max-width: 34rem) { ol.log li { grid-template-columns: 4.5rem minmax(0, 1fr); } ol.log .body { grid-column: 1 / -1; } }
   .when { color: var(--muted); }
   .who { font-weight: 700; letter-spacing: 0.03em; overflow-wrap: anywhere; }
   .body { overflow-wrap: anywhere; white-space: pre-wrap; }
   .subject { display: block; font-weight: 700; }
   .state { display: block; font-size: 0.9rem; margin-top: 0.2rem; color: var(--muted); }
-  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
-  .empty { color: var(--muted); padding: 1rem 0; }
-  button.read { margin: 0.3rem 0 0; padding: 0.15rem 0.5rem; font-size: 0.85rem; background: none; color: var(--ink); border-width: 1px; }
-  #token-form { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; margin-top: 0.75rem; max-width: 40rem; border: 0; padding: 0; background: none; }
-  #token-form[hidden] { display: none; }
-  #token-form label { margin: 0; flex-basis: 100%; }
-  #token-form input { flex: 1 1 16rem; width: auto; }
-  #token-form button { margin: 0; }
-  #heard-section { margin-top: 2rem; }
-  ul.heard { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--rule); }
-  ul.heard li { padding: 0.5rem 0; border-bottom: 1px solid var(--rule); }
-  ul.heard .detail { display: block; font-size: 0.9rem; color: var(--muted); }
-  ul.heard .detail.ok { color: var(--ok); } ul.heard .detail.warn { color: var(--warn); }
-  ul.heard .detail.bad { color: var(--bad); font-weight: 700; }
-  ol.log li.empty { display: block; }
-  #trust-section { margin-top: 2rem; }
-  ul.trust { list-style: none; margin: 0 0 0.75rem; padding: 0; border-top: 1px solid var(--rule); }
-  ul.trust li { display: flex; gap: 0.5rem; align-items: baseline; padding: 0.45rem 0; border-bottom: 1px solid var(--rule); }
-  ul.trust .key { flex: 1; min-width: 0; color: var(--muted); font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  ul.trust button { margin: 0; padding: 0.1rem 0.5rem; font-size: 0.85rem; background: none; color: var(--ink); border-width: 1px; }
-  #trust-form { background: none; border: 0; padding: 0; }
-  #trust-form button { margin-top: 0.5rem; }
-  #trust-note { font-size: 0.9rem; color: var(--muted); margin: 0.5rem 0 0; min-height: 1.4em; }
-  #trust-note.ok { color: var(--ok); } #trust-note.bad { color: var(--bad); }
-  ul.trust .note { color: var(--ink); font-size: 0.9rem; }
-  #settings-section { margin-top: 2rem; }
-  #settings-form { padding: 1rem; }
-  #settings-form fieldset { border: 0; margin: 0 0 1rem; padding: 0; }
-  #settings-form legend { font-weight: 700; padding: 0; margin-bottom: 0.25rem; }
+  .state.ok { color: var(--ok); } .state.warn { color: var(--warn); } .state.bad { color: var(--bad); }
+  #form-status { margin: 0.75rem 0 0; min-height: 1.5em; }
+
+  /* Stations */
+  .stations { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1rem; align-items: start; }
+  @media (max-width: 52rem) { .stations { grid-template-columns: minmax(0, 1fr); } }
+  ul.list { list-style: none; margin: 0; padding: 0; }
+  ul.list li { display: flex; flex-wrap: wrap; gap: 0.25rem 0.6rem; align-items: baseline; padding: 0.6rem 0; border-bottom: 1px solid var(--rule); }
+  ul.list li:last-child { border-bottom: 0; }
+  ul.list .grow { flex: 1; min-width: 0; }
+  ul.list .detail { display: block; font-size: 0.9rem; color: var(--muted); }
+  ul.list .detail.ok { color: var(--ok); } ul.list .detail.warn { color: var(--warn); } ul.list .detail.bad { color: var(--bad); font-weight: 700; }
+  ul.list .key { display: block; color: var(--muted); font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #trust-note, #settings-note { font-size: 0.9rem; color: var(--muted); margin: 0.5rem 0 0; min-height: 1.4em; }
+  #trust-note.ok, #settings-note.ok { color: var(--ok); } #trust-note.bad, #settings-note.bad { color: var(--bad); }
+  .myline { overflow-wrap: anywhere; font-size: 0.9rem; }
+
+  /* Settings */
+  .settings { max-width: 46rem; }
+  fieldset { border: 0; margin: 0 0 1.25rem; padding: 0; }
+  legend { font-weight: 800; font-size: 1.05rem; padding: 0; margin-bottom: 0.25rem; }
   .pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 0.75rem; }
   .pair label { margin-top: 0.5rem; }
-  .peer { display: grid; grid-template-columns: minmax(0, 7rem) minmax(0, 1fr) auto; gap: 0.4rem; margin-top: 0.4rem; }
-  .peer input { text-transform: none; }
-  .peer input:first-child { text-transform: uppercase; }
-  .peer button, #add-peer { margin: 0; padding: 0.2rem 0.6rem; font-size: 0.85rem; background: none; color: var(--ink); border-width: 1px; }
-  #add-peer { margin-top: 0.5rem; }
-  label.check { display: flex; gap: 0.5rem; align-items: center; font-weight: 600; }
+  label.check { display: flex; gap: 0.5rem; align-items: center; }
   label.check input { width: auto; }
   details { margin-top: 0.75rem; }
   summary { cursor: pointer; color: var(--muted); }
-  #settings-note { font-size: 0.9rem; color: var(--muted); margin: 0.5rem 0 0; min-height: 1.4em; }
-  #settings-note.ok { color: var(--ok); } #settings-note.bad { color: var(--bad); }
+  .peer { display: grid; grid-template-columns: minmax(0, 7rem) minmax(0, 1fr) auto; gap: 0.4rem; margin-top: 0.4rem; }
+  .peer input:first-child { text-transform: uppercase; }
   dl.fixed { margin: 0.75rem 0 0; font-size: 0.9rem; color: var(--muted); display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.1rem 0.75rem; }
   dl.fixed dd { margin: 0; overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
-<header>
-  <h1 id="call">…</h1>
-  <p class="station-line" id="station-line">Connecting to the node…</p>
+<header class="bar">
+  <div class="who-am-i">
+    <h1 id="call">…</h1>
+    <div class="chips" aria-live="polite">
+      <span class="chip plain" id="chip-grid" hidden></span>
+      <span class="chip" id="chip-radio">Radio</span>
+      <span class="chip" id="chip-net" hidden>Internet</span>
+      <span class="chip" id="chip-live" title="Updates arrive as they happen">Connecting…</span>
+    </div>
+  </div>
   <form id="token-form" hidden>
-    <label for="token">Access token <span class="hint">(printed by <code>hm node</code> at start-up, and kept in the file beside the store)</span></label>
+    <label for="token">Access token <span class="hint">(printed by <code>hm node</code> at start-up, and kept in <code>station.token</code>)</span></label>
     <input id="token" autocomplete="off" spellcheck="false">
-    <button type="submit">Use token</button>
+    <button class="btn" type="submit">Use token</button>
   </form>
+  <nav class="tabs" aria-label="Views">
+    <a href="#chat" data-view="chat">Chat<span class="badge" id="badge-chat" hidden></span></a>
+    <a href="#mail" data-view="mail">Mail<span class="badge" id="badge-mail" hidden></span></a>
+    <a href="#stations" data-view="stations">Stations</a>
+    <a href="#settings" data-view="settings">Settings</a>
+  </nav>
 </header>
 <main>
-  <section aria-labelledby="compose-title">
-    <h2 id="compose-title">New message</h2>
-    <form id="compose" autocomplete="off">
-      <label for="to">To</label>
-      <input id="to" name="to" required maxlength="9" placeholder="SO5KM-1" spellcheck="false">
-      <label for="subject">Subject <span class="hint">(optional; makes it mail)</span></label>
-      <input id="subject" name="subject" maxlength="128">
-      <label for="text">Message</label>
-      <textarea id="text" name="text" required></textarea>
-      <label for="precedence">Precedence</label>
-      <select id="precedence" name="precedence">
-        <option value="routine">Routine</option>
-        <option value="priority">Priority</option>
-        <option value="immediate">Immediate</option>
-        <option value="flash">Flash</option>
-      </select>
-      <button type="submit">Queue message</button>
-      <p id="form-status" role="status"></p>
-    </form>
-    <div id="heard-section" aria-labelledby="heard-title">
-      <h2 id="heard-title">Heard on the radio</h2>
-      <ul class="heard" id="heard"></ul>
-    </div>
-    <div id="trust-section" aria-labelledby="trust-title">
-      <h2 id="trust-title">Trusted stations</h2>
-      <ul class="trust" id="trust"></ul>
-      <form id="trust-form" autocomplete="off">
-        <label for="trust-line">Add a station <span class="hint">(the line <code>hm whoami</code> prints on their side)</span></label>
-        <input id="trust-line" required spellcheck="false" placeholder="SO5KM-1 8a1e…">
-        <label for="trust-who">Note <span class="hint">(optional, e.g. a name)</span></label>
-        <input id="trust-who" maxlength="80">
-        <button type="submit">Trust this station</button>
-        <p id="trust-note" role="status"></p>
-      </form>
-    </div>
-    <div id="settings-section" aria-labelledby="settings-title">
-      <h2 id="settings-title">Settings</h2>
-      <form id="settings-form" autocomplete="off">
-        <fieldset>
-          <legend>Station</legend>
-          <label for="locator">Grid locator <span class="hint">(like JO89xi; sent in beacons, empty for none)</span></label>
-          <input id="locator" maxlength="6" spellcheck="false" pattern="[A-Ra-r]{2}[0-9]{2}([A-Xa-x]{2})?">
-        </fieldset>
-        <fieldset>
-          <legend>Radio</legend>
-          <label class="check"><input id="r-enabled" type="checkbox"> Use a radio</label>
-          <div id="radio-fields">
-            <label for="r-kiss">KISS TNC <span class="hint">(Direwolf <code>127.0.0.1:8001</code>, or <code>serial:/dev/ttyUSB0:9600</code>)</span></label>
-            <input id="r-kiss" spellcheck="false">
-            <label for="r-audio">Sound card <span class="hint">(the built-in modem instead of a TNC; empty for a TNC)</span></label>
-            <input id="r-audio" spellcheck="false" placeholder="default">
-            <label for="r-ptt">PTT <span class="hint">(built-in modem: vox, rigctld, rts:/dev/ttyUSB0, cm108:/dev/hidraw0)</span></label>
-            <input id="r-ptt" spellcheck="false">
-            <div class="pair">
-              <div><label for="r-txdelay_ms">Key-up delay <span class="hint">(ms)</span></label><input id="r-txdelay_ms" type="number" min="0" step="10"></div>
-              <div><label for="r-tnc_port">TNC port</label><input id="r-tnc_port" type="number" min="0" max="15" step="1"></div>
-            </div>
-            <details>
-              <summary>Channel access and timing</summary>
-              <div class="pair">
-                <div><label for="r-persist">Persistence <span class="hint">(0–255)</span></label><input id="r-persist" type="number" min="0" max="255" step="1"></div>
-                <div><label for="r-slottime_ms">Slot time <span class="hint">(ms)</span></label><input id="r-slottime_ms" type="number" min="0" step="10"></div>
-                <div><label for="r-bitrate">Bit rate <span class="hint">(bd)</span></label><input id="r-bitrate" type="number" min="1" step="1"></div>
-                <div><label for="r-guard_ms">Guard <span class="hint">(ms)</span></label><input id="r-guard_ms" type="number" min="0" step="10"></div>
-              </div>
-            </details>
-            <label for="beacon_minutes">Beacon every <span class="hint">(minutes; 0 turns it off)</span></label>
-            <input id="beacon_minutes" type="number" min="0" step="1" required>
-          </div>
-          <p class="hint" id="radio-note"></p>
-        </fieldset>
-        <fieldset>
-          <legend>Delivery</legend>
-          <div class="pair">
-            <div><label for="radio_cost">Radio cost</label><input id="radio_cost" type="number" min="0.01" step="0.01" required></div>
-            <div><label for="internet_cost">Internet cost</label><input id="internet_cost" type="number" min="0.01" step="0.01" required></div>
-          </div>
-          <p class="hint">The cheaper way that reaches a station is tried first.</p>
-          <div class="pair">
-            <div><label for="retry_first_secs">First retry <span class="hint">(s)</span></label><input id="retry_first_secs" type="number" min="1" step="1" required></div>
-            <div><label for="retry_max_secs">Longest wait <span class="hint">(s)</span></label><input id="retry_max_secs" type="number" min="1" step="1" required></div>
-          </div>
-          <label for="retry_attempts">Attempts before giving up</label>
-          <input id="retry_attempts" type="number" min="1" step="1" required>
-        </fieldset>
-        <fieldset>
-          <legend>Internet peers <span class="hint">(stations this node dials)</span></legend>
-          <div id="peers"></div>
-          <button type="button" id="add-peer">Add a peer</button>
-        </fieldset>
-        <button type="submit">Save settings</button>
-        <p id="settings-note" role="status"></p>
-        <dl class="fixed" id="fixed"></dl>
-      </form>
+  <section class="view" id="view-chat" aria-label="Chat">
+    <div class="chat" id="chat">
+      <div class="card convos">
+        <form id="new-chat" autocomplete="off">
+          <input id="new-chat-call" maxlength="9" placeholder="Callsign" aria-label="Start a chat with" spellcheck="false" required>
+          <button class="btn" type="submit">Chat</button>
+        </form>
+        <ul id="convos"></ul>
+      </div>
+      <div class="card thread">
+        <div class="thread-head" id="thread-head" hidden>
+          <a class="btn quiet small back" href="#chat">Back</a>
+          <h2 id="thread-call"></h2>
+          <span class="sub" id="thread-sub"></span>
+        </div>
+        <ol class="lines" id="lines" aria-live="polite"></ol>
+        <form class="composer" id="composer" autocomplete="off" hidden>
+          <textarea id="line" rows="1" placeholder="Message" aria-label="Message" required></textarea>
+          <button class="btn" type="submit">Send</button>
+        </form>
+      </div>
     </div>
   </section>
-  <section aria-labelledby="log-title">
-    <h2 id="log-title" hidden>Messages</h2>
-    <div class="tabs" role="tablist">
-      <button role="tab" id="tab-in" aria-selected="true" aria-controls="log">Inbox</button>
-      <button role="tab" id="tab-out" aria-selected="false" aria-controls="log">Sent</button>
+
+  <section class="view" id="view-mail" aria-label="Mail" hidden>
+    <div class="mail">
+      <form class="card" id="compose" autocomplete="off">
+        <h2>New message</h2>
+        <label for="to">To</label>
+        <input id="to" name="to" required maxlength="9" placeholder="SO5KM-1" spellcheck="false">
+        <label for="subject">Subject</label>
+        <input id="subject" name="subject" maxlength="128" required>
+        <label for="text">Message</label>
+        <textarea id="text" name="text" rows="8" required></textarea>
+        <label for="precedence">Precedence</label>
+        <select id="precedence" name="precedence">
+          <option value="routine">Routine</option>
+          <option value="priority">Priority</option>
+          <option value="immediate">Immediate</option>
+          <option value="flash">Flash</option>
+        </select>
+        <button class="btn" type="submit">Queue message</button>
+        <p id="form-status" role="status"></p>
+      </form>
+      <div class="card">
+        <div class="subtabs" role="tablist">
+          <button role="tab" id="tab-in" aria-selected="true" aria-controls="log">Inbox</button>
+          <button role="tab" id="tab-out" aria-selected="false" aria-controls="log">Sent</button>
+        </div>
+        <ol class="log" id="log" aria-live="polite"></ol>
+      </div>
     </div>
-    <ol class="log" id="log" aria-live="polite"></ol>
+  </section>
+
+  <section class="view" id="view-stations" aria-label="Stations" hidden>
+    <div class="stations">
+      <div class="card" id="heard-section">
+        <h2>Heard on the radio</h2>
+        <ul class="list" id="heard"></ul>
+      </div>
+      <div class="card">
+        <h2>Trusted stations</h2>
+        <ul class="list" id="trust"></ul>
+        <form id="trust-form" autocomplete="off">
+          <label for="trust-line">Add a station <span class="hint">(the line <code>hm whoami</code> prints on their side)</span></label>
+          <input id="trust-line" required spellcheck="false" placeholder="SO5KM-1 8a1e…">
+          <label for="trust-who">Note <span class="hint">(optional, e.g. a name)</span></label>
+          <input id="trust-who" maxlength="80">
+          <button class="btn" type="submit">Trust this station</button>
+          <p id="trust-note" role="status"></p>
+        </form>
+        <p class="myline"><strong>Your line for other stations:</strong> <span id="my-line"></span></p>
+      </div>
+    </div>
+  </section>
+
+  <section class="view" id="view-settings" aria-label="Settings" hidden>
+    <form class="card settings" id="settings-form" autocomplete="off">
+      <fieldset>
+        <legend>Station</legend>
+        <label for="locator">Grid locator <span class="hint">(like JO89xi; sent in beacons, empty for none)</span></label>
+        <input id="locator" maxlength="6" spellcheck="false" pattern="[A-Ra-r]{2}[0-9]{2}([A-Xa-x]{2})?">
+      </fieldset>
+      <fieldset>
+        <legend>Radio</legend>
+        <label class="check"><input id="r-enabled" type="checkbox"> Use a radio</label>
+        <div id="radio-fields">
+          <label for="r-kiss">KISS TNC <span class="hint">(Direwolf <code>127.0.0.1:8001</code>, or <code>serial:/dev/ttyUSB0:9600</code>)</span></label>
+          <input id="r-kiss" spellcheck="false">
+          <label for="r-audio">Sound card <span class="hint">(the built-in modem instead of a TNC; empty for a TNC)</span></label>
+          <input id="r-audio" spellcheck="false" placeholder="default">
+          <label for="r-ptt">PTT <span class="hint">(built-in modem: vox, rigctld, rts:/dev/ttyUSB0, cm108:/dev/hidraw0)</span></label>
+          <input id="r-ptt" spellcheck="false">
+          <div class="pair">
+            <div><label for="r-txdelay_ms">Key-up delay <span class="hint">(ms)</span></label><input id="r-txdelay_ms" type="number" min="0" step="10"></div>
+            <div><label for="r-tnc_port">TNC port</label><input id="r-tnc_port" type="number" min="0" max="15" step="1"></div>
+          </div>
+          <details>
+            <summary>Channel access and timing</summary>
+            <div class="pair">
+              <div><label for="r-persist">Persistence <span class="hint">(0–255)</span></label><input id="r-persist" type="number" min="0" max="255" step="1"></div>
+              <div><label for="r-slottime_ms">Slot time <span class="hint">(ms)</span></label><input id="r-slottime_ms" type="number" min="0" step="10"></div>
+              <div><label for="r-bitrate">Bit rate <span class="hint">(bd)</span></label><input id="r-bitrate" type="number" min="1" step="1"></div>
+              <div><label for="r-guard_ms">Guard <span class="hint">(ms)</span></label><input id="r-guard_ms" type="number" min="0" step="10"></div>
+            </div>
+          </details>
+          <label for="beacon_minutes">Beacon every <span class="hint">(minutes; 0 turns it off)</span></label>
+          <input id="beacon_minutes" type="number" min="0" step="1" required>
+        </div>
+        <p class="hint" id="radio-note"></p>
+      </fieldset>
+      <fieldset>
+        <legend>Delivery</legend>
+        <div class="pair">
+          <div><label for="radio_cost">Radio cost</label><input id="radio_cost" type="number" min="0.01" step="0.01" required></div>
+          <div><label for="internet_cost">Internet cost</label><input id="internet_cost" type="number" min="0.01" step="0.01" required></div>
+        </div>
+        <p class="hint">The cheaper way that reaches a station is tried first.</p>
+        <div class="pair">
+          <div><label for="retry_first_secs">First retry <span class="hint">(s)</span></label><input id="retry_first_secs" type="number" min="1" step="1" required></div>
+          <div><label for="retry_max_secs">Longest wait <span class="hint">(s)</span></label><input id="retry_max_secs" type="number" min="1" step="1" required></div>
+        </div>
+        <label for="retry_attempts">Attempts before giving up</label>
+        <input id="retry_attempts" type="number" min="1" step="1" required>
+      </fieldset>
+      <fieldset>
+        <legend>Internet peers <span class="hint">(stations this node dials)</span></legend>
+        <div id="peers"></div>
+        <button class="btn quiet small" type="button" id="add-peer" style="margin-top: 0.5rem">Add a peer</button>
+      </fieldset>
+      <button class="btn" type="submit">Save settings</button>
+      <p id="settings-note" role="status"></p>
+      <dl class="fixed" id="fixed"></dl>
+    </form>
   </section>
 </main>
 <script>
@@ -239,24 +348,183 @@ const el = (tag, cls, text) => {
   if (text !== undefined && text !== null) n.textContent = text;
   return n;
 };
+const $ = (id) => document.getElementById(id);
 const hhmm = (unix) => new Date(unix * 1000).toISOString().slice(11, 16) + "Z";
-const day = (unix) => new Date(unix * 1000).toISOString().slice(5, 10);
-let direction = "in";
+const day = (unix) => new Date(unix * 1000).toISOString().slice(0, 10);
+const ago = (s) => s < 90 ? s + " s ago" : s < 5400 ? Math.round(s / 60) + " min ago" : Math.round(s / 3600) + " h ago";
+const compass = (deg) => ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][Math.round(deg / 45) % 8] + " (" + deg + "°)";
+const KEY = {
+  trusted: ["Key matches the one you trust", "ok"],
+  unknown: ["Not among your trusted stations", "warn"],
+  mismatch: ["Key differs from the one you trust: an impostor, or a new key", "bad"],
+};
 let me = "";
+let status = null;
+let trusted = [];
+
 // The token comes from the #token= link hm node prints, or the form; it stays in this browser.
 if (location.hash.startsWith("#token=")) {
   localStorage.setItem("hm-token", decodeURIComponent(location.hash.slice(7)));
-  history.replaceState(null, "", location.pathname);
+  history.replaceState(null, "", location.pathname + "#chat");
 }
+const token = () => localStorage.getItem("hm-token") || "";
 const api = async (path, opts = {}) => {
-  const headers = Object.assign({ Authorization: "Bearer " + (localStorage.getItem("hm-token") || "") }, opts.headers || {});
+  const headers = Object.assign({ Authorization: "Bearer " + token() }, opts.headers || {});
   const r = await fetch(path, Object.assign({}, opts, { headers }));
   if (r.status === 401) {
-    document.getElementById("token-form").hidden = false;
+    $("token-form").hidden = false;
     throw new Error("the access token is missing or wrong");
   }
   return r;
 };
+const json = (body) => ({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+const chip = (id, text, cls) => { const c = $(id); c.textContent = text; c.className = "chip " + (cls || ""); };
+const quietly = (p) => p.catch(() => {});
+
+// ---- Views -------------------------------------------------------------
+const VIEWS = ["chat", "mail", "stations", "settings"];
+
+function route() {
+  const [view, arg] = (location.hash.slice(1) || "chat").split("/");
+  const name = VIEWS.includes(view) ? view : "chat";
+  for (const v of VIEWS) $("view-" + v).hidden = v !== name;
+  for (const a of document.querySelectorAll("nav.tabs a")) {
+    if (a.dataset.view === name) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
+  }
+  if (name === "chat") openThread(arg ? decodeURIComponent(arg).toUpperCase() : null);
+  if (name === "mail") quietly(loadMail());
+  if (name === "stations") quietly(loadTrust());
+  if (name === "settings") quietly(loadSettings(true));
+}
+window.addEventListener("hashchange", route);
+
+// ---- Chat --------------------------------------------------------------
+let current = null;       // callsign of the open conversation
+let chatList = [];        // chat messages, newest first
+
+const partner = (m) => m.direction === "in" ? (m.from || m.peer) : m.peer;
+
+async function loadChats() {
+  const r = await api("/api/messages?direction=all&kind=chat&limit=1000");
+  if (!r.ok) return;
+  chatList = await r.json();
+  renderConvos();
+  if (current) renderThread();
+}
+
+function renderConvos() {
+  const byPeer = new Map();
+  for (const m of chatList) {
+    const p = partner(m);
+    if (!byPeer.has(p)) byPeer.set(p, { last: m, unread: 0 });
+    if (m.state === "Unread") byPeer.get(p).unread++;
+  }
+  if (current && !byPeer.has(current)) byPeer.set(current, { last: null, unread: 0 });
+  const ul = $("convos");
+  ul.replaceChildren();
+  let unread = 0;
+  for (const [p, c] of byPeer) {
+    unread += c.unread;
+    const a = el("a");
+    a.href = "#chat/" + encodeURIComponent(p);
+    if (p === current) a.setAttribute("aria-current", "true");
+    const name = el("span", "name", p);
+    if (c.unread) name.append(el("span", "badge", String(c.unread)));
+    a.append(name, el("span", "time", c.last ? hhmm(c.last.at) : ""));
+    a.append(el("span", "last", c.last ? (c.last.direction === "out" ? "You: " : "") + (c.last.text || "") : "No lines yet"));
+    const li = el("li");
+    li.append(a);
+    ul.append(li);
+  }
+  if (byPeer.size === 0) ul.append(el("li", "empty", "No chats yet. Type a callsign above to start one."));
+  $("badge-chat").hidden = unread === 0;
+  $("badge-chat").textContent = String(unread);
+}
+
+function openThread(call) {
+  current = call;
+  $("chat").classList.toggle("open", !!call);
+  $("thread-head").hidden = !call;
+  $("composer").hidden = !call;
+  renderConvos();
+  if (!call) {
+    $("lines").replaceChildren(el("li", "placeholder",
+      "Pick a conversation, or start one with a callsign. Lines go by radio or internet, whichever reaches the station."));
+    return;
+  }
+  $("thread-call").textContent = call;
+  renderThread();
+  $("line").focus();
+}
+
+function describeLine(m) {
+  if (m.direction === "in") {
+    return [hhmm(m.at) + (m.verified ? "" : " · signature not verified"), m.verified ? "" : "unverified"];
+  }
+  if (m.state === "Delivered") {
+    return [hhmm(m.at) + " · delivered" + (m.delivered_by ? " by " + m.delivered_by : "") + (m.verified ? " ✓" : ""), ""];
+  }
+  if (m.state === "Failed") return [hhmm(m.at) + " · not delivered: " + (m.note || "gave up"), "failed"];
+  const next = m.next_attempt * 1000 > Date.now() ? ", next try " + hhmm(m.next_attempt) : "";
+  return [hhmm(m.at) + " · waiting" + (m.attempts ? " (" + m.attempts + " tries" + next + ")" : ""), ""];
+}
+
+function renderThread() {
+  const lines = chatList.filter((m) => partner(m) === current).reverse();
+  const ol = $("lines");
+  ol.replaceChildren();
+  if (lines.length === 0) ol.append(el("li", "placeholder", "No lines with " + current + " yet. Say hello."));
+  let lastDay = "";
+  for (const m of lines) {
+    if (day(m.at) !== lastDay) { lastDay = day(m.at); ol.append(el("li", "day", lastDay)); }
+    const [meta, cls] = describeLine(m);
+    const li = el("li", "bubble " + (m.direction === "out" ? "mine " : "") + cls);
+    li.append(el("span", null, m.text !== null ? m.text : "(no text)"), el("span", "meta", meta));
+    ol.append(li);
+  }
+  ol.scrollTop = ol.scrollHeight;
+  // The station's standing, from its beacon, the trust list and the links.
+  const h = status && status.heard.find((x) => x.station === current);
+  const t = trusted.find((x) => x.station === current);
+  const bits = [t ? "trusted" + (t.note ? " · " + t.note : "") : "not trusted"];
+  if (h) bits.push("heard " + ago(h.ago));
+  if (h && h.locator) bits.push(h.locator + (h.distance_km !== null ? ", " + h.distance_km + " km " + compass(h.bearing) : ""));
+  if (status && status.internet_peers.includes(current)) bits.push("linked over the internet");
+  $("thread-sub").textContent = bits.join(" · ");
+  // Seen: mark read while the page is in front.
+  if (!document.hidden) {
+    for (const m of lines) if (m.state === "Unread") quietly(api("/api/read/" + m.id, { method: "POST" }));
+  }
+}
+
+$("new-chat").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const call = $("new-chat-call").value.trim().toUpperCase();
+  $("new-chat-call").value = "";
+  location.hash = "#chat/" + encodeURIComponent(call);
+});
+
+const autosize = () => { const t = $("line"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 160) + "px"; };
+$("line").addEventListener("input", autosize);
+$("line").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); $("composer").requestSubmit(); }
+});
+$("composer").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const text = $("line").value;
+  if (!text.trim() || !current) return;
+  const r = await api("/api/send", Object.assign({ method: "POST" }, json({ to: current, text })));
+  if (r.ok) {
+    $("line").value = "";
+    autosize();
+    loadChats();
+  } else {
+    alert("Not sent: " + ((await r.json()).error || r.statusText));
+  }
+});
+
+// ---- Mail --------------------------------------------------------------
+let direction = "in";
 
 function describeOut(m) {
   if (m.state === "Delivered") {
@@ -268,19 +536,21 @@ function describeOut(m) {
   return ["Queued" + (m.attempts ? " after " + m.attempts + " attempt" + (m.attempts > 1 ? "s" : "") : "") + next, "warn"];
 }
 
-function render(list) {
-  const log = document.getElementById("log");
+async function loadMail() {
+  const r = await api("/api/messages?kind=mail&limit=200&direction=" + direction);
+  if (!r.ok) return;
+  const list = await r.json();
+  const log = $("log");
   log.replaceChildren();
   if (list.length === 0) {
     log.append(el("li", "empty", direction === "in"
-      ? "No messages yet. Messages addressed to " + me + " appear here."
-      : "Nothing sent yet. Queue a message with the form."));
-    return;
+      ? "No mail yet. Mail addressed to " + me + " appears here."
+      : "No mail sent yet. Write one with the form."));
   }
   for (const m of list) {
     const li = el("li", "p" + Math.min(m.precedence, 3) + (m.state === "Unread" ? " unread" : ""));
     const when = el("span", "when");
-    when.append(el("span", null, day(m.at)), document.createElement("br"), el("span", null, hhmm(m.at)));
+    when.append(el("span", null, day(m.at).slice(5)), document.createElement("br"), el("span", null, hhmm(m.at)));
     const who = el("span", "who", direction === "in" ? (m.from || m.peer) : m.peer);
     const body = el("span", "body");
     if (m.subject) body.append(el("span", "subject", m.subject));
@@ -290,8 +560,9 @@ function render(list) {
       body.append(el("span", "state " + (m.verified ? "ok" : "warn"),
         (m.verified ? "Signature verified" : "Signature not verified (sender not among your trusted stations)") + via));
       if (m.state === "Unread") {
-        const b = el("button", "read", "Mark read");
-        b.addEventListener("click", async () => { await api("/api/read/" + m.id, { method: "POST" }); refresh(); });
+        const b = el("button", "btn quiet small", "Mark read");
+        b.style.marginTop = "0.3rem";
+        b.addEventListener("click", () => quietly(api("/api/read/" + m.id, { method: "POST" })));
         body.append(b);
       }
     } else {
@@ -303,27 +574,46 @@ function render(list) {
   }
 }
 
-async function refresh() {
-  try {
-    const r = await api("/api/messages?direction=" + direction + "&limit=200");
-    if (!r.ok) throw new Error((await r.json()).error || r.statusText);
-    render(await r.json());
-  } catch (e) {
-    document.getElementById("station-line").textContent = "Cannot reach the node: " + e.message;
-  }
+async function countMail() {
+  const r = await api("/api/messages?kind=mail&direction=in&limit=1000");
+  if (!r.ok) return;
+  const n = (await r.json()).filter((m) => m.state === "Unread").length;
+  $("badge-mail").hidden = n === 0;
+  $("badge-mail").textContent = String(n);
 }
 
-const ago = (s) => s < 90 ? s + " s ago" : s < 5400 ? Math.round(s / 60) + " min ago" : Math.round(s / 3600) + " h ago";
-const KEY = {
-  trusted: ["Key matches the one you trust", "ok"],
-  unknown: ["Not among your trusted stations", "warn"],
-  mismatch: ["Key differs from the one you trust: an impostor, or a new key", "bad"],
-};
+for (const [id, dir] of [["tab-in", "in"], ["tab-out", "out"]]) {
+  $(id).addEventListener("click", () => {
+    direction = dir;
+    $("tab-in").setAttribute("aria-selected", String(dir === "in"));
+    $("tab-out").setAttribute("aria-selected", String(dir === "out"));
+    quietly(loadMail());
+  });
+}
 
-const compass = (deg) => ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][Math.round(deg / 45) % 8] + " (" + deg + "°)";
+$("compose").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const f = ev.target;
+  const st = $("form-status");
+  const body = { to: f.to.value.trim().toUpperCase(), text: f.text.value, subject: f.subject.value.trim(), precedence: f.precedence.value };
+  st.className = "";
+  st.textContent = "Queuing…";
+  try {
+    const r = await api("/api/send", Object.assign({ method: "POST" }, json(body)));
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error);
+    st.className = "ok";
+    st.textContent = "Queued for " + body.to + ". It goes out when a link allows; follow it under Sent.";
+    f.text.value = ""; f.subject.value = "";
+  } catch (e) {
+    st.className = "bad";
+    st.textContent = "Not queued: " + e.message;
+  }
+});
 
+// ---- Stations ----------------------------------------------------------
 function renderHeard(list) {
-  const ul = document.getElementById("heard");
+  const ul = $("heard");
   ul.replaceChildren();
   if (!list || list.length === 0) {
     ul.append(el("li", "empty", "No stations heard yet."));
@@ -331,20 +621,23 @@ function renderHeard(list) {
   }
   for (const h of list) {
     const li = el("li");
-    li.append(el("span", "who", h.station), el("span", "when", " · " + ago(h.ago)));
+    const main = el("span", "grow");
+    main.append(el("strong", "who", h.station), el("span", "hint", " · " + ago(h.ago)));
     if (h.locator) {
-      const where = h.distance_km !== null ? " · " + h.locator + ", " + h.distance_km + " km " + compass(h.bearing) : " · " + h.locator;
-      li.append(el("span", "when", where));
+      main.append(el("span", "hint", " · " + h.locator + (h.distance_km !== null ? ", " + h.distance_km + " km " + compass(h.bearing) : "")));
     }
     if (h.key) {
       const [text, cls] = KEY[h.key] || [h.key, "warn"];
-      li.append(el("span", "detail " + cls, text));
+      main.append(el("span", "detail " + cls, text));
       const offers = h.offers.length ? "Offers " + h.offers.join(", ") + ". " : "";
       const hears = h.hears.length ? "Hears " + h.hears.join(", ") + "." : "Hears no one yet.";
-      li.append(el("span", "detail", offers + hears));
+      main.append(el("span", "detail", offers + hears));
     } else {
-      li.append(el("span", "detail", "No beacon heard yet."));
+      main.append(el("span", "detail", "No beacon heard yet."));
     }
+    const chat = el("a", "btn quiet small", "Chat");
+    chat.href = "#chat/" + encodeURIComponent(h.station);
+    li.append(main, chat);
     ul.append(li);
   }
 }
@@ -352,45 +645,47 @@ function renderHeard(list) {
 let trustFile = null;
 
 async function loadTrust() {
-  try {
-    const r = await api("/api/trust");
-    if (!r.ok) return;
-    const t = await r.json();
-    trustFile = t.file;
-    const ul = document.getElementById("trust");
-    ul.replaceChildren();
-    if (t.stations.length === 0) ul.append(el("li", "empty", "Nobody yet. Messages from untrusted stations arrive marked unverified."));
-    for (const s of t.stations) {
-      const li = el("li");
-      const b = el("button", null, "Remove");
-      b.setAttribute("aria-label", "Stop trusting " + s.station);
-      b.addEventListener("click", async () => {
-        if (!confirm("Stop trusting " + s.station + "?")) return;
-        const r = await api("/api/trust/" + encodeURIComponent(s.station), { method: "DELETE" });
-        note(r.ok ? s.station + " is no longer trusted." : "Not removed: " + ((await r.json()).error || r.statusText), r.ok ? "" : "bad");
-        loadTrust();
-      });
-      const key = el("span", "key", s.key);
-      if (s.note) key.prepend(el("span", "note", s.note + " · "));
-      li.append(el("span", "who", s.station), key, b);
-      ul.append(li);
-    }
-  } catch (e) { /* the status line already says the node is unreachable */ }
+  const r = await api("/api/trust");
+  if (!r.ok) return;
+  const t = await r.json();
+  trustFile = t.file;
+  trusted = t.stations;
+  const ul = $("trust");
+  ul.replaceChildren();
+  if (t.stations.length === 0) ul.append(el("li", "empty", "Nobody yet. Messages from untrusted stations arrive marked unverified."));
+  for (const s of t.stations) {
+    const li = el("li");
+    const main = el("span", "grow");
+    main.append(el("strong", "who", s.station));
+    if (s.note) main.append(el("span", "hint", " · " + s.note));
+    main.append(el("span", "key", s.key));
+    const chat = el("a", "btn quiet small", "Chat");
+    chat.href = "#chat/" + encodeURIComponent(s.station);
+    const b = el("button", "btn quiet small", "Remove");
+    b.setAttribute("aria-label", "Stop trusting " + s.station);
+    b.addEventListener("click", async () => {
+      if (!confirm("Stop trusting " + s.station + "?")) return;
+      const r = await api("/api/trust/" + encodeURIComponent(s.station), { method: "DELETE" });
+      note(r.ok ? s.station + " is no longer trusted." : "Not removed: " + ((await r.json()).error || r.statusText), r.ok ? "" : "bad");
+      quietly(loadTrust());
+    });
+    li.append(main, chat, b);
+    ul.append(li);
+  }
 }
 
 function note(text, cls) {
-  const n = document.getElementById("trust-note");
+  const n = $("trust-note");
   n.className = cls || "";
   n.textContent = text + (trustFile ? "" : " Not saved: this node has no settings file, so it lasts until restart.");
 }
 
-document.getElementById("trust-form").addEventListener("submit", async (ev) => {
+$("trust-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
-  const input = document.getElementById("trust-line");
-  const who = document.getElementById("trust-who");
+  const input = $("trust-line"), who = $("trust-who");
   const body = { line: input.value.trim() };
   if (who.value.trim()) body.note = who.value.trim();
-  const r = await api("/api/trust", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const r = await api("/api/trust", Object.assign({ method: "POST" }, json(body)));
   if (r.ok) {
     const s = await r.json();
     note(s.station + " is trusted now" + (trustFile ? " and saved to " + trustFile + "." : "."), "ok");
@@ -398,9 +693,10 @@ document.getElementById("trust-form").addEventListener("submit", async (ev) => {
   } else {
     note("Not added: " + ((await r.json()).error || r.statusText), "bad");
   }
-  loadTrust();
+  quietly(loadTrust());
 });
 
+// ---- Settings ----------------------------------------------------------
 const radioText = ["kiss", "audio", "ptt"];
 const radioNumbers = ["txdelay_ms", "tnc_port", "persist", "slottime_ms", "bitrate", "guard_ms"];
 const liveFields = ["beacon_minutes", "radio_cost", "internet_cost", "retry_first_secs", "retry_max_secs", "retry_attempts"];
@@ -412,148 +708,158 @@ function peerRow(p) {
   call.setAttribute("aria-label", "Peer callsign"); call.spellcheck = false;
   const addr = el("input"); addr.value = p.address; addr.placeholder = "hub.example.org:4433";
   addr.setAttribute("aria-label", "Peer address (host:port)"); addr.spellcheck = false;
-  const b = el("button", null, "Remove"); b.type = "button";
+  const b = el("button", "btn quiet small", "Remove"); b.type = "button";
   b.addEventListener("click", () => row.remove());
   row.append(call, addr, b);
   return row;
 }
 
 function settingsNote(text, cls) {
-  const n = document.getElementById("settings-note");
+  const n = $("settings-note");
   n.className = cls || "";
   n.textContent = text;
 }
 
-function showSettings(v) {
+function showSettings(v, force) {
   settingsFile = v.file;
-  const f = document.getElementById("settings-form");
   // Leave the form alone while someone is editing it.
-  if (f.contains(document.activeElement) && document.activeElement.tagName === "INPUT") return;
-  for (const k of liveFields) document.getElementById(k).value = v.live[k];
-  document.getElementById("locator").value = v.live.locator || "";
+  if (!force && $("settings-form").contains(document.activeElement) && document.activeElement.tagName === "INPUT") return;
+  for (const k of liveFields) $(k).value = v.live[k];
+  $("locator").value = v.live.locator || "";
   const r = v.live.radio;
-  document.getElementById("r-enabled").checked = r.enabled;
-  for (const k of radioText.concat(radioNumbers)) document.getElementById("r-" + k).value = r[k];
-  document.getElementById("radio-fields").hidden = !r.enabled;
-  document.getElementById("radio-note").textContent = v.radio_applies_now
+  $("r-enabled").checked = r.enabled;
+  for (const k of radioText.concat(radioNumbers)) $("r-" + k).value = r[k];
+  $("radio-fields").hidden = !r.enabled;
+  $("radio-note").textContent = v.radio_applies_now
     ? "Radio changes open the new link at once."
     : "Radio changes are saved and take a restart of the node.";
-  document.getElementById("peers").replaceChildren(...v.live.peers.map(peerRow));
+  $("peers").replaceChildren(...v.live.peers.map(peerRow));
   const fixed = v.restart_to_change;
   const rows = [["Internet", fixed.internet_listen ? "listening on " + fixed.internet_listen : "not listening"],
     ["Web page", fixed.http], ["Store", fixed.store], ["Saved to", v.file || "nowhere: changes last until restart"]];
-  if (v.overridden.length) rows.push(["For this run", "set on the command line: " + v.overridden.join(", ") + " (changes to these are saved, and used once the node runs without them)"]);
-  const dl = document.getElementById("fixed");
+  if (v.overridden.length) {
+    rows.push(["For this run", "set on the command line: " + v.overridden.join(", ") + " (changes to these are saved, and used once the node runs without them)"]);
+  }
+  const dl = $("fixed");
   dl.replaceChildren();
   for (const [k, val] of rows) dl.append(el("dt", null, k), el("dd", null, val));
 }
 
-async function loadSettings() {
-  try {
-    const r = await api("/api/settings");
-    if (r.ok) showSettings(await r.json());
-  } catch (e) { /* the status line already says the node is unreachable */ }
+async function loadSettings(force) {
+  const r = await api("/api/settings");
+  if (r.ok) showSettings(await r.json(), force);
 }
 
-document.getElementById("r-enabled").addEventListener("change", (ev) => {
-  document.getElementById("radio-fields").hidden = !ev.target.checked;
-});
+$("r-enabled").addEventListener("change", (ev) => { $("radio-fields").hidden = !ev.target.checked; });
 
-document.getElementById("add-peer").addEventListener("click", () => {
+$("add-peer").addEventListener("click", () => {
   const row = peerRow({ station: "", address: "" });
-  document.getElementById("peers").append(row);
+  $("peers").append(row);
   row.querySelector("input").focus();
 });
 
-document.getElementById("settings-form").addEventListener("submit", async (ev) => {
+$("settings-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const body = {};
-  for (const k of liveFields) body[k] = Number(document.getElementById(k).value);
-  body.locator = document.getElementById("locator").value.trim();
-  body.radio = { enabled: document.getElementById("r-enabled").checked };
-  for (const k of radioText) body.radio[k] = document.getElementById("r-" + k).value.trim();
-  for (const k of radioNumbers) body.radio[k] = Number(document.getElementById("r-" + k).value);
+  for (const k of liveFields) body[k] = Number($(k).value);
+  body.locator = $("locator").value.trim();
+  body.radio = { enabled: $("r-enabled").checked };
+  for (const k of radioText) body.radio[k] = $("r-" + k).value.trim();
+  for (const k of radioNumbers) body.radio[k] = Number($("r-" + k).value);
   body.peers = [...document.querySelectorAll("#peers .peer")]
     .map((row) => { const [c, a] = row.querySelectorAll("input"); return { station: c.value.trim().toUpperCase(), address: a.value.trim() }; })
     .filter((p) => p.station || p.address);
-  const r = await api("/api/settings", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const r = await api("/api/settings", Object.assign({ method: "PATCH" }, json(body)));
   const j = await r.json();
   if (r.ok) {
     document.activeElement.blur();
-    showSettings(j);
+    showSettings(j, true);
     settingsNote("In use now" + (settingsFile ? " and saved to " + settingsFile + "." : "; not saved, this node has no settings file."), "ok");
   } else {
     settingsNote("Not changed: " + (j.error || r.statusText), "bad");
   }
 });
 
+// ---- Status ------------------------------------------------------------
 async function loadStatus() {
   try {
     const s = await (await api("/api/status")).json();
+    status = s;
     me = s.call;
-    document.getElementById("call").textContent = s.call;
+    $("call").textContent = s.call;
     document.title = s.call + " · hm-net";
-    const grid = s.locator ? s.locator + ". " : "";
-    const radio = grid + (s.radio === null ? "No radio." : s.radio ? "Radio up: " + s.radio_via + "." : "Radio down (" + s.radio_via + ").");
-    const peers = s.internet_peers.length ? "linked to " + s.internet_peers.join(", ") : "no stations linked";
-    const net = s.internet_listen ? " Internet: " + peers + "." : "";
-    document.getElementById("station-line").textContent = radio + net + " Your line for other stations: " + s.trust_line;
-    document.getElementById("heard-section").hidden = s.radio === null;
+    $("chip-grid").hidden = !s.locator;
+    $("chip-grid").textContent = s.locator || "";
+    if (s.radio === null) chip("chip-radio", "No radio", "");
+    else chip("chip-radio", s.radio ? "Radio up" : "Radio down", s.radio ? "ok" : "bad");
+    $("chip-radio").title = s.radio_via || "";
+    $("chip-net").hidden = !s.internet_listen && s.internet_peers.length === 0;
+    chip("chip-net", s.internet_peers.length ? "Internet: " + s.internet_peers.join(", ") : "Internet: no links", s.internet_peers.length ? "ok" : "warn");
+    $("heard-section").hidden = s.radio === null && s.heard.length === 0;
+    $("my-line").textContent = s.trust_line;
     renderHeard(s.heard);
-    document.getElementById("token-form").hidden = true;
+    $("token-form").hidden = true;
+    if (current) renderThread();
   } catch (e) {
-    document.getElementById("station-line").textContent = "Cannot reach the node: " + e.message;
+    chip("chip-live", "Cannot reach the node", "bad");
   }
 }
 
-document.getElementById("token-form").addEventListener("submit", (ev) => {
-  ev.preventDefault();
-  localStorage.setItem("hm-token", document.getElementById("token").value.trim());
-  loadStatus();
-  loadTrust();
-  loadSettings();
-  refresh();
-});
+// ---- Live updates ------------------------------------------------------
+// The node names what changed on /api/events, and the page fetches that
+// again. A plain fetch keeps the token in a header (EventSource cannot).
+const onChange = {
+  message: () => { quietly(loadChats()); quietly(countMail()); if (!$("view-mail").hidden) quietly(loadMail()); },
+  status: () => quietly(loadStatus()),
+  settings: () => { quietly(loadTrust()); if (!$("view-settings").hidden) quietly(loadSettings(false)); },
+};
+onChange.all = () => { onChange.message(); onChange.status(); onChange.settings(); };
 
-for (const [id, dir] of [["tab-in", "in"], ["tab-out", "out"]]) {
-  document.getElementById(id).addEventListener("click", () => {
-    direction = dir;
-    document.getElementById("tab-in").setAttribute("aria-selected", String(dir === "in"));
-    document.getElementById("tab-out").setAttribute("aria-selected", String(dir === "out"));
-    refresh();
-  });
+async function listen() {
+  let wait = 1000;
+  for (;;) {
+    try {
+      const r = await api("/api/events", { headers: { Accept: "text/event-stream" } });
+      if (!r.ok || !r.body) throw new Error(r.statusText);
+      chip("chip-live", "Live", "ok");
+      onChange.all();
+      wait = 1000;
+      const reader = r.body.pipeThrough(new TextDecoderStream()).getReader();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += value;
+        let i;
+        while ((i = buf.indexOf("\n\n")) >= 0) {
+          const block = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          for (const line of block.split("\n")) {
+            const f = line.startsWith("data:") && onChange[line.slice(5).trim()];
+            if (f) f();
+          }
+        }
+      }
+    } catch (e) { /* reconnect below */ }
+    chip("chip-live", "Reconnecting…", "warn");
+    await new Promise((res) => setTimeout(res, wait));
+    wait = Math.min(wait * 2, 30000);
+  }
 }
 
-document.getElementById("compose").addEventListener("submit", async (ev) => {
+$("token-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
-  const f = ev.target;
-  const status = document.getElementById("form-status");
-  const body = { to: f.to.value.trim().toUpperCase(), text: f.text.value, precedence: f.precedence.value };
-  if (f.subject.value.trim()) body.subject = f.subject.value.trim();
-  status.className = "";
-  status.textContent = "Queuing…";
-  try {
-    const r = await api("/api/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    const j = await r.json();
-    if (!r.ok) throw new Error(j.error);
-    status.className = "ok";
-    status.textContent = "Queued for " + body.to + ". It goes out when the channel allows; follow it under Sent.";
-    f.text.value = ""; f.subject.value = "";
-    if (direction === "out") refresh();
-  } catch (e) {
-    status.className = "bad";
-    status.textContent = "Not queued: " + e.message;
-  }
+  localStorage.setItem("hm-token", $("token").value.trim());
+  onChange.all();
 });
 
-loadStatus();
-refresh();
-setInterval(refresh, 3000);
-setInterval(loadStatus, 10000);
-loadTrust();
-setInterval(loadTrust, 10000);
-loadSettings();
-setInterval(loadSettings, 10000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden && current) renderThread(); });
+
+route();
+onChange.all();
+listen();
+// A slow poll as well, for times shown as "ago".
+setInterval(onChange.status, 30000);
 </script>
 </body>
 </html>
