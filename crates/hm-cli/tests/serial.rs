@@ -5,8 +5,6 @@
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -107,31 +105,30 @@ fn a_dropped_link_lets_go_of_the_port() {
 }
 
 /// Two serial TNCs on one channel: data frames from one reach the other.
-/// Parameter commands stay with the TNC they were sent to.
-fn channel(a: TTYPort, b: TTYPort, stop: Arc<AtomicBool>) -> Vec<thread::JoinHandle<()>> {
-    let a = Arc::new(Mutex::new(a));
-    let b = Arc::new(Mutex::new(b));
-    [(a.clone(), b.clone()), (b, a)]
-        .into_iter()
-        .map(|(from, to)| {
-            let stop = stop.clone();
-            thread::spawn(move || {
-                let mut dec = kiss::Decoder::new(4096);
-                let (mut buf, mut frames) = ([0u8; 4096], Vec::new());
-                while !stop.load(Ordering::Relaxed) {
-                    let n = from.lock().unwrap().read(&mut buf).unwrap_or(0);
-                    if n == 0 {
-                        thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
-                    dec.push(&buf[..n], &mut frames);
-                    for f in frames.drain(..).filter(|f| f.is_data()) {
-                        let _ = to.lock().unwrap().write_all(&kiss::data_frame(f.port, &f.data));
-                    }
+/// Parameter commands stay with the TNC they were sent to. Each direction
+/// reads and writes its own handles, so a read waiting on one terminal never
+/// holds up a write to the other. The threads end with the test process.
+fn channel(a: TTYPort, b: TTYPort) {
+    for (mut from, mut to) in [
+        (a.try_clone_native().unwrap(), b.try_clone_native().unwrap()),
+        (b, a),
+    ] {
+        thread::spawn(move || {
+            let mut dec = kiss::Decoder::new(4096);
+            let (mut buf, mut frames) = ([0u8; 4096], Vec::new());
+            loop {
+                let n = from.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
                 }
-            })
-        })
-        .collect()
+                dec.push(&buf[..n], &mut frames);
+                for f in frames.drain(..).filter(|f| f.is_data()) {
+                    let _ = to.write_all(&kiss::data_frame(f.port, &f.data));
+                }
+            }
+        });
+    }
 }
 
 #[test]
@@ -165,8 +162,7 @@ fn hm_binary_over_serial_tncs() {
     .unwrap();
 
     let ((tnc_a, dev_a), (tnc_b, dev_b)) = (pty(), pty());
-    let stop = Arc::new(AtomicBool::new(false));
-    let relay = channel(tnc_a, tnc_b, stop.clone());
+    channel(tnc_a, tnc_b);
     let fast = ["--bitrate", "9600", "--txdelay", "50", "--guard", "300"];
 
     let mut listener = Command::new(hm)
@@ -196,10 +192,6 @@ fn hm_binary_over_serial_tncs() {
         .read_to_string(&mut printed)
         .unwrap();
     let _ = listener.wait();
-    stop.store(true, Ordering::Relaxed);
-    for r in relay {
-        r.join().unwrap();
-    }
     let sent = String::from_utf8_lossy(&send.stdout);
     assert!(
         send.status.success(),

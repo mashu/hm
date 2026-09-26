@@ -1,12 +1,14 @@
 name: ci
 
 # Pull requests and main run on Linux only; a release tag (v*) also runs the
-# tests on Windows and macOS, which are much slower.
+# tests on Windows and macOS, which are much slower. Running the workflow by
+# hand (Actions > ci > Run workflow) tests any branch on all three.
 on:
   push:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,9 +32,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(startsWith(github.ref, 'refs/tags/v') && '["ubuntu-latest", "windows-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
+        os: ${{ fromJSON((startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "windows-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
         toolchain: [stable, "1.90"]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master

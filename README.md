@@ -187,7 +187,8 @@ cargo install --path crates/hm-cli   # installs the `hm` command
 ## Verification
 
 Windows and macOS are slow on CI, so the tests run there only for a release tag
-(`git tag v0.1.0 && git push origin v0.1.0`); everything else runs on Linux.
+(`git tag v0.1.0 && git push origin v0.1.0`) or when the ci workflow is run by hand
+(Actions > ci > Run workflow); everything else runs on Linux.
 
 | What | How | Every pull request and push to main (Linux) | Nightly |
 | --- | --- | --- | --- |
