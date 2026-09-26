@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use hm_cli::driver::Link;
 use hm_cli::files::{KeyFile, Trust};
 use hm_cli::node::choose::Costs;
+use hm_cli::node::live::Live;
 use hm_cli::node::{self, NodeConfig, RadioConfig, RadioLink};
 use hm_cli::sound_link::{AudioFactory, Csma, PttFactory, SoundLink};
 use hm_cli::station::LinkTiming;
@@ -172,8 +173,19 @@ fn start(ether: &Ether, key: &KeyFile, me: &str, peer: &KeyFile, db: &Tmp) -> no
     trust.insert(peer.call, peer.identity.public());
     node::start(NodeConfig {
         key: KeyFile::parse(&key.to_text()).unwrap(),
-        trust,
-        trust_file: None,
+        live: Live {
+            trust,
+            notes: vec![],
+            costs: Costs::default(),
+            retry: RetryPolicy {
+                first_delay_secs: 2,
+                max_delay_secs: 5,
+                max_attempts: 20,
+            },
+            beacon_secs: 0,
+            peers: vec![],
+        },
+        config_file: None,
         me: call(me),
         radio: Some(RadioConfig {
             link: RadioLink::Modem {
@@ -188,17 +200,10 @@ fn start(ether: &Ether, key: &KeyFile, me: &str, peer: &KeyFile, db: &Tmp) -> no
                 guard_ms: 1500,
                 max_rounds: 12,
             },
-            beacon_every: None,
         }),
         internet: None,
-        costs: Costs::default(),
         store: db.0.clone(),
         http: "127.0.0.1:0".parse().unwrap(),
-        retry: RetryPolicy {
-            first_delay_secs: 2,
-            max_delay_secs: 5,
-            max_attempts: 20,
-        },
         token: "t".into(),
         seed: Some(3),
     })

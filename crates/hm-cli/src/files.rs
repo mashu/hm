@@ -1,22 +1,19 @@
-//! Station key files and trust files.
+//! Station key files, and the list of trusted stations in memory.
 //!
-//! Key file (keep private):
-//! ```text
+//! Key file (keep private), TOML:
+//! ```toml
 //! # hm-net station key. Keep this file private.
-//! call SA0KAM
-//! secret 3f0c...   (64 hex digits)
+//! call = "SA0KAM-2"
+//! secret = "3f0c..."   # 64 hex digits
 //! ```
 //!
-//! Trust file, one station per line, as printed by `hm whoami`:
-//! ```text
-//! SO5KM-1 8a1e...   (64 hex digits of the Ed25519 public key)
-//! SP5AAA  41c7...   (no SSID: this key speaks for every SSID of SP5AAA)
-//! ```
+//! A station shares its public key as one line, `CALL KEY`, which `hm whoami`
+//! prints and `hm trust add` (or the web page) takes. Trusted stations are
+//! kept in `station.toml` (see [`crate::config`]).
 //!
 //! Every SSID is a station of its own and may have its own key: SA0KAM-1 and
-//! SA0KAM-2 can be two nodes. A line with an SSID names exactly that station;
-//! a line without one covers all SSIDs of the callsign that have no line of
-//! their own.
+//! SA0KAM-2 can be two nodes. An entry with an SSID names exactly that station;
+//! one without covers all SSIDs of the callsign that have no entry of their own.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -53,31 +50,22 @@ impl KeyFile {
 
     pub fn to_text(&self) -> String {
         format!(
-            "# hm-net station key. Keep this file private.\ncall {}\nsecret {}\n",
+            "# hm-net station key. Keep this file private.\ncall = \"{}\"\nsecret = \"{}\"\n",
             self.call,
             hex::encode(&self.identity.secret())
         )
     }
 
     pub fn parse(text: &str) -> io::Result<KeyFile> {
-        let (mut call, mut secret) = (None, None);
-        for line in text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        {
-            match line.split_once(char::is_whitespace) {
-                Some(("call", v)) => {
-                    call = Some(Callsign::parse(v.trim()).map_err(|e| invalid(format!("key file: {e}")))?)
-                }
-                Some(("secret", v)) => {
-                    secret = Some(hex::decode_32(v).map_err(|e| invalid(format!("key file: {e}")))?)
-                }
-                _ => return Err(invalid(format!("key file: unexpected line {line:?}"))),
-            }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            call: String,
+            secret: String,
         }
-        let call = call.ok_or_else(|| invalid("key file: missing `call`"))?;
-        let secret = secret.ok_or_else(|| invalid("key file: missing `secret`"))?;
+        let raw: Raw = toml::from_str(text).map_err(|e| invalid(format!("key file: {e}")))?;
+        let call = Callsign::parse(&raw.call).map_err(|e| invalid(format!("key file: call: {e}")))?;
+        let secret = hex::decode_32(&raw.secret).map_err(|e| invalid(format!("key file: secret: {e}")))?;
         Ok(KeyFile {
             call,
             identity: Identity::from_secret(secret),
@@ -100,7 +88,7 @@ impl KeyFile {
         KeyFile::parse(&fs::read_to_string(path)?)
     }
 
-    /// The line other stations put in their trust file.
+    /// The line other stations give `hm trust add`.
     pub fn trust_line(&self) -> String {
         format!("{} {}", self.call, hex::encode(&self.identity.public().0))
     }
@@ -113,7 +101,8 @@ pub struct Trust {
 }
 
 impl Trust {
-    /// One trust-file line: `None` for a blank line or a comment.
+    /// A station's key as one line, `CALL KEY`, the way `hm whoami` prints it:
+    /// `None` for a blank line or a comment.
     pub fn parse_line(line: &str) -> Result<Option<(Callsign, PublicKey)>, String> {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -127,19 +116,7 @@ impl Trust {
         Ok(Some((call, PublicKey(key))))
     }
 
-    pub fn parse(text: &str) -> io::Result<Trust> {
-        let mut t = Trust::default();
-        for (n, line) in text.lines().enumerate() {
-            if let Some((call, key)) =
-                Trust::parse_line(line).map_err(|e| invalid(format!("trust file line {}: {e}", n + 1)))?
-            {
-                t.keys.insert(call, key);
-            }
-        }
-        Ok(t)
-    }
-
-    /// Stop trusting the line for exactly `call`; true if there was one.
+    /// Stop trusting exactly `call`; true if it had an entry of its own.
     pub fn remove(&mut self, call: Callsign) -> bool {
         self.keys.remove(&call).is_some()
     }
@@ -150,10 +127,6 @@ impl Trust {
 
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
-    }
-
-    pub fn load(path: &Path) -> io::Result<Trust> {
-        Trust::parse(&fs::read_to_string(path)?)
     }
 
     /// Trust `key` for `call`: that station only when `call` has an SSID,
@@ -176,79 +149,9 @@ impl Trust {
     }
 }
 
-/// Set the line for exactly `call` in the trust file at `path` to `key`, or
-/// remove it with `None`. Comments and every other line are kept as they are;
-/// a new station goes at the end. The file is replaced atomically.
-pub fn edit_trust_file(path: &Path, call: Callsign, key: Option<PublicKey>) -> io::Result<()> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e),
-    };
-    let new_line = key.map(|k| format!("{call} {}", hex::encode(&k.0)));
-    let mut out = Vec::new();
-    let mut placed = false;
-    for line in text.lines() {
-        match Trust::parse_line(line) {
-            Ok(Some((c, _))) if c == call => {
-                if let (Some(l), false) = (&new_line, placed) {
-                    out.push(l.clone());
-                    placed = true;
-                }
-            }
-            _ => out.push(line.to_string()),
-        }
-    }
-    if let (Some(l), false) = (new_line, placed) {
-        out.push(l);
-    }
-    let mut body = out.join("\n");
-    body.push('\n');
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, body)?;
-    fs::rename(&tmp, path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn trust_file_edits_keep_comments_and_other_lines() {
-        let call = |s: &str| Callsign::parse(s).unwrap();
-        let path = std::env::temp_dir().join(format!("hm-trust-edit-{}.txt", std::process::id()));
-        let (a, b) = ([1u8; 32], [2u8; 32]);
-        fs::write(
-            &path,
-            format!(
-                "# my friends\nSO5KM {}\n\n# club\nSP5AAA {}\n",
-                hex::encode(&a),
-                hex::encode(&a)
-            ),
-        )
-        .unwrap();
-        // Replace in place, add at the end, remove.
-        edit_trust_file(&path, call("SO5KM"), Some(PublicKey(b))).unwrap();
-        edit_trust_file(&path, call("SA0KAM-2"), Some(PublicKey(a))).unwrap();
-        edit_trust_file(&path, call("SP5AAA"), None).unwrap();
-        let text = fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            text,
-            format!(
-                "# my friends\nSO5KM {}\n\n# club\nSA0KAM-2 {}\n",
-                hex::encode(&b),
-                hex::encode(&a)
-            )
-        );
-        let t = Trust::parse(&text).unwrap();
-        assert_eq!(t.len(), 2);
-        assert_eq!(t.key_for(call("SO5KM-3")), Some(PublicKey(b)));
-        fs::remove_file(&path).unwrap();
-        // A missing file is created.
-        edit_trust_file(&path, call("SO5KM"), Some(PublicKey(a))).unwrap();
-        assert_eq!(Trust::load(&path).unwrap().len(), 1);
-        fs::remove_file(&path).unwrap();
-    }
 
     #[test]
     fn key_file_roundtrip_keeps_the_ssid() {
@@ -257,8 +160,13 @@ mod tests {
         assert!(k.trust_line().starts_with("SA0KAM-7 "));
         let back = KeyFile::parse(&k.to_text()).unwrap();
         assert_eq!((back.call, back.identity.public()), (k.call, k.identity.public()));
-        assert!(KeyFile::parse("call SA0KAM\n").is_err());
-        assert!(KeyFile::parse("secret 00\ncall SA0KAM").is_err());
+        assert!(k.to_text().contains("call = \"SA0KAM-7\""));
+        assert!(KeyFile::parse("call = \"SA0KAM\"\n").is_err());
+        assert!(KeyFile::parse("call = \"SA0KAM\"\nsecret = \"00\"\n").is_err());
+        assert!(
+            KeyFile::parse("call SA0KAM\nsecret 00\n").is_err(),
+            "the old format is gone"
+        );
     }
 
     #[test]
@@ -281,26 +189,28 @@ mod tests {
     }
 
     #[test]
-    fn trust_lines_name_one_station_or_every_ssid() {
+    fn trust_entries_name_one_station_or_every_ssid() {
         let call = |s: &str| Callsign::parse(s).unwrap();
         let base = KeyFile::generate(call("SO5KM")).unwrap();
         let one = KeyFile::generate(call("SO5KM-2")).unwrap();
-        let t = Trust::parse(&format!(
-            "# friends\n\n{}\n{}\n",
-            base.trust_line(),
-            one.trust_line()
-        ))
-        .unwrap();
-        // A line without an SSID covers every SSID with no line of its own...
+        let entry = |l: &str| Trust::parse_line(l).unwrap().unwrap();
+        let mut t = Trust::default();
+        for (c, k) in [entry(&base.trust_line()), entry(&one.trust_line())] {
+            t.insert(c, k);
+        }
+        // An entry without an SSID covers every SSID with no entry of its own...
         assert_eq!(t.key_for(call("SO5KM")), Some(base.identity.public()));
         assert_eq!(t.key_for(call("SO5KM-1")), Some(base.identity.public()));
-        // ...and a line with one names exactly that station.
+        // ...and an entry with one names exactly that station.
         assert_eq!(t.key_for(call("SO5KM-2")), Some(one.identity.public()));
         assert_eq!(t.key_for(call("SA0KAM")), None);
-        let only_two = Trust::parse(&one.trust_line()).unwrap();
+        let mut only_two = Trust::default();
+        let (c, k) = entry(&one.trust_line());
+        only_two.insert(c, k);
         assert_eq!(only_two.key_for(call("SO5KM-1")), None);
         assert_eq!(only_two.key_for(call("SO5KM")), None);
-        assert!(Trust::parse("SO5KM").is_err());
-        assert!(Trust::parse("SO5KM 1234").is_err());
+        assert_eq!(Trust::parse_line("  # a comment"), Ok(None));
+        assert!(Trust::parse_line("SO5KM").is_err());
+        assert!(Trust::parse_line("SO5KM 1234").is_err());
     }
 }

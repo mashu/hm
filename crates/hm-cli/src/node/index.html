@@ -24,7 +24,7 @@
   }
   header { padding: 1.5rem clamp(1rem, 4vw, 2.5rem) 1rem; border-bottom: 2px solid var(--ink); }
   h1 { margin: 0; font-size: clamp(2rem, 6vw, 3.25rem); line-height: 1; letter-spacing: 0.04em; font-weight: 800; }
-  .station-line { margin: 0.4rem 0 0; color: var(--muted); font-size: 0.95rem; }
+  .station-line { margin: 0.4rem 0 0; color: var(--muted); font-size: 0.95rem; overflow-wrap: anywhere; }
   main {
     display: grid; gap: 2rem; padding: 1.5rem clamp(1rem, 4vw, 2.5rem) 3rem;
     grid-template-columns: minmax(0, 22rem) minmax(0, 1fr); align-items: start;
@@ -92,6 +92,22 @@
   #trust-form button { margin-top: 0.5rem; }
   #trust-note { font-size: 0.9rem; color: var(--muted); margin: 0.5rem 0 0; min-height: 1.4em; }
   #trust-note.ok { color: var(--ok); } #trust-note.bad { color: var(--bad); }
+  ul.trust .note { color: var(--ink); font-size: 0.9rem; }
+  #settings-section { margin-top: 2rem; }
+  #settings-form { padding: 1rem; }
+  #settings-form fieldset { border: 0; margin: 0 0 1rem; padding: 0; }
+  #settings-form legend { font-weight: 700; padding: 0; margin-bottom: 0.25rem; }
+  .pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 0.75rem; }
+  .pair label { margin-top: 0.5rem; }
+  .peer { display: grid; grid-template-columns: minmax(0, 7rem) minmax(0, 1fr) auto; gap: 0.4rem; margin-top: 0.4rem; }
+  .peer input { text-transform: none; }
+  .peer input:first-child { text-transform: uppercase; }
+  .peer button, #add-peer { margin: 0; padding: 0.2rem 0.6rem; font-size: 0.85rem; background: none; color: var(--ink); border-width: 1px; }
+  #add-peer { margin-top: 0.5rem; }
+  #settings-note { font-size: 0.9rem; color: var(--muted); margin: 0.5rem 0 0; min-height: 1.4em; }
+  #settings-note.ok { color: var(--ok); } #settings-note.bad { color: var(--bad); }
+  dl.fixed { margin: 0.75rem 0 0; font-size: 0.9rem; color: var(--muted); display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.1rem 0.75rem; }
+  dl.fixed dd { margin: 0; overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -134,8 +150,42 @@
       <form id="trust-form" autocomplete="off">
         <label for="trust-line">Add a station <span class="hint">(the line <code>hm whoami</code> prints on their side)</span></label>
         <input id="trust-line" required spellcheck="false" placeholder="SO5KM-1 8a1e…">
+        <label for="trust-who">Note <span class="hint">(optional, e.g. a name)</span></label>
+        <input id="trust-who" maxlength="80">
         <button type="submit">Trust this station</button>
         <p id="trust-note" role="status"></p>
+      </form>
+    </div>
+    <div id="settings-section" aria-labelledby="settings-title">
+      <h2 id="settings-title">Settings</h2>
+      <form id="settings-form" autocomplete="off">
+        <fieldset id="beacon-set">
+          <legend>Beacon</legend>
+          <label for="beacon_minutes">Every <span class="hint">(minutes; 0 turns it off)</span></label>
+          <input id="beacon_minutes" type="number" min="0" step="1" required>
+        </fieldset>
+        <fieldset>
+          <legend>Delivery</legend>
+          <div class="pair">
+            <div><label for="radio_cost">Radio cost</label><input id="radio_cost" type="number" min="0.01" step="0.01" required></div>
+            <div><label for="internet_cost">Internet cost</label><input id="internet_cost" type="number" min="0.01" step="0.01" required></div>
+          </div>
+          <p class="hint">The cheaper way that reaches a station is tried first.</p>
+          <div class="pair">
+            <div><label for="retry_first_secs">First retry <span class="hint">(s)</span></label><input id="retry_first_secs" type="number" min="1" step="1" required></div>
+            <div><label for="retry_max_secs">Longest wait <span class="hint">(s)</span></label><input id="retry_max_secs" type="number" min="1" step="1" required></div>
+          </div>
+          <label for="retry_attempts">Attempts before giving up</label>
+          <input id="retry_attempts" type="number" min="1" step="1" required>
+        </fieldset>
+        <fieldset>
+          <legend>Internet peers <span class="hint">(stations this node dials)</span></legend>
+          <div id="peers"></div>
+          <button type="button" id="add-peer">Add a peer</button>
+        </fieldset>
+        <button type="submit">Save settings</button>
+        <p id="settings-note" role="status"></p>
+        <dl class="fixed" id="fixed"></dl>
       </form>
     </div>
   </section>
@@ -206,7 +256,7 @@ function render(list) {
     if (direction === "in") {
       const via = m.from && m.from !== m.peer ? ", via " + m.peer : "";
       body.append(el("span", "state " + (m.verified ? "ok" : "warn"),
-        (m.verified ? "Signature verified" : "Signature not verified (sender not in the trust file)") + via));
+        (m.verified ? "Signature verified" : "Signature not verified (sender not among your trusted stations)") + via));
       if (m.state === "Unread") {
         const b = el("button", "read", "Mark read");
         b.addEventListener("click", async () => { await api("/api/read/" + m.id, { method: "POST" }); refresh(); });
@@ -233,9 +283,9 @@ async function refresh() {
 
 const ago = (s) => s < 90 ? s + " s ago" : s < 5400 ? Math.round(s / 60) + " min ago" : Math.round(s / 3600) + " h ago";
 const KEY = {
-  trusted: ["Key matches your trust file", "ok"],
-  unknown: ["Not in your trust file", "warn"],
-  mismatch: ["Key differs from your trust file: an impostor, or a new key", "bad"],
+  trusted: ["Key matches the one you trust", "ok"],
+  unknown: ["Not among your trusted stations", "warn"],
+  mismatch: ["Key differs from the one you trust: an impostor, or a new key", "bad"],
 };
 
 function renderHeard(list) {
@@ -282,7 +332,9 @@ async function loadTrust() {
         note(r.ok ? s.station + " is no longer trusted." : "Not removed: " + ((await r.json()).error || r.statusText), r.ok ? "" : "bad");
         loadTrust();
       });
-      li.append(el("span", "who", s.station), el("span", "key", s.key), b);
+      const key = el("span", "key", s.key);
+      if (s.note) key.prepend(el("span", "note", s.note + " · "));
+      li.append(el("span", "who", s.station), key, b);
       ul.append(li);
     }
   } catch (e) { /* the status line already says the node is unreachable */ }
@@ -291,21 +343,91 @@ async function loadTrust() {
 function note(text, cls) {
   const n = document.getElementById("trust-note");
   n.className = cls || "";
-  n.textContent = text + (trustFile ? "" : " Not saved: this node has no trust file (--trust), so it lasts until restart.");
+  n.textContent = text + (trustFile ? "" : " Not saved: this node has no settings file, so it lasts until restart.");
 }
 
 document.getElementById("trust-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const input = document.getElementById("trust-line");
-  const r = await api("/api/trust", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ line: input.value.trim() }) });
+  const who = document.getElementById("trust-who");
+  const body = { line: input.value.trim() };
+  if (who.value.trim()) body.note = who.value.trim();
+  const r = await api("/api/trust", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   if (r.ok) {
     const s = await r.json();
     note(s.station + " is trusted now" + (trustFile ? " and saved to " + trustFile + "." : "."), "ok");
-    input.value = "";
+    input.value = ""; who.value = "";
   } else {
     note("Not added: " + ((await r.json()).error || r.statusText), "bad");
   }
   loadTrust();
+});
+
+const liveFields = ["beacon_minutes", "radio_cost", "internet_cost", "retry_first_secs", "retry_max_secs", "retry_attempts"];
+let settingsFile = null;
+
+function peerRow(p) {
+  const row = el("div", "peer");
+  const call = el("input"); call.value = p.station; call.placeholder = "SO5KM"; call.maxLength = 9;
+  call.setAttribute("aria-label", "Peer callsign"); call.spellcheck = false;
+  const addr = el("input"); addr.value = p.address; addr.placeholder = "hub.example.org:4433";
+  addr.setAttribute("aria-label", "Peer address (host:port)"); addr.spellcheck = false;
+  const b = el("button", null, "Remove"); b.type = "button";
+  b.addEventListener("click", () => row.remove());
+  row.append(call, addr, b);
+  return row;
+}
+
+function settingsNote(text, cls) {
+  const n = document.getElementById("settings-note");
+  n.className = cls || "";
+  n.textContent = text;
+}
+
+function showSettings(v) {
+  settingsFile = v.file;
+  const f = document.getElementById("settings-form");
+  // Leave the form alone while someone is editing it.
+  if (f.contains(document.activeElement) && document.activeElement.tagName === "INPUT") return;
+  for (const k of liveFields) document.getElementById(k).value = v.live[k];
+  document.getElementById("peers").replaceChildren(...v.live.peers.map(peerRow));
+  const fixed = v.restart_to_change;
+  const rows = [["Radio", fixed.radio || "off"], ["Internet", fixed.internet_listen ? "listening on " + fixed.internet_listen : "not listening"],
+    ["Web page", fixed.http], ["Store", fixed.store], ["Saved to", v.file || "nowhere: changes last until restart"]];
+  const dl = document.getElementById("fixed");
+  dl.replaceChildren();
+  for (const [k, val] of rows) dl.append(el("dt", null, k), el("dd", null, val));
+}
+
+async function loadSettings() {
+  try {
+    const r = await api("/api/settings");
+    if (r.ok) showSettings(await r.json());
+  } catch (e) { /* the status line already says the node is unreachable */ }
+}
+
+document.getElementById("add-peer").addEventListener("click", () => {
+  const row = peerRow({ station: "", address: "" });
+  document.getElementById("peers").append(row);
+  row.querySelector("input").focus();
+});
+
+document.getElementById("settings-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const body = {};
+  for (const k of liveFields) body[k] = Number(document.getElementById(k).value);
+  body.peers = [...document.querySelectorAll("#peers .peer")]
+    .map((row) => { const [c, a] = row.querySelectorAll("input"); return { station: c.value.trim().toUpperCase(), address: a.value.trim() }; })
+    .filter((p) => p.station || p.address);
+  const r = await api("/api/settings", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const j = await r.json();
+  if (r.ok) {
+    document.activeElement.blur();
+    showSettings(j);
+    settingsNote("In use now" + (settingsFile ? " and saved to " + settingsFile + "." : "; not saved, this node has no settings file."), "ok");
+  } else {
+    settingsNote("Not changed: " + (j.error || r.statusText), "bad");
+  }
 });
 
 async function loadStatus() {
@@ -317,8 +439,9 @@ async function loadStatus() {
     const radio = s.radio === null ? "No radio." : s.radio ? "Radio up: " + s.radio_via + "." : "Radio down (" + s.radio_via + ").";
     const peers = s.internet_peers.length ? "linked to " + s.internet_peers.join(", ") : "no stations linked";
     const net = s.internet_listen ? " Internet: " + peers + "." : "";
-    document.getElementById("station-line").textContent = radio + net + " Your trust-file line: " + s.trust_line;
+    document.getElementById("station-line").textContent = radio + net + " Your line for other stations: " + s.trust_line;
     document.getElementById("heard-section").hidden = s.radio === null;
+    document.getElementById("beacon-set").hidden = s.radio === null;
     renderHeard(s.heard);
     document.getElementById("token-form").hidden = true;
   } catch (e) {
@@ -331,6 +454,7 @@ document.getElementById("token-form").addEventListener("submit", (ev) => {
   localStorage.setItem("hm-token", document.getElementById("token").value.trim());
   loadStatus();
   loadTrust();
+  loadSettings();
   refresh();
 });
 
@@ -371,6 +495,8 @@ setInterval(refresh, 3000);
 setInterval(loadStatus, 10000);
 loadTrust();
 setInterval(loadTrust, 10000);
+loadSettings();
+setInterval(loadSettings, 10000);
 </script>
 </body>
 </html>

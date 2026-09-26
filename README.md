@@ -21,7 +21,7 @@ clear, identities signed.
 | `hm-net` | Internet links: QUIC with mutual TLS 1.3 on Ed25519 station keys (only trusted stations connect), automatic redial, one stream per bundle with a signed receipt |
 | `hm-modem-afsk` | Our own AFSK 1200 modem (Bell 202), pure Rust and `no_std`: HDLC framing and CRC, multi-slicer demodulator with per-tone AGC and PLL clock recovery, carrier detect |
 | `hm-rig` | Radio hardware: sound cards through `cpal` (ALSA, CoreAudio, WASAPI); PTT by rigctld (Hamlib CAT), serial RTS/DTR, CM108 GPIO (AIOC, Digirig) or VOX; a virtual radio channel for tests |
-| `hm-cli` | The `hm` command: `node` (the station daemon: radio and/or internet links, web interface, JSON API with access token), `keygen`, `whoami`, `send`, `listen`; KISS links over TCP or a serial port, and a real-time driver |
+| `hm-cli` | The `hm` command: `node` (the station daemon: radio and/or internet links, web interface, JSON API with access token, settings applied live), `keygen`, `whoami`, `trust`, `send`, `listen`, all set up by one `station.toml`; KISS links over TCP or a serial port, and a real-time driver |
 
 Phase 1 still to do: an on-air test, IL2P framing and better decoding deep in noise for
 the built-in modem, stream modems (Mercury, ARDOP, VARA) as radio bearers,
@@ -31,21 +31,79 @@ other nodes is Phase 2.
 ## Run a station
 
 ```sh
-hm keygen --call SA0KAM
-hm node --ssid 1 --trust trusted.txt      # radio through Direwolf on 127.0.0.1:8001
+hm keygen --call SA0KAM-1                 # writes station.key and a starter station.toml
+hm trust add "SO5KM-1 8a1e…"              # the line `hm whoami` prints on their side
+hm node                                   # radio through Direwolf on 127.0.0.1:8001
 ```
+
+### station.toml
+
+Everything a station needs to know lives in one TOML file in the station's folder:
+`[station]`, `[radio]`, `[internet]`, `[delivery]` and the trusted stations as `[[trust]]`
+entries. Every setting has a default, and `hm keygen` writes a starter file listing them
+with comments. The key itself stays in `station.key` (readable by you only) and the web
+page's access token in `station.token`. Paths in the file are relative to the file.
+
+```toml
+[station]
+key = "station.key"
+
+[radio]
+kiss = "serial:/dev/ttyUSB0:57600"
+beacon_minutes = 10
+
+[internet]
+listen = "0.0.0.0:4433"
+
+[[internet.peers]]
+station = "SO5KM"
+address = "hm.example.org:4433"
+
+[delivery]
+radio_cost = 1.0
+internet_cost = 2.0
+
+[[trust]]
+station = "SO5KM-1"
+key = "8a1e…"
+note = "Jan"
+```
+
+Every `hm` command reads `station.toml` from the current folder, or the file given with
+`--config`. Command-line options override the file for one run (`hm node --help` names the
+setting each one overrides) and the node logs which ones did. Unknown settings are errors,
+so a typo is reported rather than ignored.
+
+### Changing settings while the node runs
+
+The node applies these at once, without a restart:
+
+- **Trusted stations**: add or remove them on the web page, with `hm trust add/remove`, or
+  by editing `[[trust]]`. A station taken off the list loses its internet link at once.
+- **Delivery**: link costs and retry timing.
+- **Internet peers**: which stations the node dials.
+- **Beacon interval**.
+
+Changes made on the web page are written to `station.toml`, keeping its comments and layout.
+The node also notices when the file is edited by hand, within a second or two. A file that
+does not parse is logged and ignored, and the node keeps the settings it was using. The
+radio, the internet listen address, the web address and the store are read at start-up;
+change them in the file and restart.
+
+### The web page
 
 `hm node` prints a link such as `http://127.0.0.1:8080/#token=…`. Open it for the inbox,
 the sent log with each message's delivery state, and a form to queue messages. The token
 is also kept beside the store (`station.token`); the page asks for it if you open the
-plain address. The node keeps every message in `station.db` and retries undelivered mail
-with growing delays (1 minute doubling to an hour, 12 attempts).
+plain address. The page also lists the trusted stations and has the live settings.
+The node keeps every message in `station.db` and retries undelivered mail with growing
+delays (1 minute doubling to an hour, 12 attempts, set in `[delivery]`).
 
-Every 10 minutes (`--beacon-minutes`, 0 for none) the node sends a signed beacon on the
+Every 10 minutes (`beacon_minutes`, 0 for none) the node sends a signed beacon on the
 radio: its callsign and key, whether it has internet links, and the stations it has heard in
 the last hour. The status page lists every station heard, and for those that beacon whether
-their key matches your trust file. A beacon never adds a key to the trust file; a key that
-differs from the listed one is logged as a warning.
+their key matches the one you trust. A beacon never adds a trusted station; a key that
+differs from the trusted one is logged as a warning.
 
 ### The built-in modem
 
@@ -53,47 +111,52 @@ Without Direwolf, the node runs its own AFSK 1200 modem on a sound card:
 
 ```sh
 hm audio-devices                                   # list sound cards
-hm node --trust trusted.txt --audio default --ptt vox
-hm node --trust trusted.txt --audio "USB Audio" --ptt cm108:/dev/hidraw0     # AIOC or Digirig
-hm node --trust trusted.txt --audio "USB Audio" --ptt rigctld              # CAT through Hamlib's rigctld
-hm node --trust trusted.txt --audio "USB Audio" --ptt rts:/dev/ttyUSB0
+hm node --audio default --ptt vox
+hm node --audio "USB Audio" --ptt cm108:/dev/hidraw0     # AIOC or Digirig
+hm node --audio "USB Audio" --ptt rigctld              # CAT through Hamlib's rigctld
+hm node --audio "USB Audio" --ptt rts:/dev/ttyUSB0
 ```
+
+or in `station.toml`: `audio = "USB Audio"` and `ptt = "cm108:/dev/hidraw0"` under `[radio]`.
 
 It sends the same AX.25 UI frames as the KISS path, so stations on the built-in modem and
 stations on Direwolf work together. It waits for a clear channel (p-persistent CSMA on its
-carrier detect: `--persist`, `--slottime`), sends each transfer burst in one key-up, and
+carrier detect: `persist`, `slottime_ms`), sends each transfer burst in one key-up, and
 releases PTT on every exit path.
 
 ### Radio, internet, or both
 
 A node can reach other stations by radio, over the internet, or both:
 
-```sh
+```toml
 # A home station with radio that also keeps an internet link to a server
-hm node --trust trusted.txt --peer SO5KM=hm.example.org:4433
-
-# A server without a radio that trusted stations connect to
-hm node --no-radio --trust trusted.txt --listen 0.0.0.0:4433
+[[internet.peers]]
+station = "SO5KM"
+address = "hm.example.org:4433"
 ```
 
+```toml
+# A server without a radio that trusted stations connect to
+[radio]
+enabled = false
+
+[internet]
+listen = "0.0.0.0:4433"
+```
+
+For a quick try the same works from the command line: `hm node --peer
+SO5KM=hm.example.org:4433`, or `hm node --no-radio --listen 0.0.0.0:4433`.
+
 Internet links are QUIC connections authenticated with the station keys themselves:
-only stations in the trust file can connect, and each link is bound to a callsign.
+only trusted stations can connect, and each link is bound to a callsign.
 There is no certificate authority and no central server; any node can listen, dial, or both.
 
 For each message the node picks the link with the lowest expected cost: the link's
-cost (`--radio-cost 1`, `--internet-cost 2` by default) divided by how reliably it has
+cost (`radio_cost = 1`, `internet_cost = 2` by default) divided by how reliably it has
 delivered to that station lately. So mail goes by radio while radio delivers; if radio
 keeps failing, the internet carries it until radio works again. The sent log shows which
 link delivered each message. Mail to a station you have no working link to waits in
 the queue; passing mail on through other nodes comes in Phase 2.
-
-### Trusting stations while the node runs
-
-Trusted stations can change without a restart: add or remove them on the web page (or through
-the API), or edit the `--trust` file, which the node reads again within a second or two of
-any change. Changes made on the page are written to that file, keeping your comments. A
-station taken off the list loses its internet link at once. A trust file that does not
-parse is logged and ignored, and the node keeps the stations it trusted before.
 
 ### Several stations under one callsign
 
@@ -101,14 +164,14 @@ Every SSID is a station of its own, so you can run more than one node, for examp
 station and a server:
 
 ```sh
-hm keygen --call SA0KAM-1 --out home.key     # one key per station
-hm keygen --call SA0KAM-2 --out server.key
-hm whoami --key home.key                     # SA0KAM-1 <key>: a trust-file line
+hm --config home/station.toml keygen --call SA0KAM-1     # one folder and key per station
+hm --config server/station.toml keygen --call SA0KAM-2
+hm --config home/station.toml whoami                     # SA0KAM-1 <key>
 ```
 
-Mail to SA0KAM-2 goes to that node only. In a trust file, a line with an SSID names exactly
-that station; a line without one (as from a key made with `--call SA0KAM`) covers every SSID
-that has no line of its own, which keeps older key files working with `--ssid`. A node that
+Mail to SA0KAM-2 goes to that node only. A `[[trust]]` entry with an SSID names exactly
+that station; one without (as from a key made with `--call SA0KAM`) covers every SSID
+that has no entry of its own, for a key used with `ssid = …` under `[station]`. A node that
 only uses the internet does not transmit, so it needs no licence; any name of up to 9
 letters, digits, `-`, `/` or `.` works (`KAMHOME`), but use your callsign on anything
 with a radio.
@@ -121,9 +184,11 @@ with a radio.
 | GET | `/api/messages?direction=in\|out&limit=n` | newest first, with delivery state and link |
 | POST | `/api/send` | `{"to", "text", "subject"?, "precedence"?}` → `201 {"id"}` |
 | POST | `/api/read/{id}` | mark an inbound message read |
-| GET | `/api/trust` | trusted stations and the trust file they are saved to |
-| POST | `/api/trust` | `{"line": "SO5KM-1 8a1e…"}` (as `hm whoami` prints it) → `201` |
+| GET | `/api/trust` | trusted stations with their notes, and the file they are saved to |
+| POST | `/api/trust` | `{"line": "SO5KM-1 8a1e…", "note"?}` (as `hm whoami` prints it) → `201` |
 | DELETE | `/api/trust/{station}` | stop trusting a station → `204` |
+| GET | `/api/settings` | the settings in use: `live` ones, and those that take a restart |
+| PATCH | `/api/settings` | any of `beacon_minutes`, `radio_cost`, `internet_cost`, `retry_first_secs`, `retry_max_secs`, `retry_attempts`, `peers` (`[{"station", "address"}]`) → the new settings; saved to `station.toml` |
 
 Every `/api` request needs `Authorization: Bearer <token>`. The API is plain HTTP and
 listens on localhost by default; to use the web interface from another machine, put it
@@ -141,13 +206,14 @@ on-air test is next.
 
    ```sh
    hm keygen --call SA0KAM
-   hm whoami >> trusted.txt   # collect the other station's line the same way
+   hm whoami                    # give this line to the other station
+   hm trust add "SO5KM 8a1e…"   # and add theirs
    ```
 
 3. Receiving station:
 
    ```sh
-   hm listen --ssid 1 --trust trusted.txt
+   hm listen --ssid 1
    ```
 
 4. Sending station:
@@ -160,8 +226,9 @@ on-air test is next.
 On this path every hm frame is an AX.25 UI frame from your callsign to `HMNET`, so each
 transmission carries your station identification, and Direwolf's own CSMA (`PERSIST`,
 `SLOTTIME`) handles channel access. Callsigns must fit AX.25: at most 6 letters or digits
-plus SSID 0–15. If transfers time out on a slow or busy channel, raise `--guard`; if your
-TNC's key-up delay differs from 300 ms, set `--txdelay` to match.
+plus SSID 0–15. If transfers time out on a slow or busy channel, raise `guard_ms`; if your
+TNC's key-up delay differs from 300 ms, set `txdelay_ms` to match (both under `[radio]`,
+or `--guard` and `--txdelay` for one run).
 
 ## A hardware TNC on a serial port
 
@@ -169,14 +236,14 @@ TNC's key-up delay differs from 300 ms, set `--txdelay` to match.
 TNC-2 in KISS mode:
 
 ```sh
-hm node --trust trusted.txt --kiss serial:/dev/ttyUSB0:57600
+hm node --kiss serial:/dev/ttyUSB0:57600
 hm send --kiss /dev/ttyACM0 --to SO5KM-1 --text "via a hardware TNC"   # 9600 Bd
-hm listen --kiss COM3 --trust trusted.txt                              # Windows
+hm listen --kiss COM3                              # Windows
 ```
 
 A hardware TNC keys the radio and waits for a clear channel itself, so on opening the port
-`hm` sends it the key-up delay, persistence and slot time (`--txdelay`, `--persist`,
-`--slottime`) as KISS parameters. The TNC must already be in KISS mode.
+`hm` sends it the key-up delay, persistence and slot time (`txdelay_ms`, `persist`,
+`slottime_ms`) as KISS parameters. The TNC must already be in KISS mode.
 
 ## Measured (simulator, 1200 bd, 300 ms TXDELAY)
 

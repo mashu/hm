@@ -2,7 +2,7 @@
 //!
 //! Each station authenticates with its own Ed25519 station key, carried in a
 //! self-signed certificate. Both sides verify the other's key against their
-//! trust file (mutual TLS 1.3, Ed25519 only), so only known stations connect,
+//! trusted stations (mutual TLS 1.3, Ed25519 only), so only known stations connect,
 //! and every connection is bound to a callsign. There is no certificate
 //! authority and no central server.
 //!
@@ -96,7 +96,9 @@ pub struct NetConfig {
     pub trust: Vec<(Callsign, PublicKey)>,
     pub listen: SocketAddr,
     /// Stations to keep a connection to.
-    pub dial: Vec<(Callsign, SocketAddr)>,
+    /// Stations to keep a link to, as `host:port`; looked up again at every
+    /// dial, so a changed address is followed. See also [`Net::set_dial`].
+    pub dial: Vec<(Callsign, String)>,
 }
 
 const ED25519_SPKI_PREFIX: [u8; 12] = [
@@ -156,7 +158,7 @@ impl TrustTable {
     }
 }
 
-/// Accepts exactly the station keys in the trust file, as it is right now.
+/// Accepts exactly the station keys trusted, as they are right now.
 #[derive(Debug)]
 struct TrustVerifier {
     trust: Arc<RwLock<TrustTable>>,
@@ -170,7 +172,7 @@ impl TrustVerifier {
         if self.trust.read().expect("lock").names.contains_key(&key) {
             Ok(())
         } else {
-            Err(rustls::Error::General("station key not in the trust file".into()))
+            Err(rustls::Error::General("station key not trusted".into()))
         }
     }
 
@@ -276,6 +278,8 @@ pub struct Net {
     /// Trusted stations, shared with the TLS verifier; see [`Net::set_trust`].
     trust: Arc<RwLock<TrustTable>>,
     conns: Mutex<BTreeMap<Callsign, Connection>>,
+    /// Stations to keep a link to.
+    dial: Mutex<Vec<(Callsign, String)>>,
     accept: Accept,
 }
 
@@ -325,12 +329,12 @@ impl Net {
             identity: Identity::from_secret(cfg.secret),
             trust,
             conns: Mutex::new(BTreeMap::new()),
+            dial: Mutex::new(Vec::new()),
             accept,
         });
         tokio::spawn(accept_loop(net.clone()));
-        if !cfg.dial.is_empty() {
-            tokio::spawn(dial_loop(net.clone(), cfg.dial));
-        }
+        *net.dial.lock().expect("lock") = cfg.dial;
+        tokio::spawn(dial_loop(Arc::downgrade(&net)));
         Ok(net)
     }
 
@@ -339,7 +343,7 @@ impl Net {
     }
 
     /// The live connection to `peer`: named by its own callsign, or by its base
-    /// callsign when the trust file lists the key without an SSID.
+    /// callsign when its key is trusted without an SSID.
     fn conn_for(&self, peer: Callsign) -> Option<Connection> {
         let conns = self.conns.lock().expect("lock");
         [peer, peer.base()]
@@ -416,6 +420,12 @@ impl Net {
         self.trust.read().expect("lock").names.get(&key).copied()
     }
 
+    /// Replace the stations to keep a link to. Links to stations dropped from
+    /// the list stay until they break; they are not redialled.
+    pub fn set_dial(&self, peers: Vec<(Callsign, String)>) {
+        *self.dial.lock().expect("lock") = peers;
+    }
+
     /// Replace the trusted stations. New connections are checked against the
     /// new list at once; a link whose key is no longer trusted, or now belongs
     /// to another callsign, is closed (and redialled if configured).
@@ -457,25 +467,45 @@ async fn accept_loop(net: Arc<Net>) {
     }
 }
 
-async fn dial_loop(net: Arc<Net>, peers: Vec<(Callsign, SocketAddr)>) {
+/// Keeps the dial list's links up. Holds the station only while dialling, so
+/// a station that is dropped releases its socket, and the loop ends.
+async fn dial_loop(net: std::sync::Weak<Net>) {
     loop {
-        for (call, addr) in &peers {
+        let Some(net) = net.upgrade() else { return };
+        let peers = net.dial.lock().expect("lock").clone();
+        for (call, address) in &peers {
             if net.is_connected(*call) {
                 continue;
             }
-            if let Ok(connecting) = net.endpoint.connect(*addr, "hm-net") {
-                if let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(5), connecting).await {
-                    let named = net.peer_of(&conn);
-                    if named != Some(*call) && named != Some(call.base()) {
-                        conn.close(1u32.into(), b"unexpected station");
-                    } else if confirmed(&conn).await {
-                        net.register(conn);
-                    } else {
-                        conn.close(1u32.into(), b"not accepted");
-                    }
+            let Ok(Ok(addrs)) =
+                tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(address)).await
+            else {
+                continue;
+            };
+            // A name can resolve to IPv6 and IPv4 addresses (localhost to ::1
+            // and 127.0.0.1): try each, those our socket can reach first.
+            let mut addrs: Vec<SocketAddr> = addrs.collect();
+            let v4 = net.endpoint.local_addr().is_ok_and(|a| a.is_ipv4());
+            addrs.sort_by_key(|a| a.is_ipv4() != v4);
+            for addr in addrs {
+                let Ok(connecting) = net.endpoint.connect(addr, "hm-net") else {
+                    continue;
+                };
+                let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(5), connecting).await else {
+                    continue;
+                };
+                let named = net.peer_of(&conn);
+                if named != Some(*call) && named != Some(call.base()) {
+                    conn.close(1u32.into(), b"unexpected station");
+                } else if confirmed(&conn).await {
+                    net.register(conn);
+                } else {
+                    conn.close(1u32.into(), b"not accepted");
                 }
+                break;
             }
         }
+        drop(net);
         tokio::time::sleep(REDIAL_EVERY).await;
     }
 }

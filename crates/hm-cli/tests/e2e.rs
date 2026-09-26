@@ -158,47 +158,51 @@ fn hm_binary_end_to_end() {
     let dir = std::env::temp_dir().join(format!("hm-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let (a_key, b_key, trust) = (dir.join("a.key"), dir.join("b.key"), dir.join("trusted.txt"));
-    let run = |args: &[&str]| Command::new(hm).args(args).output().unwrap();
+    // Each station in a directory of its own: `hm keygen` writes station.key
+    // and a starter station.toml there, and `hm trust add` exchanges keys.
+    let (a_cfg, b_cfg) = (dir.join("a/station.toml"), dir.join("b/station.toml"));
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    std::fs::create_dir_all(dir.join("b")).unwrap();
+    let run = |cfg: &std::path::Path, args: &[&str]| {
+        Command::new(hm)
+            .arg("--config")
+            .arg(cfg)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert!(run(&a_cfg, &["keygen", "--call", "SA0KAM"]).status.success());
+    assert!(run(&b_cfg, &["keygen", "--call", "SO5KM"]).status.success());
     assert!(
-        run(&["keygen", "--call", "SA0KAM", "--out", a_key.to_str().unwrap()])
-            .status
-            .success()
-    );
-    assert!(
-        run(&["keygen", "--call", "SO5KM", "--out", b_key.to_str().unwrap()])
-            .status
-            .success()
-    );
-    assert!(
-        !run(&["keygen", "--call", "SO5KM", "--out", b_key.to_str().unwrap()])
-            .status
-            .success(),
+        !run(&b_cfg, &["keygen", "--call", "SO5KM"]).status.success(),
         "no overwrite"
     );
-    let whoami = run(&["whoami", "--key", a_key.to_str().unwrap()]);
-    std::fs::write(&trust, &whoami.stdout).unwrap();
-    let b_trust = dir.join("b-trusted.txt");
-    std::fs::write(
-        &b_trust,
-        run(&["whoami", "--key", b_key.to_str().unwrap()]).stdout,
-    )
-    .unwrap();
+    assert!(dir.join("b/station.key").exists());
+    let line = |cfg| {
+        String::from_utf8(run(cfg, &["whoami"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    let (a_line, b_line) = (line(&a_cfg), line(&b_cfg));
+    assert!(run(&b_cfg, &["trust", "add", &a_line, "--note", "Alice"])
+        .status
+        .success());
+    assert!(run(&a_cfg, &["trust", "add", &b_line]).status.success());
+    let listed = String::from_utf8(run(&b_cfg, &["trust", "list"]).stdout).unwrap();
+    assert!(
+        listed.contains("SA0KAM ") && listed.contains("# Alice"),
+        "{listed}"
+    );
+    assert!(!run(&b_cfg, &["trust", "add", "SA0KAM nothex"]).status.success());
 
     let tnc = fake_tnc(0);
     let addr = tnc.addr.to_string();
     let fast = ["--bitrate", "9600", "--txdelay", "50", "--guard", "300"];
     let mut listener = Command::new(hm)
-        .args([
-            "listen",
-            "--key",
-            b_key.to_str().unwrap(),
-            "--ssid",
-            "1",
-            "--kiss",
-            &addr,
-        ])
-        .args(["--trust", trust.to_str().unwrap()])
+        .arg("--config")
+        .arg(&b_cfg)
+        .args(["listen", "--ssid", "1", "--kiss", &addr])
         .args(fast)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -206,15 +210,9 @@ fn hm_binary_end_to_end() {
         .unwrap();
     thread::sleep(Duration::from_millis(500));
     let send = Command::new(hm)
-        .args([
-            "send",
-            "--key",
-            a_key.to_str().unwrap(),
-            "--kiss",
-            &addr,
-            "--to",
-            "SO5KM-1",
-        ])
+        .arg("--config")
+        .arg(&a_cfg)
+        .args(["send", "--kiss", &addr, "--to", "SO5KM-1"])
         .args([
             "--text",
             "hello from the hm binary",
@@ -224,7 +222,7 @@ fn hm_binary_end_to_end() {
             "priority",
         ])
         .args(fast)
-        .args(["--timeout", "60", "--trust", b_trust.to_str().unwrap()])
+        .args(["--timeout", "60"])
         .output()
         .unwrap();
     thread::sleep(Duration::from_millis(500));
@@ -260,7 +258,15 @@ fn a_key_for_one_ssid_is_that_station_only() {
     let dir = std::env::temp_dir().join(format!("hm-ssid-key-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let key = dir.join("server.key");
-    let run = |args: &[&str]| Command::new(hm).args(args).output().unwrap();
+    let cfg = dir.join("station.toml");
+    let run = |args: &[&str]| {
+        Command::new(hm)
+            .arg("--config")
+            .arg(&cfg)
+            .args(args)
+            .output()
+            .unwrap()
+    };
     assert!(
         run(&["keygen", "--call", "SA0KAM-2", "--out", key.to_str().unwrap()])
             .status
@@ -285,5 +291,7 @@ fn a_key_for_one_ssid_is_that_station_only() {
         !out.status.success() && err.contains("is for SA0KAM-2 only"),
         "{err}"
     );
+    // Keygen wrote a starter settings file next to the key.
+    assert!(cfg.exists());
     std::fs::remove_dir_all(&dir).unwrap();
 }

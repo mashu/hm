@@ -4,7 +4,7 @@
 //! internet) and which stations it has heard lately. The signature binds the
 //! frame's source callsign to the key: a beacon that verifies proves only that
 //! whoever sent it holds that key. Whether the key belongs to the callsign is
-//! for the trust file to say; beacons never teach keys.
+//! for the trusted keys to say; beacons never teach keys.
 
 use alloc::vec::Vec;
 

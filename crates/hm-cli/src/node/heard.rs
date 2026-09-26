@@ -1,5 +1,5 @@
 //! Stations heard on the radio: from any frame's source callsign, and from
-//! beacons, whose keys are compared with the trust file (never adopted).
+//! beacons, whose keys are compared with the trusted keys (never adopted).
 
 use std::collections::BTreeMap;
 
@@ -8,14 +8,14 @@ use hm_xfer::beacon::HeardBeacon;
 
 use crate::files::Trust;
 
-/// How a beacon's key compares with the trust file.
+/// How a beacon's key compares with the trusted key.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum KeyCheck {
-    /// The key the trust file lists for the station.
+    /// The key trusted for the station.
     Trusted,
-    /// The station is not in the trust file.
+    /// The station is not trusted.
     Unknown,
-    /// The trust file lists another key: an impostor, or a station with a new key.
+    /// Another key is trusted for it: an impostor, or a station with a new key.
     Mismatch,
 }
 
