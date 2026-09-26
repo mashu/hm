@@ -17,6 +17,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: HM_SEEDS=10000 cargo test -p hm-sim --release --test oracle -- --nocapture
 
+  modem-curve:
+    name: modem frame-loss table vs the modem
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p hm-sim --release --test afsk afsk_1200_curve -- --ignored --nocapture
+
   mutations:
     name: decoder mutations, 1,000,000 inputs
     runs-on: ubuntu-latest

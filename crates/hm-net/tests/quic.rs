@@ -191,11 +191,24 @@ async fn reconnects_after_the_peer_restarts() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(down, "A notices the connection is gone");
-    // B comes back on the same address; A redials by itself.
-    let mut c = cfg("SO5KM", 2, &[("SA0KAM", 1)], vec![]);
-    c.listen = addr;
+    // B comes back on the same address; A redials by itself. The old B's UDP
+    // socket is released only once its background tasks have wound down, which
+    // under load can take a moment (a restarted process would not wait: the
+    // OS frees the port when the old one exits), so retry the bind until it is free.
     let (b2_accept, b2_log) = recorder(Verdict::Stored);
-    let _b2 = Net::start(c, b2_accept).unwrap();
+    let mut tries = 0;
+    let _b2 = loop {
+        let mut c = cfg("SO5KM", 2, &[("SA0KAM", 1)], vec![]);
+        c.listen = addr;
+        match Net::start(c, b2_accept.clone()) {
+            Ok(n) => break n,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && tries < 100 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("B cannot listen on its old address again: {e}"),
+        }
+    };
     assert!(wait_connected(&a, "SO5KM").await);
     a.deliver(call("SO5KM"), b"after restart").await.unwrap();
     assert_eq!(b2_log.lock().unwrap().len(), 1);

@@ -6,20 +6,24 @@
 //! - **Channels and ports**: each channel has its own bitrate and TXDELAY. A
 //!   station attaches radios (ports) to channels, e.g. port 0 on the VHF access
 //!   channel and port 1 on an HF backbone channel. Channels never interfere.
-//! - **Airtime**: `txdelay + (frame + phy overhead) * 8 / bitrate`, rounded up to 1 ms.
+//! - **Airtime**: `txdelay + txtail + ((frame + phy overhead) * 8 + stuffed bits) / bitrate`,
+//!   rounded up to 1 ms; stuffed bits are counted on HDLC channels only.
 //!   Each radio sends its queued frames back to back; a frame queued while the
 //!   radio is still transmitting follows without a new TXDELAY (PTT stays keyed).
 //! - **Half-duplex**: a radio that is transmitting hears nothing on its channel.
 //! - **Collisions**: two transmissions overlapping at a receiver destroy each
 //!   other (no capture effect), including hidden-terminal cases.
-//! - **Loss**: per directed link: Bernoulli, Gilbert–Elliott (bursty) or a
-//!   per-UTC-hour table for HF band openings (sim time 0 = 00:00 UTC).
+//! - **Loss**: per directed link: Bernoulli, Gilbert–Elliott (bursty), a
+//!   per-UTC-hour table for HF band openings (sim time 0 = 00:00 UTC), or a
+//!   real modem's measured loss by SNR and frame length ([`Loss::afsk_1200`]).
 //! - **Faults**: stations going down and up, links cut and restored
 //!   (partitions), per-station clock offset and drift, and frames delivered
 //!   with undetected bit errors.
-//!
-//! Channel access (CSMA) is *not* modelled: it is the machine's job, so the
-//! simulator measures whatever MAC the protocol implements.
+//! - **Channel access**: off by default (a radio keys up when its machine asks,
+//!   so the simulator measures whatever MAC the protocol implements), or per
+//!   radio p-persistent CSMA on carrier detect ([`Csma`]), as the link below the
+//!   machine does it on air. Carrier is detected after a delay, and only from
+//!   stations the radio can hear, so hidden terminals still collide.
 //!
 //! Same seed and same inputs give a byte-identical run; [`Report::trace`]
 //! hashes every delivery, fault and application event.
@@ -31,8 +35,12 @@ use std::hash::{Hash, Hasher};
 use hm_core::{DetRng, Input, Machine, Millis, Output, Port};
 use hm_wire::{FrameHeader, FrameType, DATA_PREAMBLE_LEN, HEADER_LEN};
 
+pub mod afsk_1200;
+pub mod curve;
 pub mod metrics;
 pub mod toy;
+
+pub use curve::LossCurve;
 
 pub type NodeId = usize;
 
@@ -58,6 +66,23 @@ pub enum Loss {
     /// Frame loss probability by UTC hour (index 0 = 00:00–00:59).
     /// 1.0 models a closed band.
     Hourly([f64; 24]),
+    /// A real modem at a fixed SNR, from its measured curve: longer frames
+    /// (bytes on air, the channel's per-frame overhead included) are lost more often.
+    Measured {
+        curve: &'static LossCurve,
+        snr_db: f64,
+    },
+}
+
+impl Loss {
+    /// The built-in AFSK 1200 modem at `snr_db` (3 kHz noise bandwidth), as
+    /// measured in white noise at 48 kHz: see [`afsk_1200::CURVE`].
+    pub const fn afsk_1200(snr_db: f64) -> Loss {
+        Loss::Measured {
+            curve: &afsk_1200::CURVE,
+            snr_db,
+        }
+    }
 }
 
 /// Physical parameters of a channel.
@@ -66,32 +91,121 @@ pub struct RadioParams {
     pub bitrate_bps: u32,
     /// Key-up delay before data (TXDELAY), counted as airtime.
     pub txdelay: Millis,
-    /// Extra bytes the modem adds per frame (preamble, sync word, FEC parity).
+    /// Flags or carrier after the last frame of a key-up (TXTAIL), counted as
+    /// airtime. Charged to the frame that keys up, like TXDELAY.
+    pub txtail: Millis,
+    /// Extra bytes the link and modem add per frame: link header, frame check,
+    /// closing flag, or preamble, sync word and FEC parity.
     pub phy_overhead_bytes: u32,
+    /// HDLC bit stuffing: a 0 bit after every five 1 bits of the frame. Counted
+    /// exactly on the frame's own bytes; the overhead bytes are not stuffed.
+    pub hdlc: bool,
 }
 
 impl RadioParams {
-    /// AFSK 1200 on an FM transceiver with a typical 300 ms TXDELAY.
+    /// AFSK 1200 on an FM transceiver through AX.25, as the built-in modem and
+    /// Direwolf send it: 300 ms TXDELAY, a 16-byte UI header, a 2-byte frame
+    /// check and a flag after each frame, HDLC bit stuffing, and two tail flags.
+    /// Checked against the modulator in `tests/afsk.rs`.
     pub const VHF_1200: RadioParams = RadioParams {
         bitrate_bps: 1200,
         txdelay: Millis(300),
-        phy_overhead_bytes: 0,
+        txtail: Millis(14),
+        phy_overhead_bytes: 19,
+        hdlc: true,
     };
 
-    /// Airtime of a frame that keys up the transmitter.
-    pub fn airtime(&self, frame_len: usize) -> Millis {
-        self.txdelay + self.airtime_keyed(frame_len)
+    /// A channel that sends exactly the frame's bytes, with only a TXDELAY.
+    pub const fn raw(bitrate_bps: u32, txdelay: Millis) -> RadioParams {
+        RadioParams {
+            bitrate_bps,
+            txdelay,
+            txtail: Millis(0),
+            phy_overhead_bytes: 0,
+            hdlc: false,
+        }
     }
 
-    /// Airtime of a frame sent while the transmitter is already keyed.
+    /// Airtime of a frame of `frame_len` bytes that keys up the transmitter,
+    /// without bit stuffing (a lower bound on HDLC channels).
+    pub fn airtime(&self, frame_len: usize) -> Millis {
+        self.txdelay + self.txtail + self.airtime_keyed(frame_len)
+    }
+
+    /// Airtime of a frame sent while the transmitter is already keyed, without bit stuffing.
     pub fn airtime_keyed(&self, frame_len: usize) -> Millis {
-        let bits = (frame_len as u64 + self.phy_overhead_bytes as u64) * 8;
+        self.bits_ms((frame_len as u64 + self.phy_overhead_bytes as u64) * 8)
+    }
+
+    /// Bits `frame` occupies on air, overhead and stuffing included.
+    pub fn frame_bits(&self, frame: &[u8]) -> u64 {
+        let stuffed = if self.hdlc { stuffed_bits(frame) } else { 0 };
+        (frame.len() as u64 + self.phy_overhead_bytes as u64) * 8 + stuffed
+    }
+
+    /// Airtime of `frame`, with the key-up (TXDELAY and TXTAIL) when `keyup`.
+    pub fn airtime_of(&self, frame: &[u8], keyup: bool) -> Millis {
+        let body = self.bits_ms(self.frame_bits(frame));
+        if keyup {
+            self.txdelay + self.txtail + body
+        } else {
+            body
+        }
+    }
+
+    fn bits_ms(&self, bits: u64) -> Millis {
         Millis((bits * 1000).div_ceil(self.bitrate_bps.max(1) as u64))
     }
 
     fn bits_us(&self, bits: u64) -> u64 {
         bits * 1_000_000 / self.bitrate_bps.max(1) as u64
     }
+}
+
+/// Zero bits HDLC inserts into `bytes` (sent least significant bit first):
+/// one after every run of five 1 bits, the run count starting at zero.
+pub fn stuffed_bits(bytes: &[u8]) -> u64 {
+    let (mut ones, mut stuffed) = (0u32, 0u64);
+    for &b in bytes {
+        for i in 0..8 {
+            if (b >> i) & 1 == 1 {
+                ones += 1;
+                if ones == 5 {
+                    stuffed += 1;
+                    ones = 0;
+                }
+            } else {
+                ones = 0;
+            }
+        }
+    }
+    stuffed
+}
+
+/// Carrier-sense channel access for one radio: p-persistent CSMA on carrier
+/// detect, as the built-in modem's link and Direwolf do it. Frames the machine
+/// asks to send while the radio is idle wait for a clear channel: while a
+/// carrier is heard, wait a slot; when clear, key up with probability
+/// (persist + 1) / 256, else wait a slot. They then go out in one key-up.
+/// Frames asked for while the radio is keyed follow in the same key-up.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Csma {
+    pub persist: u8,
+    pub slot: Millis,
+    /// How long after another station keys up its carrier is detected. A
+    /// station that starts within this time of another does not hear it.
+    pub dcd_delay: Millis,
+}
+
+impl Csma {
+    /// The built-in modem's defaults (`--persist 63 --slottime 100`). Carrier
+    /// detect: its demodulator rises 68–101 ms after key-up at 7–20 dB SNR
+    /// (`tests/afsk.rs`), and the link reads audio in 20 ms chunks.
+    pub const DEFAULT: Csma = Csma {
+        persist: 63,
+        slot: Millis(100),
+        dcd_delay: Millis(125),
+    };
 }
 
 /// A station's clock relative to simulation time:
@@ -155,8 +269,12 @@ pub fn classify_hm_frame(frame: &[u8]) -> (usize, FrameClass) {
 /// the scheduled airtime in [`Stats::airtime_ms`] also includes rounding up to 1 ms.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Airtime {
+    /// Key-up: TXDELAY and TXTAIL.
     pub txdelay_us: u64,
-    /// Modem overhead bytes plus frame headers.
+    /// What the link and modem add to each frame: overhead bytes (AX.25
+    /// header, frame check, flag) and bit stuffing.
+    pub link_us: u64,
+    /// Frame headers (as the classifier counts them).
     pub overhead_us: u64,
     pub payload_us: u64,
     pub control_us: u64,
@@ -165,7 +283,12 @@ pub struct Airtime {
 
 impl Airtime {
     pub fn total_us(&self) -> u64 {
-        self.txdelay_us + self.overhead_us + self.payload_us + self.control_us + self.unknown_us
+        self.txdelay_us
+            + self.link_us
+            + self.overhead_us
+            + self.payload_us
+            + self.control_us
+            + self.unknown_us
     }
 
     /// Share of airtime that carried payload, in `[0, 1]`.
@@ -180,6 +303,7 @@ impl Airtime {
 
     fn add(&mut self, o: &Airtime) {
         self.txdelay_us += o.txdelay_us;
+        self.link_us += o.link_us;
         self.overhead_us += o.overhead_us;
         self.payload_us += o.payload_us;
         self.control_us += o.control_us;
@@ -262,19 +386,24 @@ pub enum Outcome {
 /// Optional detailed log, in processing order, for independent checking.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogEntry {
-    /// `queued_at` is when the machine asked to transmit; `keyup` is false when
-    /// the frame followed the previous one without a new TXDELAY.
+    /// `asked_at` is when the machine asked to transmit and `queued_at` when
+    /// the radio took the frame: the same, except on a radio with [`Csma`],
+    /// where it is when the channel was found clear. `keyup` is false when the
+    /// frame followed the previous one without a new TXDELAY.
     Tx {
         id: u64,
         channel: ChannelId,
         from: NodeId,
         port: Port,
+        asked_at: Millis,
         queued_at: Millis,
         start: Millis,
         end: Millis,
         keyup: bool,
         len: usize,
         digest: u64,
+        /// The frame's bytes, so a checker can count bit stuffing itself.
+        data: Vec<u8>,
     },
     /// Transmission `tx` ended and is being evaluated at every listening neighbour;
     /// its `Rx` entries follow immediately.
@@ -308,6 +437,14 @@ pub enum LogEntry {
 struct Radio {
     channel: ChannelId,
     free_at: Millis,
+    /// Start of the current or last key-up.
+    keyed_at: Millis,
+    csma: Option<Csma>,
+    /// Frames waiting for the channel, with when the machine asked to send them.
+    waiting: Vec<(Vec<u8>, Millis)>,
+    /// Bumped to cancel a scheduled channel-access attempt.
+    access_gen: u64,
+    access_pending: bool,
 }
 
 struct Node<M> {
@@ -342,6 +479,8 @@ struct Tx {
     from: NodeId,
     start: Millis,
     end: Millis,
+    /// Start of the key-up this frame belongs to: its carrier began then.
+    keyed_at: Millis,
 }
 
 enum Ev<C> {
@@ -369,6 +508,11 @@ enum Ev<C> {
         from: NodeId,
         to: NodeId,
         enabled: bool,
+    },
+    Access {
+        node: NodeId,
+        port: Port,
+        gen: u64,
     },
 }
 
@@ -552,8 +696,23 @@ where
             Radio {
                 channel: ch,
                 free_at: Millis::ZERO,
+                keyed_at: Millis::ZERO,
+                csma: None,
+                waiting: Vec::new(),
+                access_gen: 0,
+                access_pending: false,
             },
         );
+    }
+
+    /// Channel access for the radio on `port` of `node`: `None` (the default)
+    /// keys up as soon as the machine asks, `Some` waits for a clear channel.
+    pub fn set_csma(&mut self, node: NodeId, port: Port, csma: Option<Csma>) {
+        let r = self.nodes[node]
+            .radios
+            .get_mut(&port)
+            .unwrap_or_else(|| panic!("station {node} has no radio on port {port}"));
+        r.csma = csma;
     }
 
     pub fn node_count(&self) -> usize {
@@ -733,6 +892,11 @@ where
                     let n = &mut self.nodes[node];
                     n.gen += 1;
                     n.timer = None;
+                    for r in n.radios.values_mut() {
+                        r.waiting.clear();
+                        r.access_pending = false;
+                        r.access_gen += 1;
+                    }
                 }
             }
             Ev::SetLink {
@@ -760,6 +924,7 @@ where
                 start,
                 frame,
             } => self.finish_tx(id, channel, from, start, frame),
+            Ev::Access { node, port, gen } => self.access(node, port, gen),
         }
     }
 
@@ -830,23 +995,80 @@ where
         if !self.nodes[node].up {
             return;
         }
-        let ch = match self.nodes[node].radios.get(&port) {
-            Some(r) => r.channel,
+        let now = self.now;
+        let r = match self.nodes[node].radios.get_mut(&port) {
+            Some(r) => r,
             None => panic!("station {node} transmitted on port {port}, which has no radio"),
         };
+        if r.csma.is_some() && r.free_at <= now {
+            // Idle radio with channel access: wait for a clear channel. The
+            // first attempt runs after the machine's other outputs, so a whole
+            // over gathers into one key-up.
+            r.waiting.push((frame, now));
+            if !r.access_pending {
+                r.access_pending = true;
+                let gen = r.access_gen;
+                self.push(now, Ev::Access { node, port, gen });
+            }
+            return;
+        }
+        self.put_on_air(node, port, frame, now);
+    }
+
+    /// One channel-access attempt for the frames waiting on a radio.
+    fn access(&mut self, node: NodeId, port: Port, gen: u64) {
+        let now = self.now;
+        let n = &self.nodes[node];
+        let r = &n.radios[&port];
+        if !n.up || r.access_gen != gen || !r.access_pending {
+            return;
+        }
+        // Channel access switched off meanwhile: send what is waiting now.
+        if let Some(csma) = r.csma {
+            let busy = self.carrier(node, r.channel, csma.dcd_delay);
+            if busy || self.rng.below(256) > csma.persist as u64 {
+                self.push(now + csma.slot, Ev::Access { node, port, gen });
+                return;
+            }
+        }
+        let r = self.nodes[node].radios.get_mut(&port).expect("checked");
+        r.access_pending = false;
+        for (frame, asked_at) in std::mem::take(&mut r.waiting) {
+            self.put_on_air(node, port, frame, asked_at);
+        }
+    }
+
+    /// Whether `node` detects a carrier on `ch`: another station it can hear
+    /// has been keyed up for at least `dcd_delay`.
+    fn carrier(&self, node: NodeId, ch: ChannelId, dcd_delay: Millis) -> bool {
+        let now = self.now;
+        self.txs.iter().any(|t| {
+            t.channel == ch
+                && t.from != node
+                && t.start <= now
+                && now < t.end
+                && t.keyed_at + dcd_delay <= now
+                && self.links.get(&(ch, t.from, node)).is_some_and(|l| l.enabled)
+        })
+    }
+
+    /// Key up (or continue the key-up) and send `frame`.
+    fn put_on_air(&mut self, node: NodeId, port: Port, frame: Vec<u8>, asked_at: Millis) {
+        let ch = self.nodes[node].radios[&port].channel;
         let radio = self.channels[ch.0];
         let keyup = self.nodes[node].radios[&port].free_at <= self.now;
-        let airtime = if keyup {
-            radio.airtime(frame.len())
-        } else {
-            radio.airtime_keyed(frame.len())
-        };
+        let airtime = radio.airtime_of(&frame, keyup);
         let (header, class) = (self.classifier)(&frame);
         let header = header.min(frame.len());
         let body_bits = (frame.len() - header) as u64 * 8;
         let split = Airtime {
-            txdelay_us: if keyup { radio.txdelay.0 * 1000 } else { 0 },
-            overhead_us: radio.bits_us((radio.phy_overhead_bytes as u64 + header as u64) * 8),
+            txdelay_us: if keyup {
+                (radio.txdelay.0 + radio.txtail.0) * 1000
+            } else {
+                0
+            },
+            link_us: radio.bits_us(radio.frame_bits(&frame) - frame.len() as u64 * 8),
+            overhead_us: radio.bits_us(header as u64 * 8),
             payload_us: if class == FrameClass::Payload {
                 radio.bits_us(body_bits)
             } else {
@@ -868,6 +1090,10 @@ where
         let start = if keyup { self.now } else { r.free_at };
         let end = start + airtime;
         r.free_at = end;
+        if keyup {
+            r.keyed_at = start;
+        }
+        let keyed_at = r.keyed_at;
         let n = &mut self.nodes[node];
         n.stats.frames_sent += 1;
         n.stats.bytes_sent += frame.len() as u64;
@@ -886,6 +1112,7 @@ where
             from: node,
             start,
             end,
+            keyed_at,
         });
         let digest = Fnv::digest(&frame);
         let queued_at = self.now;
@@ -894,12 +1121,18 @@ where
             channel: ch,
             from: node,
             port,
+            asked_at,
             queued_at,
             start,
             end,
             keyup,
             len: frame.len(),
             digest,
+            data: if self.log.is_some() {
+                frame.clone()
+            } else {
+                Vec::new()
+            },
         });
         self.push(
             end,
@@ -941,11 +1174,12 @@ where
                 Outcome::LostCollision
             } else {
                 let now = self.now;
+                let on_air = frame.len() + self.channels[ch.0].phy_overhead_bytes as usize;
                 let link = self
                     .links
                     .get_mut(&(ch, from, r))
                     .expect("receiver comes from link table");
-                if lose(&mut self.rng, link, now) {
+                if lose(&mut self.rng, link, now, on_air) {
                     Outcome::LostChannel
                 } else if !frame.is_empty() && self.rng.chance(link.corrupt) {
                     Outcome::Corrupted
@@ -1010,7 +1244,7 @@ where
     }
 }
 
-fn lose(rng: &mut DetRng, link: &mut Link, now: Millis) -> bool {
+fn lose(rng: &mut DetRng, link: &mut Link, now: Millis, on_air: usize) -> bool {
     match link.loss {
         Loss::None => false,
         Loss::Bernoulli(p) => rng.chance(p),
@@ -1027,6 +1261,7 @@ fn lose(rng: &mut DetRng, link: &mut Link, now: Millis) -> bool {
             rng.chance(if link.bad { loss_bad } else { loss_good })
         }
         Loss::Hourly(table) => rng.chance(table[((now.0 / 3_600_000) % 24) as usize]),
+        Loss::Measured { curve, snr_db } => rng.chance(curve.loss(snr_db, on_air)),
     }
 }
 

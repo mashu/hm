@@ -300,7 +300,7 @@ fn precedence_orders_the_queue_and_bad_sends_fail_fast() {
 fn duty_cycle_limits_over_size_and_spacing() {
     let mut cfg = Config::vhf_1200(call("SA0KAM"));
     cfg.duty_cycle_permille = 100;
-    cfg.bucket = Millis(5_000);
+    cfg.bucket = Millis(5_500);
     let mut a = Xfer::new(cfg, identity("SA0KAM"), DetRng::from_seed(1)).unwrap();
     let mut out = Vec::new();
     a.handle(
@@ -312,7 +312,8 @@ fn duty_cycle_limits_over_size_and_spacing() {
         }),
         &mut out,
     );
-    // A 5 s bucket holds TXDELAY + OFFER + two 222-byte frames (1.48 s each), not the 20 wanted.
+    // A 5.5 s bucket holds TXDELAY + OFFER (0.52 s) + two 222-byte frames
+    // (1.64 s each on air as AX.25), not the 20 wanted.
     assert_eq!(frames(&out).len(), 1 + 2);
     // The receiver still needs 18 symbols; at 10% duty the next over waits for the bucket to refill.
     let session = FrameHeader::decode(&frames(&out)[0]).unwrap().0.session;
@@ -341,7 +342,7 @@ fn duty_cycle_limits_over_size_and_spacing() {
     );
     let mut out = Vec::new();
     a.on_deadline(t, &mut out);
-    // No OFFER this time, so three frames fit: 0.3 s + 3 x 1.48 s < 5 s.
+    // No OFFER this time, so three frames fit: 0.3 s + 3 x 1.64 s < 5.5 s.
     assert_eq!(frames(&out).len(), 3);
 }
 
@@ -681,4 +682,71 @@ fn one_sender_cannot_hold_more_than_its_share() {
         );
     }
     assert_eq!(b.incoming.len(), b.cfg.max_incoming_per_sender);
+}
+
+/// A sender waiting for its ACK that hears an over between other stations
+/// keeps waiting until its own over could have followed that one and been
+/// answered: the link may have held our over back for the busy channel.
+#[test]
+fn other_traffic_extends_the_wait_for_an_ack() {
+    let mut a = engine("SA0KAM");
+    let mut out = Vec::new();
+    a.handle(
+        Millis(0),
+        Input::Command(Command::Send {
+            to: call("SO5KM-1"),
+            object: vec![7; 1500],
+            precedence: 0,
+        }),
+        &mut out,
+    );
+    assert!(!frames(&out).is_empty());
+    let first = a.next_deadline().unwrap();
+
+    // SP5AAA sends SP5BBB a DATA frame with 10 more to come in its over.
+    let pre = DataPreamble {
+        object_len: 4000,
+        remaining: 10,
+    };
+    let mut payload = pre.to_bytes().unwrap().to_vec();
+    payload.extend_from_slice(&[0u8; 200]);
+    let other = FrameHeader {
+        ftype: FrameType::Data,
+        src: call("SP5AAA"),
+        dst: Dest::Station(call("SP5BBB")),
+        session: 9,
+        index: 3,
+    }
+    .frame(&payload)
+    .unwrap();
+    let heard = Millis(5_000);
+    a.handle(heard, Input::Frame { port: 0, data: other }, &mut out);
+    let later = a.next_deadline().unwrap();
+    let cfg = &a.cfg;
+    let over_end = heard + cfg.air(10, cfg.data_frame_len(200));
+    let o = a.active.as_ref().unwrap();
+    assert!(later > first);
+    assert_eq!(
+        later,
+        over_end + cfg.ack_guard + o.last_cost + cfg.ack_guard + a.ack_air() + cfg.ack_guard
+    );
+
+    // Frames from our peer to us are its answer, not other traffic: even one
+    // the engine ignores (another session) leaves the wait as it is.
+    let before = a.next_deadline().unwrap();
+    let stray = FrameHeader {
+        ftype: FrameType::Ack,
+        src: call("SO5KM-1"),
+        dst: Dest::Station(call("SA0KAM")),
+        session: o.session.wrapping_add(1),
+        index: 0,
+    }
+    .frame(&Ack::default().to_vec().unwrap())
+    .unwrap();
+    a.handle(
+        Millis(before.0 - 1),
+        Input::Frame { port: 0, data: stray },
+        &mut out,
+    );
+    assert_eq!(a.next_deadline().unwrap(), before);
 }

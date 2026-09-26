@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hm_core::{DetRng, Millis, Port};
 use hm_sim::toy::{Beacon, BeaconCmd, BeaconEvent};
-use hm_sim::{ChannelId, Clock, LogEntry, Loss, NodeId, Outcome, RadioParams, Report, Sim, Stats};
+use hm_sim::{ChannelId, Clock, Csma, LogEntry, Loss, NodeId, Outcome, RadioParams, Report, Sim, Stats};
 
 type BeaconSim = Sim<Beacon, BeaconCmd, BeaconEvent>;
 
@@ -24,11 +24,13 @@ struct Scenario {
     ports: BTreeMap<(NodeId, ChannelId), Port>,
     /// (channel, from, to) -> (loss is None, corruption probability)
     links: BTreeMap<(ChannelId, NodeId, NodeId), (bool, f64)>,
+    /// (node, channel) -> channel access, for radios that have it
+    csma: BTreeMap<(NodeId, ChannelId), Csma>,
     nodes: usize,
 }
 
 fn random_loss(g: &mut DetRng) -> Loss {
-    match g.below(5) {
+    match g.below(6) {
         0 => Loss::None,
         1 => Loss::Bernoulli(g.next_f64() * 0.3),
         2 => Loss::GilbertElliott {
@@ -44,8 +46,29 @@ fn random_loss(g: &mut DetRng) -> Loss {
             }
             Loss::Hourly(t)
         }
+        4 => Loss::afsk_1200(4.0 + g.next_f64() * 8.0),
         _ => Loss::Bernoulli(0.0),
     }
+}
+
+/// Rule: key-up (TXDELAY and TXTAIL) when keying up, then the frame, the
+/// per-frame overhead and, on HDLC channels, a 0 after every five 1s sent
+/// (bytes least significant bit first), rounded up to a whole millisecond.
+fn airtime(p: &RadioParams, data: &[u8], keyup: bool) -> Millis {
+    let mut bits = 8 * (data.len() as u64 + p.phy_overhead_bytes as u64);
+    if p.hdlc {
+        let mut run = 0;
+        for bit in data.iter().flat_map(|b| (0..8).map(move |i| b >> i & 1)) {
+            run = if bit == 1 { run + 1 } else { 0 };
+            if run == 5 {
+                bits += 1;
+                run = 0;
+            }
+        }
+    }
+    let body = (bits * 1000).div_ceil(p.bitrate_bps as u64);
+    let key = if keyup { p.txdelay.0 + p.txtail.0 } else { 0 };
+    Millis(key + body)
 }
 
 fn build_and_run(seed: u64) -> (Scenario, BeaconSim) {
@@ -54,13 +77,16 @@ fn build_and_run(seed: u64) -> (Scenario, BeaconSim) {
     let hf_params = RadioParams {
         bitrate_bps: [300, 600, 1200, 2400][g.below(4) as usize],
         txdelay: Millis(50 + g.below(200)),
+        txtail: Millis(g.below(30)),
         phy_overhead_bytes: g.below(20) as u32,
+        hdlc: g.chance(0.5),
     };
     let hf = sim.add_channel(hf_params);
     let mut sc = Scenario {
         channels: vec![RadioParams::VHF_1200, hf_params],
         ports: BTreeMap::new(),
         links: BTreeMap::new(),
+        csma: BTreeMap::new(),
         nodes: 3 + g.below(8) as usize,
     };
     for i in 0..sc.nodes {
@@ -84,6 +110,15 @@ fn build_and_run(seed: u64) -> (Scenario, BeaconSim) {
         let id = sim.add_node_on(m, &radios);
         for (p, ch) in radios {
             sc.ports.insert((id, ch), p);
+            if g.chance(0.4) {
+                let c = Csma {
+                    persist: g.below(256) as u8,
+                    slot: Millis(20 + g.below(200)),
+                    dcd_delay: Millis(g.below(200)),
+                };
+                sim.set_csma(id, p, Some(c));
+                sc.csma.insert((id, ch), c);
+            }
         }
         if g.chance(0.3) {
             sim.set_clock(
@@ -148,6 +183,8 @@ struct TxRec {
     from: NodeId,
     start: Millis,
     end: Millis,
+    /// Start of the key-up the frame went out in.
+    keyed_at: Millis,
     digest: u64,
 }
 
@@ -163,6 +200,8 @@ fn check(
         sc.links.keys().map(|k| (*k, true)).collect();
     let mut txs: BTreeMap<u64, TxRec> = BTreeMap::new();
     let mut radio_busy_until: BTreeMap<(NodeId, ChannelId), Millis> = BTreeMap::new();
+    let mut radio_keyed_at: BTreeMap<(NodeId, ChannelId), Millis> = BTreeMap::new();
+    let mut radio_last_queued: BTreeMap<(NodeId, ChannelId), Millis> = BTreeMap::new();
     let mut time = Millis::ZERO;
     let mut current_eval: Option<(u64, BTreeSet<NodeId>)> = None;
     let mut evaluated: BTreeSet<u64> = BTreeSet::new();
@@ -215,12 +254,14 @@ fn check(
                 channel,
                 from,
                 port,
+                asked_at,
                 queued_at,
                 start,
                 end,
                 keyup,
                 len,
                 digest,
+                ref data,
             } => {
                 if sc.ports.get(&(from, channel)) != Some(&port) {
                     return Err(format!(
@@ -236,11 +277,14 @@ fn check(
                     ));
                 }
                 let params = sc.channels[channel.0];
-                let (expect_start, expect_air) = if keyup {
-                    (queued_at, params.airtime(len))
-                } else {
-                    (*busy, params.airtime_keyed(len))
-                };
+                if data.len() != len {
+                    return Err(format!(
+                        "tx {id}: logged {} bytes for a {len}-byte frame",
+                        data.len()
+                    ));
+                }
+                let expect_start = if keyup { queued_at } else { *busy };
+                let expect_air = airtime(&params, data, keyup);
                 if start != expect_start || end.0 - start.0 != expect_air.0 {
                     return Err(format!(
                         "tx {id}: {start:?}..{end:?}, expected start {expect_start:?}, airtime {} ms",
@@ -248,6 +292,54 @@ fn check(
                     ));
                 }
                 *busy = end;
+                let keyed_at = *radio_keyed_at
+                    .entry((from, channel))
+                    .and_modify(|k| {
+                        if keyup {
+                            *k = start
+                        }
+                    })
+                    .or_insert(start);
+                let last_queued = radio_last_queued.insert((from, channel), queued_at);
+                match sc.csma.get(&(from, channel)) {
+                    // Rule: without channel access the radio takes a frame when asked.
+                    None if asked_at != queued_at => {
+                        return Err(format!(
+                            "tx {id}: asked at {asked_at:?}, queued at {queued_at:?} without CSMA"
+                        ));
+                    }
+                    None => {}
+                    Some(c) => {
+                        if asked_at > queued_at {
+                            return Err(format!(
+                                "tx {id}: queued at {queued_at:?} before asked at {asked_at:?}"
+                            ));
+                        }
+                        // Rule: key up only when no station this one hears has
+                        // been keyed up for the carrier-detect delay.
+                        if keyup {
+                            let heard = txs.values().find(|t| {
+                                t.channel == channel
+                                    && t.from != from
+                                    && t.start <= queued_at
+                                    && queued_at < t.end
+                                    && t.keyed_at + c.dcd_delay <= queued_at
+                                    && enabled.get(&(channel, t.from, from)) == Some(&true)
+                            });
+                            if let Some(t) = heard {
+                                return Err(format!(
+                                    "tx {id}: station {from} keyed up at {queued_at:?} over station {}'s carrier since {:?}",
+                                    t.from, t.keyed_at
+                                ));
+                            }
+                        } else if asked_at < queued_at && last_queued != Some(queued_at) {
+                            // Rule: frames that waited for the channel go out together.
+                            return Err(format!(
+                                "tx {id}: waited for the channel but left in another key-up"
+                            ));
+                        }
+                    }
+                }
                 let s = &mut got[channel.0];
                 s.frames_sent += 1;
                 s.bytes_sent += len as u64;
@@ -261,6 +353,7 @@ fn check(
                         from,
                         start,
                         end,
+                        keyed_at,
                         digest,
                     },
                 );
