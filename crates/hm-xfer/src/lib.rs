@@ -415,6 +415,11 @@ impl Xfer {
         self.keys.insert(call, key);
     }
 
+    /// Replace every trusted key, for example after the trust file changed.
+    pub fn set_trust(&mut self, keys: impl IntoIterator<Item = (Callsign, PublicKey)>) {
+        self.keys = keys.into_iter().collect();
+    }
+
     /// Completion ACKs ignored because their receipt did not verify.
     pub fn rejected_receipts(&self) -> u64 {
         self.rejected_receipts

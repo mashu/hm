@@ -270,3 +270,37 @@ async fn two_ssids_link_to_one_hub_at_once() {
         Err(NetError::NotConnected)
     ));
 }
+
+/// Trust changes take effect without a restart: a station added to the hub's
+/// trust connects on its next redial, and one removed is cut off at once.
+#[tokio::test]
+async fn trust_changes_apply_while_running() {
+    let (hub_accept, _) = recorder(Verdict::Stored);
+    let hub = Net::start(cfg("SO5KM", 2, &[], vec![]), hub_accept).unwrap();
+    let addr = hub.local_addr().unwrap();
+    let (a_accept, a_log) = recorder(Verdict::Stored);
+    let a = Net::start(
+        cfg("SA0KAM", 1, &[("SO5KM", 2)], vec![(call("SO5KM"), addr)]),
+        a_accept,
+    )
+    .unwrap();
+    // Not trusted yet: refused.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!a.is_connected(call("SO5KM")));
+
+    let a_key = Identity::from_secret(secret(1)).public();
+    hub.set_trust(&[(call("SA0KAM"), a_key)]);
+    assert!(wait_connected(&a, "SO5KM").await, "connects after being trusted");
+    hub.deliver(call("SA0KAM"), b"welcome").await.unwrap();
+    assert_eq!(a_log.lock().unwrap().len(), 1);
+
+    hub.set_trust(&[]);
+    assert!(!hub.is_connected(call("SA0KAM")), "the link is closed at once");
+    assert!(matches!(
+        hub.deliver(call("SA0KAM"), b"x").await,
+        Err(NetError::NotConnected)
+    ));
+    // It keeps redialling, and keeps being refused.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!hub.is_connected(call("SA0KAM")) && !a.is_connected(call("SO5KM")));
+}

@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use hm_ident::{Identity, PublicKey};
@@ -133,10 +133,33 @@ pub fn station_certificate(
     ))
 }
 
-/// Accepts exactly the station keys in the trust file.
+/// Trusted stations: callsign -> key, and key -> callsign to name peers.
+#[derive(Debug, Default)]
+struct TrustTable {
+    keys: BTreeMap<Callsign, PublicKey>,
+    names: BTreeMap<[u8; 32], Callsign>,
+}
+
+impl TrustTable {
+    fn new(list: &[(Callsign, PublicKey)]) -> TrustTable {
+        let keys: BTreeMap<Callsign, PublicKey> = list.iter().copied().collect();
+        let names = keys.iter().map(|(c, k)| (k.0, *c)).collect();
+        TrustTable { keys, names }
+    }
+
+    /// A station's key: its own, else its base callsign's.
+    fn key_for(&self, call: Callsign) -> Option<PublicKey> {
+        self.keys
+            .get(&call)
+            .or_else(|| self.keys.get(&call.base()))
+            .copied()
+    }
+}
+
+/// Accepts exactly the station keys in the trust file, as it is right now.
 #[derive(Debug)]
 struct TrustVerifier {
-    keys: BTreeMap<[u8; 32], Callsign>,
+    trust: Arc<RwLock<TrustTable>>,
     provider: Arc<CryptoProvider>,
 }
 
@@ -144,7 +167,7 @@ impl TrustVerifier {
     fn check(&self, cert: &CertificateDer<'_>) -> Result<(), rustls::Error> {
         let key = ed25519_key_in_cert(cert)
             .ok_or_else(|| rustls::Error::General("not an Ed25519 station key".into()))?;
-        if self.keys.contains_key(&key) {
+        if self.trust.read().expect("lock").names.contains_key(&key) {
             Ok(())
         } else {
             Err(rustls::Error::General("station key not in the trust file".into()))
@@ -250,10 +273,8 @@ pub struct Net {
     endpoint: Endpoint,
     me: Callsign,
     identity: Identity,
-    /// Trusted keys by base callsign.
-    keys: BTreeMap<Callsign, PublicKey>,
-    /// Key -> callsign as the trust file lists it, to name authenticated peers.
-    names: BTreeMap<[u8; 32], Callsign>,
+    /// Trusted stations, shared with the TLS verifier; see [`Net::set_trust`].
+    trust: Arc<RwLock<TrustTable>>,
     conns: Mutex<BTreeMap<Callsign, Connection>>,
     accept: Accept,
 }
@@ -263,10 +284,9 @@ impl Net {
     /// Must be called inside a Tokio runtime.
     pub fn start(cfg: NetConfig, accept: Accept) -> io::Result<Arc<Net>> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let keys: BTreeMap<Callsign, PublicKey> = cfg.trust.iter().copied().collect();
-        let names: BTreeMap<[u8; 32], Callsign> = keys.iter().map(|(c, k)| (k.0, *c)).collect();
+        let trust = Arc::new(RwLock::new(TrustTable::new(&cfg.trust)));
         let verifier = Arc::new(TrustVerifier {
-            keys: names.clone(),
+            trust: trust.clone(),
             provider: provider.clone(),
         });
         let (cert, key) = station_certificate(cfg.secret)?;
@@ -303,8 +323,7 @@ impl Net {
             endpoint,
             me: cfg.me.base(),
             identity: Identity::from_secret(cfg.secret),
-            keys,
-            names,
+            trust,
             conns: Mutex::new(BTreeMap::new()),
             accept,
         });
@@ -345,10 +364,11 @@ impl Net {
     /// Send `object` to `to` and wait for its verified receipt.
     pub async fn deliver(&self, to: Callsign, object: &[u8]) -> Result<(), NetError> {
         let conn = self.conn_for(to).ok_or(NetError::NotConnected)?;
-        let key = *self
-            .keys
-            .get(&to)
-            .or_else(|| self.keys.get(&to.base()))
+        let key = self
+            .trust
+            .read()
+            .expect("lock")
+            .key_for(to)
             .ok_or(NetError::NotConnected)?;
         let exchange = async {
             let (mut send, mut recv) = conn.open_bi().await.map_err(|e| NetError::Io(e.to_string()))?;
@@ -393,7 +413,22 @@ impl Net {
             .downcast::<Vec<CertificateDer<'static>>>()
             .ok()?;
         let key = ed25519_key_in_cert(certs.first()?)?;
-        self.names.get(&key).copied()
+        self.trust.read().expect("lock").names.get(&key).copied()
+    }
+
+    /// Replace the trusted stations. New connections are checked against the
+    /// new list at once; a link whose key is no longer trusted, or now belongs
+    /// to another callsign, is closed (and redialled if configured).
+    pub fn set_trust(&self, trust: &[(Callsign, PublicKey)]) {
+        *self.trust.write().expect("lock") = TrustTable::new(trust);
+        let mut conns = self.conns.lock().expect("lock");
+        conns.retain(|name, conn| {
+            let still = self.peer_of(conn) == Some(*name);
+            if !still {
+                conn.close(1u32.into(), b"no longer trusted");
+            }
+            still
+        });
     }
 
     fn register(self: &Arc<Self>, conn: Connection) {

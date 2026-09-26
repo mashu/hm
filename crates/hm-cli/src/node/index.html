@@ -83,6 +83,15 @@
   ul.heard .detail.ok { color: var(--ok); } ul.heard .detail.warn { color: var(--warn); }
   ul.heard .detail.bad { color: var(--bad); font-weight: 700; }
   ol.log li.empty { display: block; }
+  #trust-section { margin-top: 2rem; }
+  ul.trust { list-style: none; margin: 0 0 0.75rem; padding: 0; border-top: 1px solid var(--rule); }
+  ul.trust li { display: flex; gap: 0.5rem; align-items: baseline; padding: 0.45rem 0; border-bottom: 1px solid var(--rule); }
+  ul.trust .key { flex: 1; min-width: 0; color: var(--muted); font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  ul.trust button { margin: 0; padding: 0.1rem 0.5rem; font-size: 0.85rem; background: none; color: var(--ink); border-width: 1px; }
+  #trust-form { background: none; border: 0; padding: 0; }
+  #trust-form button { margin-top: 0.5rem; }
+  #trust-note { font-size: 0.9rem; color: var(--muted); margin: 0.5rem 0 0; min-height: 1.4em; }
+  #trust-note.ok { color: var(--ok); } #trust-note.bad { color: var(--bad); }
 </style>
 </head>
 <body>
@@ -118,6 +127,16 @@
     <div id="heard-section" aria-labelledby="heard-title">
       <h2 id="heard-title">Heard on the radio</h2>
       <ul class="heard" id="heard"></ul>
+    </div>
+    <div id="trust-section" aria-labelledby="trust-title">
+      <h2 id="trust-title">Trusted stations</h2>
+      <ul class="trust" id="trust"></ul>
+      <form id="trust-form" autocomplete="off">
+        <label for="trust-line">Add a station <span class="hint">(the line <code>hm whoami</code> prints on their side)</span></label>
+        <input id="trust-line" required spellcheck="false" placeholder="SO5KM-1 8a1e…">
+        <button type="submit">Trust this station</button>
+        <p id="trust-note" role="status"></p>
+      </form>
     </div>
   </section>
   <section aria-labelledby="log-title">
@@ -242,6 +261,53 @@ function renderHeard(list) {
   }
 }
 
+let trustFile = null;
+
+async function loadTrust() {
+  try {
+    const r = await api("/api/trust");
+    if (!r.ok) return;
+    const t = await r.json();
+    trustFile = t.file;
+    const ul = document.getElementById("trust");
+    ul.replaceChildren();
+    if (t.stations.length === 0) ul.append(el("li", "empty", "Nobody yet. Messages from untrusted stations arrive marked unverified."));
+    for (const s of t.stations) {
+      const li = el("li");
+      const b = el("button", null, "Remove");
+      b.setAttribute("aria-label", "Stop trusting " + s.station);
+      b.addEventListener("click", async () => {
+        if (!confirm("Stop trusting " + s.station + "?")) return;
+        const r = await api("/api/trust/" + encodeURIComponent(s.station), { method: "DELETE" });
+        note(r.ok ? s.station + " is no longer trusted." : "Not removed: " + ((await r.json()).error || r.statusText), r.ok ? "" : "bad");
+        loadTrust();
+      });
+      li.append(el("span", "who", s.station), el("span", "key", s.key), b);
+      ul.append(li);
+    }
+  } catch (e) { /* the status line already says the node is unreachable */ }
+}
+
+function note(text, cls) {
+  const n = document.getElementById("trust-note");
+  n.className = cls || "";
+  n.textContent = text + (trustFile ? "" : " Not saved: this node has no trust file (--trust), so it lasts until restart.");
+}
+
+document.getElementById("trust-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const input = document.getElementById("trust-line");
+  const r = await api("/api/trust", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ line: input.value.trim() }) });
+  if (r.ok) {
+    const s = await r.json();
+    note(s.station + " is trusted now" + (trustFile ? " and saved to " + trustFile + "." : "."), "ok");
+    input.value = "";
+  } else {
+    note("Not added: " + ((await r.json()).error || r.statusText), "bad");
+  }
+  loadTrust();
+});
+
 async function loadStatus() {
   try {
     const s = await (await api("/api/status")).json();
@@ -264,6 +330,7 @@ document.getElementById("token-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
   localStorage.setItem("hm-token", document.getElementById("token").value.trim());
   loadStatus();
+  loadTrust();
   refresh();
 });
 
@@ -302,6 +369,8 @@ loadStatus();
 refresh();
 setInterval(refresh, 3000);
 setInterval(loadStatus, 10000);
+loadTrust();
+setInterval(loadTrust, 10000);
 </script>
 </body>
 </html>

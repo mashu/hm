@@ -19,6 +19,7 @@
 mod api;
 pub mod choose;
 pub mod heard;
+pub mod trust;
 
 use std::collections::BTreeMap;
 use std::io;
@@ -43,6 +44,7 @@ use crate::kiss_link::{KissLink, KissTarget, TncParams};
 use crate::sound_link::{AudioFactory, Csma, PttFactory, SoundLink};
 use crate::station::{open_message, unix_now, LinkTiming, Station, Verification};
 use choose::{Bearer, Chooser, Costs};
+use trust::SharedTrust;
 
 /// How the node reaches its radio.
 pub enum RadioLink {
@@ -87,6 +89,9 @@ pub struct InternetConfig {
 pub struct NodeConfig {
     pub key: KeyFile,
     pub trust: Trust,
+    /// Where `trust` came from: watched for edits, and where changes made
+    /// through the API are saved. Without one, API changes last until restart.
+    pub trust_file: Option<PathBuf>,
     /// Callsign on air (the key's base call, possibly with an SSID).
     pub me: Callsign,
     pub radio: Option<RadioConfig>,
@@ -237,13 +242,14 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
     let (radio_evt_tx, radio_evt_rx) = tokio::sync::mpsc::unbounded_channel();
     let (radio_cmd_tx, radio_cmd_rx) = mpsc::channel();
     let status = Arc::new(Mutex::new(Status::default()));
+    let trust = Arc::new(SharedTrust::new(cfg.trust.clone(), cfg.trust_file.clone()));
     let cfg = Arc::new(cfg);
 
     let radio = match &cfg.radio {
         Some(_) => {
-            let (cfg, stop) = (cfg.clone(), stop.clone());
+            let (cfg, trust, stop) = (cfg.clone(), trust.clone(), stop.clone());
             Some(thread::Builder::new().name("radio".into()).spawn(move || {
-                radio_thread(&cfg, radio_cmd_rx, radio_evt_tx, &stop);
+                radio_thread(&cfg, &trust, radio_cmd_rx, radio_evt_tx, &stop);
             })?)
         }
         None => None,
@@ -252,7 +258,7 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
     // The internet endpoint is bound here so its address is known on return.
     let (addr_tx, addr_rx) = mpsc::channel::<io::Result<Option<SocketAddr>>>();
     let main = {
-        let (cfg, store, status) = (cfg.clone(), store.clone(), status.clone());
+        let (cfg, store, status, trust) = (cfg.clone(), store.clone(), status.clone(), trust.clone());
         thread::Builder::new().name("node".into()).spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -263,14 +269,15 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                 let net = match &cfg.internet {
                     None => None,
                     Some(ic) => {
-                        let (store, trust, me, key_call) =
-                            (store.clone(), cfg.trust.clone(), cfg.me, cfg.key.call);
-                        let gate: hm_net::Accept =
-                            Arc::new(move |via, obj| accept(&store, &trust, me, key_call, via, &obj));
+                        let (store, gate_trust, me, key_call) =
+                            (store.clone(), trust.clone(), cfg.me, cfg.key.call);
+                        let gate: hm_net::Accept = Arc::new(move |via, obj| {
+                            accept(&store, &gate_trust.get(), me, key_call, via, &obj)
+                        });
                         let nc = NetConfig {
                             me: cfg.me,
                             secret: cfg.key.identity.secret(),
-                            trust: cfg.trust.iter().collect(),
+                            trust: trust.get().iter().collect(),
                             listen: ic.listen,
                             dial: ic.peers.clone(),
                         };
@@ -291,6 +298,7 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                     store: store.clone(),
                     cfg: cfg.clone(),
                     status: status.clone(),
+                    trust: trust.clone(),
                 });
                 let http_listener = tokio::net::TcpListener::from_std(listener).expect("listener");
                 let mut http_shutdown = shutdown_rx.clone();
@@ -308,6 +316,7 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                     radio_cmd_tx,
                     radio_evt_rx,
                     &status,
+                    &trust,
                     shutdown_rx,
                 )
                 .await;
@@ -343,6 +352,7 @@ struct InFlight {
 
 type NetResult = (ObjectId, Callsign, Result<(), NetError>);
 
+#[allow(clippy::too_many_arguments)]
 async fn coordinator(
     cfg: &NodeConfig,
     store: &Store,
@@ -350,8 +360,10 @@ async fn coordinator(
     radio_cmd: mpsc::Sender<RadioCmd>,
     mut radio_evt: tokio::sync::mpsc::UnboundedReceiver<RadioEvt>,
     status: &Mutex<Status>,
+    trust: &SharedTrust,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    let mut trust_version = trust.version();
     let seed = cfg
         .seed
         .unwrap_or_else(|| getrandom::u64().unwrap_or_else(|_| unix_now()));
@@ -422,7 +434,7 @@ async fn coordinator(
                     }
                 }
                 RadioEvt::Received { from, object } => {
-                    accept(store, &cfg.trust, cfg.me, cfg.key.call, from, &object);
+                    accept(store, &trust.get(), cfg.me, cfg.key.call, from, &object);
                 }
                 RadioEvt::Heard(list) => {
                     status.lock().expect("lock").heard = list;
@@ -453,6 +465,17 @@ async fn coordinator(
                 finish(id, peer, Bearer::Internet, outcome, &mut chooser);
             }
             _ = tick.tick() => {
+                match trust.reload_if_changed() {
+                    Some(Ok(n)) => log(format!("trust file changed: {n} stations trusted")),
+                    Some(Err(e)) => log(format!("trust file not reloaded, keeping the stations trusted so far: {e}")),
+                    None => {}
+                }
+                if trust.version() != trust_version {
+                    trust_version = trust.version();
+                    if let Some(n) = &net {
+                        n.set_trust(&trust.get().iter().collect::<Vec<_>>());
+                    }
+                }
                 let now = unix_now();
                 let due = match store.due(now) {
                     Ok(d) => d,
@@ -517,6 +540,7 @@ const MAX_WAIT: Duration = Duration::from_millis(200);
 /// Keep a KISS link up and run the transfer engine on it.
 fn radio_thread(
     cfg: &NodeConfig,
+    trust: &SharedTrust,
     cmds: mpsc::Receiver<RadioCmd>,
     events: tokio::sync::mpsc::UnboundedSender<RadioEvt>,
     stop: &AtomicBool,
@@ -525,7 +549,7 @@ fn radio_thread(
     while !stop.load(Ordering::Relaxed) {
         let session = |link: &mut dyn Link| {
             let _ = events.send(RadioEvt::Up);
-            radio_session(cfg, rc, link, &cmds, &events, stop)
+            radio_session(cfg, rc, trust, link, &cmds, &events, stop)
         };
         let result = match &rc.link {
             RadioLink::Kiss {
@@ -558,14 +582,16 @@ fn radio_thread(
 fn radio_session(
     cfg: &NodeConfig,
     rc: &RadioConfig,
+    trust: &SharedTrust,
     link: &mut dyn Link,
     cmds: &mpsc::Receiver<RadioCmd>,
     events: &tokio::sync::mpsc::UnboundedSender<RadioEvt>,
     stop: &AtomicBool,
 ) -> io::Result<()> {
+    let mut trust_version = trust.version();
     let station = Station {
         key: &cfg.key,
-        trust: &cfg.trust,
+        trust: &trust.get(),
         me: cfg.me,
         timing: rc.timing,
     };
@@ -585,6 +611,10 @@ fn radio_session(
     let mut heard_changed = false;
     let mut last_report = Instant::now();
     loop {
+        if trust.version() != trust_version {
+            trust_version = trust.version();
+            x.set_trust(trust.get().iter());
+        }
         if let (Some(at), Some(every)) = (next_beacon, rc.beacon_every) {
             if Instant::now() >= at {
                 let t = unix_now();
@@ -648,7 +678,7 @@ fn radio_session(
                     None => wait,
                 };
                 if let Some(frame) = link.recv_timeout(wait)? {
-                    heard_changed |= hear(&mut heard, &cfg.trust, cfg.me, &frame);
+                    heard_changed |= hear(&mut heard, &trust.get(), cfg.me, &frame);
                     x.handle(now(), Input::Frame { port, data: frame }, &mut out);
                 }
             }
