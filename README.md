@@ -141,6 +141,16 @@ stations on Direwolf work together. It waits for a clear channel (p-persistent C
 carrier detect: `persist`, `slottime_ms`), sends each transfer burst in one key-up, and
 releases PTT on every exit path.
 
+With `framing = "il2p"` under `[radio]`, it sends the same frames in IL2P, the framing of
+NinoTNC and Direwolf 1.7: Reed–Solomon parity repairs up to 8 bad bytes in each block, so
+frames get through far more noise. On a simulated channel, 40 frames of ~60 bytes at a
+full-band SNR of −4 dB: 19 arrived as AX.25, all 40 as IL2P; at −6 dB, none against 25.
+`framing = "auto"` sends IL2P to stations that said they decode it (every hm station on the
+built-in modem does, and says so in its OPEN) and AX.25 to everyone else, beacons included.
+The modem always decodes both. Tested against Direwolf both ways: Direwolf decodes all of
+our IL2P frames, and we decode more of `gen_packets -I 1` than Direwolf itself (97 against
+94 of 100 in rising noise).
+
 ### Radio, internet, or both
 
 A node can reach other stations by radio, over the internet, or both:

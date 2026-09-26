@@ -93,6 +93,9 @@ pub struct RadioSettings {
     pub txdelay_ms: u64,
     /// Slack around the predicted end of another station's transmission.
     pub guard_ms: u64,
+    /// Built-in modem: "ax25", "il2p" (Reed–Solomon FEC; NinoTNC and Direwolf
+    /// 1.7 decode it) or "auto" (IL2P to stations that say they decode it).
+    pub framing: String,
     /// A signed beacon this often, in minutes; 0 for none.
     pub beacon_minutes: u64,
 }
@@ -110,6 +113,7 @@ impl Default for RadioSettings {
             bitrate: 1200,
             txdelay_ms: 300,
             guard_ms: 1500,
+            framing: "ax25".into(),
             beacon_minutes: 10,
         }
     }
@@ -152,6 +156,7 @@ impl RadioSettings {
         if self.tnc_port > 15 {
             return Err("radio.tnc_port is 0 to 15".into());
         }
+        crate::sound_link::Framing::parse(&self.framing).map_err(|e| format!("radio.{e}"))?;
         if self.ptt.trim().is_empty() {
             return Err("radio.ptt is empty (use \"vox\" for none)".into());
         }
@@ -482,6 +487,9 @@ pub fn set_radio(path: &Path, old: &RadioSettings, new: &RadioSettings) -> io::R
     if old.ptt != new.ptt {
         put("ptt", new.ptt.as_str().into());
     }
+    if old.framing != new.framing {
+        put("framing", new.framing.as_str().into());
+    }
     if old.persist != new.persist {
         put("persist", i64::from(new.persist).into());
     }
@@ -538,6 +546,7 @@ key = {key:?}
 # kiss = "127.0.0.1:8001"   Direwolf, or "serial:/dev/ttyUSB0:9600" for a hardware TNC
 # audio = "default"         the built-in modem on a sound card instead
 # ptt = "vox"               or "rts:/dev/ttyUSB0", "cm108:/dev/hidraw0"
+# framing = "ax25"          built-in modem: or "il2p" (far more robust in noise), "auto"
 [radio]
 beacon_minutes = 10         # 0 turns the beacon off
 

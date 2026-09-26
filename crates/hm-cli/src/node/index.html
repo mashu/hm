@@ -296,6 +296,12 @@
           <input id="r-audio" spellcheck="false" placeholder="default">
           <label for="r-ptt">PTT <span class="hint">(built-in modem: vox, rigctld, rts:/dev/ttyUSB0, cm108:/dev/hidraw0)</span></label>
           <input id="r-ptt" spellcheck="false">
+          <label for="r-framing">Framing <span class="hint">(built-in modem; IL2P carries frames through far more noise)</span></label>
+          <select id="r-framing">
+            <option value="ax25">AX.25: every packet station decodes it</option>
+            <option value="auto">Auto: IL2P to stations that decode it</option>
+            <option value="il2p">IL2P always (NinoTNC, Direwolf 1.7, hm)</option>
+          </select>
           <div class="pair">
             <div><label for="r-txdelay_ms">Key-up delay <span class="hint">(ms)</span></label><input id="r-txdelay_ms" type="number" min="0" step="10"></div>
             <div><label for="r-tnc_port">TNC port</label><input id="r-tnc_port" type="number" min="0" max="15" step="1"></div>
@@ -697,7 +703,7 @@ $("trust-form").addEventListener("submit", async (ev) => {
 });
 
 // ---- Settings ----------------------------------------------------------
-const radioText = ["kiss", "audio", "ptt"];
+const radioText = ["kiss", "audio", "ptt", "framing"];
 const radioNumbers = ["txdelay_ms", "tnc_port", "persist", "slottime_ms", "bitrate", "guard_ms"];
 const liveFields = ["beacon_minutes", "radio_cost", "internet_cost", "retry_first_secs", "retry_max_secs", "retry_attempts"];
 let settingsFile = null;

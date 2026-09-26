@@ -9,8 +9,12 @@
 //! demodulator's carrier detect (while the channel is busy, wait a slot; when
 //! clear, transmit with probability (p + 1) / 256, else wait a slot).
 //! PTT is released on every exit path and no transmission exceeds `max_tx`.
+//!
+//! Frames go out as AX.25 in HDLC, which every packet station decodes, or in
+//! IL2P, whose Reed–Solomon parity carries them through far more noise
+//! ([`Framing`]). Both are always decoded.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -23,14 +27,38 @@ use hm_core::DetRng;
 use hm_modem_afsk::{Demodulator, DemodulatorConfig, Modulator};
 use hm_rig::ptt::Ptt;
 use hm_rig::AudioPort;
-use hm_wire::Callsign;
+use hm_wire::{Callsign, Dest, FrameHeader, FEATURE_IL2P};
 
 use crate::driver::Link;
 
 pub type AudioFactory = Arc<dyn Fn() -> io::Result<Box<dyn AudioPort>> + Send + Sync>;
 pub type PttFactory = Arc<dyn Fn() -> io::Result<Box<dyn Ptt>> + Send + Sync>;
 
-/// Channel access and keying.
+/// How frames go on air.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum Framing {
+    /// AX.25 in HDLC, as every packet station decodes.
+    #[default]
+    Ax25,
+    /// IL2P with maximum FEC: NinoTNC, Direwolf 1.7 and hm decode it.
+    Il2p,
+    /// IL2P to stations whose OPEN says they decode it, AX.25 to the rest
+    /// (and for beacons, which everyone should hear).
+    Auto,
+}
+
+impl Framing {
+    pub fn parse(s: &str) -> Result<Framing, String> {
+        match s {
+            "ax25" => Ok(Framing::Ax25),
+            "il2p" => Ok(Framing::Il2p),
+            "auto" => Ok(Framing::Auto),
+            other => Err(format!("framing {other:?}: use ax25, il2p or auto")),
+        }
+    }
+}
+
+/// Channel access, keying and framing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Csma {
     /// Transmit probability per clear slot is (persist + 1) / 256; 63 is the usual 25%.
@@ -39,6 +67,7 @@ pub struct Csma {
     pub txdelay_ms: u32,
     /// Longest single transmission; longer bursts are split.
     pub max_tx: Duration,
+    pub framing: Framing,
 }
 
 impl Default for Csma {
@@ -48,6 +77,7 @@ impl Default for Csma {
             slot: Duration::from_millis(100),
             txdelay_ms: 300,
             max_tx: Duration::from_secs(30),
+            framing: Framing::Ax25,
         }
     }
 }
@@ -55,9 +85,15 @@ impl Default for Csma {
 const GATHER: Duration = Duration::from_millis(20);
 const CAPTURE_WAIT: Duration = Duration::from_millis(20);
 
+/// A frame to send, and whether it goes in IL2P.
+type Outgoing = (Vec<u8>, bool);
+
 pub struct SoundLink {
     me: Callsign,
-    to_air: Option<Sender<Vec<u8>>>,
+    framing: Framing,
+    /// Stations that told us they decode IL2P.
+    il2p_peers: BTreeSet<Callsign>,
+    to_air: Option<Sender<Outgoing>>,
     from_air: Receiver<Vec<u8>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -84,7 +120,7 @@ impl SoundLink {
         })?;
         let mut ptt = ptt()?;
         ptt.set(false)?;
-        let (to_air, air_in) = mpsc::channel::<Vec<u8>>();
+        let (to_air, air_in) = mpsc::channel::<Outgoing>();
         let (air_out, from_air) = mpsc::channel::<Vec<u8>>();
         let (opened_tx, opened_rx) = mpsc::channel::<io::Result<()>>();
         let stop = Arc::new(AtomicBool::new(false));
@@ -110,6 +146,8 @@ impl SoundLink {
             .map_err(|_| io::Error::other("modem thread ended"))??;
         Ok(SoundLink {
             me,
+            framing: csma.framing,
+            il2p_peers: BTreeSet::new(),
             to_air: Some(to_air),
             from_air,
             stop,
@@ -143,8 +181,29 @@ impl Link for SoundLink {
     fn send(&mut self, frame: &[u8]) -> io::Result<()> {
         let ui = ax25::wrap(self.me, frame)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:?}")))?;
+        let il2p = match self.framing {
+            Framing::Ax25 => false,
+            Framing::Il2p => true,
+            Framing::Auto => match FrameHeader::decode(frame) {
+                Ok((h, _)) => matches!(h.dst, Dest::Station(c) if self.il2p_peers.contains(&c)),
+                Err(_) => false,
+            },
+        };
         let tx = self.to_air.as_ref().expect("open until dropped");
-        tx.send(ui).map_err(|_| self.failed())
+        tx.send((ui, il2p)).map_err(|_| self.failed())
+    }
+
+    fn peer_features(&mut self, peer: Callsign, features: u32) {
+        if features & FEATURE_IL2P != 0 {
+            self.il2p_peers.insert(peer);
+        } else {
+            self.il2p_peers.remove(&peer);
+        }
+    }
+
+    /// The modem decodes IL2P whatever it sends.
+    fn features(&self) -> u32 {
+        FEATURE_IL2P
     }
 
     fn recv_timeout(&mut self, wait: Duration) -> io::Result<Option<Vec<u8>>> {
@@ -165,7 +224,7 @@ fn run(
     mut port: Box<dyn AudioPort>,
     ptt: &mut dyn Ptt,
     csma: Csma,
-    air_in: Receiver<Vec<u8>>,
+    air_in: Receiver<Outgoing>,
     air_out: Sender<Vec<u8>>,
     stop: &AtomicBool,
 ) -> io::Result<()> {
@@ -173,7 +232,7 @@ fn run(
     let mut demod = Demodulator::new(DemodulatorConfig::new(fs));
     let modulator = Modulator::new(fs);
     let mut rng = DetRng::from_seed(getrandom::u64().unwrap_or(0x5eed));
-    let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut pending: VecDeque<Outgoing> = VecDeque::new();
     let mut last_enqueue = Instant::now();
     let mut next_try = Instant::now();
     let (mut audio, mut frames) = (Vec::new(), Vec::new());
@@ -209,18 +268,24 @@ fn run(
             next_try = now + csma.slot;
             continue;
         }
+        // One key-up carries frames of one framing, up to `max_tx`.
         let mut batch = Vec::new();
+        let il2p = pending.front().is_some_and(|(_, il2p)| *il2p);
         let mut secs = csma.txdelay_ms as f64 / 1000.0;
-        while let Some(f) = pending.front() {
+        while let Some((f, i)) = pending.front() {
             let t = frame_secs(f.len());
-            if !batch.is_empty() && secs + t > csma.max_tx.as_secs_f64() {
+            if *i != il2p || (!batch.is_empty() && secs + t > csma.max_tx.as_secs_f64()) {
                 break;
             }
             secs += t;
-            batch.push(pending.pop_front().expect("front exists"));
+            batch.push(pending.pop_front().expect("front exists").0);
         }
         let refs: Vec<&[u8]> = batch.iter().map(|f| f.as_slice()).collect();
-        let samples = modulator.modulate(&refs, csma.txdelay_ms);
+        let samples = if il2p {
+            modulator.modulate_il2p(&refs, csma.txdelay_ms, true)
+        } else {
+            modulator.modulate(&refs, csma.txdelay_ms)
+        };
         ptt.set(true)?;
         let keyed = Keyed(ptt);
         port.play(&samples)?;
