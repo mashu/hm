@@ -314,7 +314,7 @@ async fn messages(
                 out.push(v);
             }
         }
-        out.sort_by(|a, b| (b.at, b.seq).cmp(&(a.at, a.seq)));
+        out.sort_by_key(|m| std::cmp::Reverse((m.at, m.seq)));
         out.truncate(limit);
         Ok(out)
     })
