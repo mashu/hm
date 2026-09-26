@@ -21,10 +21,10 @@ clear, identities signed.
 | `hm-net` | Internet links: QUIC with mutual TLS 1.3 on Ed25519 station keys (only trusted stations connect), automatic redial, one stream per bundle with a signed receipt |
 | `hm-modem-afsk` | Our own AFSK 1200 modem (Bell 202), pure Rust and `no_std`: HDLC framing and CRC, multi-slicer demodulator with per-tone AGC and PLL clock recovery, carrier detect |
 | `hm-rig` | Radio hardware: sound cards through `cpal` (ALSA, CoreAudio, WASAPI); PTT by rigctld (Hamlib CAT), serial RTS/DTR, CM108 GPIO (AIOC, Digirig) or VOX; a virtual radio channel for tests |
-| `hm-cli` | The `hm` command: `node` (the station daemon: radio and/or internet links, web interface, JSON API with access token), `keygen`, `whoami`, `send`, `listen`; a KISS-over-TCP link and a real-time driver |
+| `hm-cli` | The `hm` command: `node` (the station daemon: radio and/or internet links, web interface, JSON API with access token), `keygen`, `whoami`, `send`, `listen`; KISS links over TCP or a serial port, and a real-time driver |
 
 Phase 1 still to do: an on-air test, IL2P framing and better decoding deep in noise for
-the built-in modem, stream modems (Mercury, ARDOP, VARA) as radio bearers, KISS over serial,
+the built-in modem, stream modems (Mercury, ARDOP, VARA) as radio bearers,
 CTRL session open/close, and the Dioxus interface with a setup wizard. Relaying mail through
 other nodes is Phase 2.
 
@@ -128,6 +128,21 @@ transmission carries your station identification, and Direwolf's own CSMA (`PERS
 plus SSID 0–15. If transfers time out on a slow or busy channel, raise `--guard`; if your
 TNC's key-up delay differs from 300 ms, set `--txdelay` to match.
 
+## A hardware TNC on a serial port
+
+`--kiss` also takes a serial port, for TNCs such as a NinoTNC, Mobilinkd, TNC-Pi or a
+TNC-2 in KISS mode:
+
+```sh
+hm node --trust trusted.txt --kiss serial:/dev/ttyUSB0:57600
+hm send --kiss /dev/ttyACM0 --to SO5KM-1 --text "via a hardware TNC"   # 9600 Bd
+hm listen --kiss COM3 --trust trusted.txt                              # Windows
+```
+
+A hardware TNC keys the radio and waits for a clear channel itself, so on opening the port
+`hm` sends it the key-up delay, persistence and slot time (`--txdelay`, `--persist`,
+`--slottime`) as KISS parameters. The TNC must already be in KISS mode.
+
 ## Measured (simulator, 1200 bd, 300 ms TXDELAY)
 
 The simulated channel sends frames as the built-in modem does: AX.25 UI header,
@@ -174,6 +189,7 @@ cargo install --path crates/hm-cli   # installs the `hm` command
 | Coverage-guided fuzzing | `cd fuzz && cargo +nightly fuzz run <target>`; targets: frame, ack, envelope, bundle, binding, callsign, kiss, ax25, xfer | compile only | 10 min per target |
 | Cross-platform determinism | pinned trace hash of a reference simulation | Linux, Windows, macOS | |
 | End to end over TCP | fake KISS TNC relaying frames (with drops and APRS noise) between `hm listen` and `hm send` processes | yes | |
+| KISS over serial | pseudo-terminals as serial TNCs: channel-access parameters on opening, frames both ways, the port released on close, `hm send` and `hm listen` delivering through two serial TNCs | Linux, macOS | |
 | Built-in modem link | stations on a virtual radio channel in real time: carrier sense defers to a busy channel, PTT only around transmissions, one key-up per burst, two nodes exchanging mail | yes | |
 | Internet links | QUIC stations on localhost: delivery with verified receipts, rejection, impostors and wrong server keys refused, redial after restart | yes | |
 | Station nodes | `hm node` instances driven only through the HTTP API: radio delivery, restart, store-and-forward, internet-only nodes, radio failing over to the internet | yes | |

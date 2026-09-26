@@ -36,15 +36,20 @@ use hm_xfer::{Command, Event, Failure, Receipt};
 
 use crate::driver::Link;
 use crate::files::{KeyFile, Trust};
-use crate::kiss_tcp::KissLink;
+use crate::kiss_link::{KissLink, KissTarget, TncParams};
 use crate::sound_link::{AudioFactory, Csma, PttFactory, SoundLink};
 use crate::station::{open_message, unix_now, LinkTiming, Station, Verification};
 use choose::{Bearer, Chooser, Costs};
 
 /// How the node reaches its radio.
 pub enum RadioLink {
-    /// An external KISS TNC over TCP (Direwolf, or a hardware TNC behind a bridge).
-    Kiss { addr: String, tnc_port: u8 },
+    /// An external KISS TNC: Direwolf over TCP, or a hardware TNC on a serial
+    /// port (which is given `params` for its channel access).
+    Kiss {
+        target: KissTarget,
+        tnc_port: u8,
+        params: TncParams,
+    },
     /// The built-in modem on a sound card, with its own PTT and channel access.
     Modem {
         audio: AudioFactory,
@@ -62,7 +67,7 @@ pub struct RadioConfig {
 impl RadioConfig {
     pub fn describe(&self) -> String {
         match &self.link {
-            RadioLink::Kiss { addr, tnc_port } => format!("KISS TNC {addr} port {tnc_port}"),
+            RadioLink::Kiss { target, tnc_port, .. } => format!("{} port {tnc_port}", target.describe()),
             RadioLink::Modem { describe, .. } => format!("built-in modem, {describe}"),
         }
     }
@@ -490,9 +495,11 @@ fn radio_thread(
             radio_session(cfg, rc, link, &cmds, &events, stop)
         };
         let result = match &rc.link {
-            RadioLink::Kiss { addr, tnc_port } => {
-                KissLink::connect(addr, cfg.me, *tnc_port).map(|mut l| session(&mut l))
-            }
+            RadioLink::Kiss {
+                target,
+                tnc_port,
+                params,
+            } => KissLink::open(target, cfg.me, *tnc_port, *params).map(|mut l| session(&mut l)),
             RadioLink::Modem { audio, ptt, csma, .. } => {
                 SoundLink::start(cfg.me, audio.clone(), ptt.clone(), *csma).map(|mut l| session(&mut l))
             }

@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hm_cli::files::{KeyFile, Trust};
+use hm_cli::kiss_link::{KissTarget, TncParams};
 use hm_cli::node::choose::Costs;
 use hm_cli::node::{self, InternetConfig, NodeConfig, NodeHandle, RadioConfig, RadioLink};
 use hm_cli::station::LinkTiming;
@@ -127,8 +128,9 @@ fn start(s: Setup) -> NodeHandle {
         me: call(s.me),
         radio: s.tnc.map(|t| RadioConfig {
             link: RadioLink::Kiss {
-                addr: t.to_string(),
+                target: KissTarget::Tcp(t.to_string()),
                 tnc_port: 0,
+                params: TncParams::default(),
             },
             timing: FAST,
         }),
