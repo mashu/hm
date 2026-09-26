@@ -15,6 +15,7 @@ hm-bundle = { path = "../crates/hm-bundle" }
 hm-bearer = { path = "../crates/hm-bearer" }
 hm-core = { path = "../crates/hm-core" }
 hm-xfer = { path = "../crates/hm-xfer" }
+hm-modem-afsk = { path = "../crates/hm-modem-afsk" }
 
 # Kept out of the main workspace: cargo-fuzz needs nightly and sanitizer flags.
 [workspace]
@@ -93,6 +94,13 @@ bench = false
 [[bin]]
 name = "ctrl"
 path = "fuzz_targets/ctrl.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "il2p"
+path = "fuzz_targets/il2p.rs"
 test = false
 doc = false
 bench = false

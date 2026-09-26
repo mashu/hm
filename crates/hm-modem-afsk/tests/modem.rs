@@ -226,7 +226,8 @@ fn atest_count_with(path: &std::path::Path, args: &[&str]) -> usize {
 fn ax25_ui(n: usize) -> Vec<u8> {
     let addr = |call: &str, ssid: u8, last: bool| {
         let mut a: Vec<u8> = format!("{call:<6}").bytes().map(|c| c << 1).collect();
-        a.push(0x60 | (ssid << 1) | last as u8);
+        // A command, as hm sends: C bit set on the destination.
+        a.push(0x60 | (ssid << 1) | last as u8 | if last { 0 } else { 0x80 });
         a
     };
     let mut f = addr("HMNET", 0, false);
@@ -338,4 +339,99 @@ fn held_out_tilt_and_noise_against_direwolf() {
     }
     eprintln!("held out total: Direwolf {theirs}, ours {ours}");
     assert!(ours * 100 >= theirs * 95, "ours {ours} vs Direwolf {theirs}");
+}
+
+/// IL2P frames from Direwolf's `gen_packets -I` decode here, in noise too.
+#[test]
+fn we_decode_direwolf_il2p() {
+    if !have("gen_packets") || !have("atest") {
+        eprintln!("skipped: Direwolf's gen_packets and atest are not installed");
+        return;
+    }
+    let dir = std::env::temp_dir();
+    for (fec, n) in [("1", 100usize), ("0", 100)] {
+        let fs = 48_000u32;
+        let path = dir.join(format!("dw-il2p-{fec}-{}.wav", std::process::id()));
+        let st = Command::new("gen_packets")
+            .args(["-I", fec, "-n", &n.to_string(), "-r", &fs.to_string(), "-o"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(st.status.success());
+        let theirs = atest_best(&path);
+        let (_, audio) = read_wav(&path);
+        let got = decode(fs, &audio);
+        // Every frame is a Direwolf test UI frame from WB2OSZ-15.
+        assert!(got
+            .iter()
+            .all(|f| f.len() > 16 && f[7..13] == b"WB2OSZ".map(|c| c << 1)));
+        eprintln!(
+            "gen_packets -I {fec} -n {n}: Direwolf decoded {theirs}, we decoded {}",
+            got.len()
+        );
+        assert!(
+            got.len() * 100 >= theirs * 95,
+            "ours {} vs Direwolf {theirs}",
+            got.len()
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+/// Our IL2P frames decode in Direwolf, with both FEC levels.
+#[test]
+fn direwolf_decodes_our_il2p() {
+    if !have("atest") {
+        eprintln!("skipped: Direwolf's atest is not installed");
+        return;
+    }
+    let dir = std::env::temp_dir();
+    let fs = 48_000u32;
+    for max_fec in [true, false] {
+        let sent: Vec<Vec<u8>> = (0..50).map(ax25_ui).collect();
+        let m = Modulator::new(fs);
+        let mut audio = Vec::new();
+        for f in &sent {
+            audio.extend(m.modulate_il2p(&[f.as_slice()], 150, max_fec));
+            audio.extend(std::iter::repeat_n(0.0, fs as usize / 5));
+        }
+        let path = dir.join(format!("hm-il2p-{max_fec}-{}.wav", std::process::id()));
+        write_wav(&path, fs, &audio);
+        let n = atest_count(&path);
+        let ours = success(&sent, &decode(fs, &audio));
+        eprintln!("our IL2P (max FEC {max_fec}): Direwolf decoded {n}/50, we decoded {ours}/50");
+        assert_eq!((n, ours), (50, 50));
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+/// What IL2P buys in noise: the same frames, HDLC against IL2P, at falling SNR.
+#[test]
+fn il2p_outlasts_hdlc_in_noise() {
+    let fs = 48_000;
+    let mut rng = DetRng::from_seed(31);
+    let sent: Vec<Vec<u8>> = (0..40).map(ax25_ui).collect();
+    let m = Modulator::new(fs);
+    let mut report = Vec::new();
+    let (mut hdlc_total, mut il2p_total) = (0, 0);
+    for snr in [-2.0f32, -3.0, -4.0, -5.0, -6.0] {
+        let mut ok = [0usize; 2];
+        for (k, il2p) in [false, true].into_iter().enumerate() {
+            for f in &sent {
+                let mut audio = if il2p {
+                    m.modulate_il2p(&[f.as_slice()], 150, true)
+                } else {
+                    m.modulate(&[f.as_slice()], 150)
+                };
+                audio.extend(std::iter::repeat_n(0.0, fs as usize / 10));
+                add_noise(&mut audio, snr, &mut rng);
+                ok[k] += decode(fs, &audio).contains(f) as usize;
+            }
+        }
+        hdlc_total += ok[0];
+        il2p_total += ok[1];
+        report.push(format!("{snr} dB: HDLC {}/40, IL2P {}/40", ok[0], ok[1]));
+    }
+    eprintln!("{}", report.join("; "));
+    assert!(il2p_total > hdlc_total, "IL2P {il2p_total} vs HDLC {hdlc_total}");
 }

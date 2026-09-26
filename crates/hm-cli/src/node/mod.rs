@@ -34,7 +34,7 @@ use hm_bundle::Address;
 use hm_core::{DetRng, Input, Machine, Millis, Output};
 use hm_net::{Net, NetConfig, NetError, Verdict};
 use hm_store::{Retry, Store};
-use hm_wire::{Callsign, FrameHeader, ObjectId, FLAG_INTERNET};
+use hm_wire::{Callsign, Dest, FrameHeader, ObjectId, FLAG_INTERNET};
 use hm_xfer::beacon::{beacon_frame, read_beacon};
 use hm_xfer::{Command, Event, Failure, Receipt};
 
@@ -42,7 +42,7 @@ use crate::config::RadioSettings;
 use crate::driver::Link;
 use crate::files::{KeyFile, Trust};
 use crate::kiss_link::{KissLink, KissTarget, TncParams};
-use crate::sound_link::{AudioFactory, Csma, PttFactory, SoundLink};
+use crate::sound_link::{AudioFactory, Csma, Framing, PttFactory, SoundLink};
 use crate::station::{open_message, unix_now, LinkTiming, Station, Verification};
 use choose::{Bearer, Chooser};
 use live::{Live, LiveConfig};
@@ -96,13 +96,14 @@ pub fn radio_config(r: &RadioSettings) -> Result<Option<RadioConfig>, String> {
         },
         (true, Some(device)) => {
             let (device, spec) = (device.clone(), r.ptt.clone());
-            let describe = format!("sound card {device}, PTT {spec}");
+            let describe = format!("sound card {device}, PTT {spec}, {}", r.framing);
             RadioLink::Modem {
                 audio: Arc::new(move || {
                     Ok(Box::new(hm_rig::soundcard::SoundCard::open(&device)?) as Box<dyn hm_rig::AudioPort>)
                 }),
                 ptt: Arc::new(move || hm_rig::ptt::open(&spec)),
                 csma: Csma {
+                    framing: Framing::parse(&r.framing)?,
                     persist: r.persist,
                     slot: Duration::from_millis(r.slottime_ms),
                     txdelay_ms: r.txdelay_ms as u32,
@@ -782,6 +783,7 @@ fn radio_session(
         timing: rc.timing,
     };
     let mut x = station.engine()?;
+    x.set_features(link.features());
     let port = x.config().port;
     let start = Instant::now();
     let now = || Millis(start.elapsed().as_millis() as u64);
@@ -855,7 +857,22 @@ fn radio_session(
         }
         for o in out.drain(..) {
             match o {
-                Output::Transmit { port: p, data } if p == port => link.send(&data)?,
+                Output::Transmit { port: p, data } if p == port => {
+                    // Tell the link what the destination decodes, so it can frame to suit.
+                    if let Ok((
+                        FrameHeader {
+                            dst: Dest::Station(to),
+                            ..
+                        },
+                        _,
+                    )) = FrameHeader::decode(&data)
+                    {
+                        if let Some(open) = x.peer(to) {
+                            link.peer_features(to, open.features);
+                        }
+                    }
+                    link.send(&data)?
+                }
                 Output::Transmit { .. } => {}
                 Output::Event(Event::Received { from, object, .. }) => {
                     let _ = events.send(RadioEvt::Received { from, object });

@@ -14,7 +14,7 @@ use hm_cli::files::{KeyFile, Trust};
 use hm_cli::node::choose::Costs;
 use hm_cli::node::live::Live;
 use hm_cli::node::{self, NodeConfig, RadioConfig, RadioLink};
-use hm_cli::sound_link::{AudioFactory, Csma, PttFactory, SoundLink};
+use hm_cli::sound_link::{AudioFactory, Csma, Framing, PttFactory, SoundLink};
 use hm_cli::station::LinkTiming;
 use hm_rig::ether::Ether;
 use hm_rig::ptt::Ptt;
@@ -257,4 +257,57 @@ fn two_nodes_exchange_mail_over_the_built_in_modem() {
         .contains("built-in modem"));
     a.stop().unwrap();
     b.stop().unwrap();
+}
+
+fn framed_link(ether: &Ether, me: &str, framing: Framing) -> SoundLink {
+    let csma = Csma {
+        framing,
+        ..Csma::default()
+    };
+    SoundLink::start(call(me), audio(ether), ptt(&Recorder::default()), csma).unwrap()
+}
+
+/// In heavy noise, frames sent in IL2P arrive where the same frames in AX.25
+/// are lost. `auto` picks IL2P only for a station that said it decodes it.
+#[test]
+fn il2p_gets_through_noise_that_stops_ax25() {
+    let noise: f32 = std::env::var("HM_NOISE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.25);
+    let delivered = |framing: Framing, seed: u64, tell: bool| {
+        let ether = Ether::new(FS, noise, seed);
+        let mut a = framed_link(&ether, "SA0KAM", framing);
+        let mut b = framed_link(&ether, "SO5KM", Framing::Ax25);
+        if tell {
+            a.peer_features(call("SO5KM"), a.features());
+        }
+        // hm-shaped frames to SO5KM: the header names the destination.
+        let frames: Vec<Vec<u8>> = (0..12u8)
+            .map(|i| {
+                hm_wire::FrameHeader {
+                    ftype: hm_wire::FrameType::Data,
+                    src: call("SA0KAM"),
+                    dst: hm_wire::Dest::Station(call("SO5KM")),
+                    session: 1,
+                    index: i as u32,
+                }
+                .frame(&[i; 120])
+                .unwrap()
+            })
+            .collect();
+        for f in &frames {
+            a.send(f).unwrap();
+            thread::sleep(Duration::from_millis(1200));
+        }
+        let got = collect(&mut b, Duration::from_secs(3));
+        frames.iter().filter(|f| got.contains(f)).count()
+    };
+    let ax25 = delivered(Framing::Ax25, 7, false);
+    let il2p = delivered(Framing::Il2p, 7, false);
+    let auto_told = delivered(Framing::Auto, 7, true);
+    let auto_untold = delivered(Framing::Auto, 7, false);
+    eprintln!("noise {noise}: AX.25 {ax25}/12, IL2P {il2p}/12, auto (told) {auto_told}/12, auto (not told) {auto_untold}/12");
+    assert!(il2p >= ax25 + 4, "IL2P {il2p} vs AX.25 {ax25}");
+    assert!(auto_told >= ax25 + 4 && auto_untold <= ax25 + 2);
 }

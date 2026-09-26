@@ -41,9 +41,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
-      - name: ALSA headers for the sound-card crate
+      # Direwolf's gen_packets and atest check the modem against Direwolf
+      # (AX.25 and IL2P, both directions); those tests are skipped without it.
+      - name: ALSA headers for the sound-card crate, and Direwolf
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev direwolf
       # Includes the pinned simulator trace, so on a release tag this also checks
       # that runs are identical across operating systems.
       - run: cargo test --workspace

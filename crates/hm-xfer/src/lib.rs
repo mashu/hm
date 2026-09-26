@@ -441,6 +441,11 @@ impl Xfer {
         })
     }
 
+    /// Change the feature bits sent in OPEN (for example once the link is known).
+    pub fn set_features(&mut self, features: u32) {
+        self.cfg.features = features;
+    }
+
     /// What `peer` told us in its latest OPEN, if it sent one lately.
     pub fn peer(&self, peer: Callsign) -> Option<Open> {
         self.peers.get(&peer).map(|(o, _)| *o)

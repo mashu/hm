@@ -500,6 +500,8 @@ struct RadioView {
     /// The built-in modem's sound card; "" for a KISS TNC instead.
     audio: Option<String>,
     ptt: Option<String>,
+    /// Built-in modem framing: "ax25", "il2p" or "auto".
+    framing: Option<String>,
     persist: Option<u8>,
     slottime_ms: Option<u64>,
     bitrate: Option<u32>,
@@ -515,6 +517,7 @@ impl RadioView {
             tnc_port: Some(r.tnc_port),
             audio: Some(r.audio.clone().unwrap_or_default()),
             ptt: Some(r.ptt.clone()),
+            framing: Some(r.framing.clone()),
             persist: Some(r.persist),
             slottime_ms: Some(r.slottime_ms),
             bitrate: Some(r.bitrate),
@@ -537,6 +540,7 @@ impl RadioView {
             kiss,
             tnc_port,
             ptt,
+            framing,
             persist,
             slottime_ms,
             bitrate,

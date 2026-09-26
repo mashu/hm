@@ -11,6 +11,13 @@ pub trait Link {
     fn send(&mut self, frame: &[u8]) -> io::Result<()>;
     /// Wait up to `wait` for a frame; `Ok(None)` on timeout.
     fn recv_timeout(&mut self, wait: Duration) -> io::Result<Option<Vec<u8>>>;
+    /// What `peer` said it supports (`hm_wire::FEATURE_*` bits), for links
+    /// that can frame traffic to it differently.
+    fn peer_features(&mut self, _peer: hm_wire::Callsign, _features: u32) {}
+    /// Feature bits this link adds to the station's OPEN.
+    fn features(&self) -> u32 {
+        0
+    }
 }
 
 /// What the event callback wants next.

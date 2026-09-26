@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::f64::consts::TAU;
 
-use crate::{hdlc, BAUD, MARK_HZ, SPACE_HZ};
+use crate::{hdlc, il2p, BAUD, MARK_HZ, SPACE_HZ};
 
 /// Frames to AFSK audio.
 #[derive(Clone, Debug)]
@@ -27,19 +27,35 @@ impl Modulator {
         self.modulate_bits(&bits)
     }
 
+    /// One IL2P transmission: preamble bytes for `txdelay_ms`, then the
+    /// frames, each with its sync word and Reed–Solomon parity (16 bytes per
+    /// block with `max_fec`).
+    pub fn modulate_il2p(&self, frames: &[&[u8]], txdelay_ms: u32, max_fec: bool) -> Vec<f32> {
+        let preamble = libm::ceilf(txdelay_ms as f32 * BAUD / 8000.0) as usize;
+        let bits = il2p::encode_bits(frames, preamble.max(1), max_fec);
+        self.tones(bits.iter().map(|&b| b == 1))
+    }
+
     /// NRZI and phase-continuous FSK: a 0 bit changes the tone, a 1 keeps it.
     pub fn modulate_bits(&self, bits: &[u8]) -> Vec<f32> {
-        let fs = self.sample_rate as f64;
-        let per_bit = fs / BAUD as f64;
-        let mut out = Vec::with_capacity((bits.len() as f64 * per_bit) as usize + 1);
         let mut mark = true;
-        let mut phase = 0.0f64;
-        let mut t = 0.0f64;
-        let mut n = 0usize;
-        for &b in bits {
+        self.tones(bits.iter().map(move |&b| {
             if b == 0 {
                 mark = !mark;
             }
+            mark
+        }))
+    }
+
+    /// Phase-continuous FSK, one tone per bit: mark where `true`.
+    fn tones(&self, marks: impl Iterator<Item = bool>) -> Vec<f32> {
+        let fs = self.sample_rate as f64;
+        let per_bit = fs / BAUD as f64;
+        let mut out = Vec::new();
+        let mut phase = 0.0f64;
+        let mut t = 0.0f64;
+        let mut n = 0usize;
+        for mark in marks {
             let f = if mark { MARK_HZ } else { SPACE_HZ } as f64;
             t += per_bit;
             while (n as f64) < t {

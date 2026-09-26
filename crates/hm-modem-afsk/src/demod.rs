@@ -3,6 +3,7 @@ use core::f32::consts::TAU;
 
 use crate::filter::{bandpass, window, Fir};
 use crate::hdlc::Deframer;
+use crate::il2p;
 use crate::{BAUD, MARK_HZ, SPACE_HZ};
 
 /// Tuning of the demodulator; the defaults suit FM voice radios.
@@ -76,6 +77,7 @@ struct Slicer {
     prev_level: bool,
     prev_sign: bool,
     deframer: Deframer,
+    il2p: il2p::Receiver,
     /// Last 32 transitions: bit set when it fell near the expected moment.
     quality: u32,
     locked: bool,
@@ -131,6 +133,7 @@ impl Demodulator {
                 prev_level: false,
                 prev_sign: false,
                 deframer: Deframer::new(),
+                il2p: il2p::Receiver::new(),
                 quality: 0,
                 locked: false,
             })
@@ -201,10 +204,12 @@ impl Demodulator {
             let before = s.pll;
             s.pll = s.pll.wrapping_add(self.pll_step);
             if before > 0 && s.pll < 0 {
-                // Middle of a bit: decide it, undo NRZI, feed the deframer.
+                // Middle of a bit: decide it. HDLC undoes NRZI; IL2P takes it as it is.
                 let bit = (sign == s.prev_level) as u8;
                 s.prev_level = sign;
-                if let Some(frame) = s.deframer.push(bit) {
+                let hdlc = s.deframer.push(bit);
+                let il2p = s.il2p.push(sign as u8);
+                for frame in hdlc.into_iter().chain(il2p) {
                     let sum = checksum(&frame);
                     let now = self.samples;
                     let window = self.dedupe_window;

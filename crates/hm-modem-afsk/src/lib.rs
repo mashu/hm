@@ -25,7 +25,9 @@ pub mod crc;
 mod demod;
 mod filter;
 pub mod hdlc;
+pub mod il2p;
 mod modulator;
+pub mod rs;
 
 pub use demod::{Demodulator, DemodulatorConfig};
 pub use modulator::Modulator;

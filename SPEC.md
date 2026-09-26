@@ -323,6 +323,13 @@ destination or PID.
 KISS framing is standard: FEND 0xC0, FESC 0xDB, TFEND 0xDC, TFESC 0xDD. The type
 byte holds the TNC port in its high nibble and command 0 (data).
 
+On air, the AX.25 frame travels in HDLC (flags, bit stuffing, CRC) or in IL2P
+as NinoTNC and Direwolf 1.7 send it: one 0x55 byte, the sync word 0xF15E48, a
+type 1 header (the two addresses, UI control and PID; 13 bytes, scrambled, then
+2 Reed–Solomon parity bytes) and the information field in scrambled blocks, each
+followed by its parity (16 bytes per block of at most 239 with maximum FEC). A
+station that decodes IL2P sets the IL2P feature bit in its OPEN (section 7).
+
 ## 10. Internet links
 
 Stations may also link over the internet. A link is a QUIC connection (RFC 9000)
