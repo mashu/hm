@@ -74,7 +74,16 @@ fn carrier_sense_waits_for_a_busy_channel() {
     let mut c = link(&ether, "SP5AAA", &rc);
     let long: Vec<u8> = (0..500u32).map(|i| i as u8).collect(); // about 4 s on air
     a.send(&long).unwrap();
-    thread::sleep(Duration::from_millis(1500)); // A is mid-transmission
+    // A keys up on its own schedule (p-persistent: 25% per 100 ms slot, so a
+    // fixed sleep can end before A is on the air). Wait until it is, then some.
+    let keyed = |r: &Recorder| r.0.lock().unwrap().iter().any(|(_, on)| *on);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !keyed(&ra) {
+        assert!(Instant::now() < deadline, "A never keyed up");
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(500)); // A is mid-transmission
+    assert!(!keyed(&rb), "B has nothing to send yet");
     b.send(b"short frame from B, sent while A is on the air").unwrap();
     let got = collect(&mut c, Duration::from_secs(10));
     assert!(got.contains(&long), "C decoded A's frame");
