@@ -38,6 +38,7 @@ use hm_wire::{Callsign, FrameHeader, ObjectId, FLAG_INTERNET};
 use hm_xfer::beacon::{beacon_frame, read_beacon};
 use hm_xfer::{Command, Event, Failure, Receipt};
 
+use crate::config::RadioSettings;
 use crate::driver::Link;
 use crate::files::{KeyFile, Trust};
 use crate::kiss_link::{KissLink, KissTarget, TncParams};
@@ -78,6 +79,45 @@ impl RadioConfig {
     }
 }
 
+/// Builds the radio link from `[radio]` settings: `None` when the radio is
+/// off. With one, the node follows changes to `[radio]` without a restart.
+pub type RadioBuilder = Arc<dyn Fn(&RadioSettings) -> Result<Option<RadioConfig>, String> + Send + Sync>;
+
+/// The radio link `[radio]` describes: a KISS TNC, or the built-in modem on a
+/// sound card; `None` when the radio is off.
+pub fn radio_config(r: &RadioSettings) -> Result<Option<RadioConfig>, String> {
+    r.check()?;
+    let link = match (r.enabled, &r.audio) {
+        (false, _) => return Ok(None),
+        (true, None) => RadioLink::Kiss {
+            target: KissTarget::parse(&r.kiss)?,
+            tnc_port: r.tnc_port,
+            params: r.tnc_params(),
+        },
+        (true, Some(device)) => {
+            let (device, spec) = (device.clone(), r.ptt.clone());
+            let describe = format!("sound card {device}, PTT {spec}");
+            RadioLink::Modem {
+                audio: Arc::new(move || {
+                    Ok(Box::new(hm_rig::soundcard::SoundCard::open(&device)?) as Box<dyn hm_rig::AudioPort>)
+                }),
+                ptt: Arc::new(move || hm_rig::ptt::open(&spec)),
+                csma: Csma {
+                    persist: r.persist,
+                    slot: Duration::from_millis(r.slottime_ms),
+                    txdelay_ms: r.txdelay_ms as u32,
+                    ..Default::default()
+                },
+                describe,
+            }
+        }
+    };
+    Ok(Some(RadioConfig {
+        link,
+        timing: r.timing(),
+    }))
+}
+
 /// The node's internet endpoint. The stations it keeps links to are live
 /// settings ([`Live::peers`]).
 pub struct InternetConfig {
@@ -91,9 +131,17 @@ pub struct NodeConfig {
     /// `station.toml`: watched for edits, and where changes made through the
     /// API are saved. Without one, API changes last until restart.
     pub config_file: Option<PathBuf>,
+    /// Command-line settings for this run, kept over edits to the file.
+    pub overrides: Option<live::Overrides>,
+    /// Names of the settings `overrides` sets, for the settings page.
+    pub overridden: Vec<String>,
     /// Callsign on air (the key's base call, possibly with an SSID).
     pub me: Callsign,
+    /// The radio link to start with.
     pub radio: Option<RadioConfig>,
+    /// Rebuilds the radio link when `[radio]` changes; without one, radio
+    /// changes take a restart.
+    pub radio_builder: Option<RadioBuilder>,
     pub internet: Option<InternetConfig>,
     pub store: PathBuf,
     pub http: SocketAddr,
@@ -107,6 +155,8 @@ pub struct NodeConfig {
 #[derive(Clone, Debug, Default)]
 pub struct Status {
     pub radio: Option<bool>,
+    /// How the radio is reached, while the node has one.
+    pub radio_via: Option<String>,
     pub internet_listen: Option<SocketAddr>,
     pub internet_peers: Vec<Callsign>,
     /// (station, bearer, estimated success rate)
@@ -163,11 +213,22 @@ enum RadioCmd {
 }
 
 enum RadioEvt {
+    /// The radio link now in use (`None`: the radio is off).
+    Using(Option<String>),
     Up,
     Down(String),
-    Received { from: Callsign, object: Vec<u8> },
-    Delivered { xfer_id: ObjectId, receipt: Receipt },
-    Failed { xfer_id: ObjectId, reason: Failure },
+    Received {
+        from: Callsign,
+        object: Vec<u8>,
+    },
+    Delivered {
+        xfer_id: ObjectId,
+        receipt: Receipt,
+    },
+    Failed {
+        xfer_id: ObjectId,
+        reason: Failure,
+    },
     Heard(Vec<heard::Station>),
 }
 
@@ -239,17 +300,19 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
     let (radio_evt_tx, radio_evt_rx) = tokio::sync::mpsc::unbounded_channel();
     let (radio_cmd_tx, radio_cmd_rx) = mpsc::channel();
     let status = Arc::new(Mutex::new(Status::default()));
-    let live = Arc::new(LiveConfig::new(cfg.live.clone(), cfg.config_file.clone()));
+    let live = Arc::new(
+        LiveConfig::new(cfg.live.clone(), cfg.config_file.clone()).with_overrides(cfg.overrides.clone()),
+    );
     let cfg = Arc::new(cfg);
 
-    let radio = match &cfg.radio {
-        Some(_) => {
+    let radio = match cfg.radio.is_some() || cfg.radio_builder.is_some() {
+        true => {
             let (cfg, live, stop) = (cfg.clone(), live.clone(), stop.clone());
             Some(thread::Builder::new().name("radio".into()).spawn(move || {
                 radio_thread(&cfg, &live, radio_cmd_rx, radio_evt_tx, &stop);
             })?)
         }
-        None => None,
+        false => None,
     };
 
     // The internet endpoint is bound here so its address is known on return.
@@ -366,6 +429,8 @@ async fn coordinator(
         .unwrap_or_else(|| getrandom::u64().unwrap_or_else(|_| unix_now()));
     let mut chooser = Chooser::new(live.get().costs, 3600, DetRng::from_seed(seed));
     let mut radio_up = false;
+    let mut last_down: Option<String> = None;
+    let mut radio_via = cfg.radio.as_ref().map(|r| r.describe());
     let mut in_flight: BTreeMap<ObjectId, InFlight> = BTreeMap::new();
     let mut radio_ids: BTreeMap<ObjectId, ObjectId> = BTreeMap::new(); // transfer id -> bundle id
     let (net_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<NetResult>();
@@ -420,13 +485,24 @@ async fn coordinator(
         tokio::select! {
             _ = shutdown.changed() => return,
             Some(ev) = radio_evt.recv() => match ev {
+                RadioEvt::Using(via) => {
+                    if via != radio_via {
+                        log(format!("radio now {}", via.as_deref().unwrap_or("off")));
+                    }
+                    radio_via = via;
+                }
                 RadioEvt::Up => {
                     radio_up = true;
+                    last_down = None;
                     log("radio up");
                 }
                 RadioEvt::Down(why) => {
                     radio_up = false;
-                    log(format!("radio down: {why}"));
+                    // Retries fail the same way every few seconds: say it once.
+                    if last_down.as_deref() != Some(why.as_str()) {
+                        log(format!("radio down: {why}"));
+                        last_down = Some(why);
+                    }
                     let lost: Vec<ObjectId> =
                         in_flight.iter().filter(|(_, f)| f.bearer == Bearer::Radio).map(|(id, _)| *id).collect();
                     radio_ids.clear();
@@ -519,7 +595,8 @@ async fn coordinator(
                     }
                 }
                 let mut st = status.lock().expect("lock");
-                st.radio = cfg.radio.as_ref().map(|_| radio_up);
+                st.radio = radio_via.as_ref().map(|_| radio_up);
+                st.radio_via = radio_via.clone();
                 st.internet_peers = net.as_ref().map(|n| n.connected()).unwrap_or_default();
                 st.estimates = chooser
                     .peers()
@@ -542,7 +619,15 @@ const FIRST_BEACON_MS: (u64, u64) = (5_000, 30_000);
 const HEARD_REPORT: Duration = Duration::from_secs(30);
 const MAX_WAIT: Duration = Duration::from_millis(200);
 
-/// Keep a KISS link up and run the transfer engine on it.
+/// How a radio session ended.
+enum Ended {
+    Stopped,
+    /// `[radio]` changed: open the link it describes now.
+    Reconfigure,
+}
+
+/// Keep the radio link up and run the transfer engine on it; open a new link
+/// when `[radio]` changes, if the node has a [`RadioBuilder`].
 fn radio_thread(
     cfg: &NodeConfig,
     live: &LiveConfig,
@@ -550,49 +635,89 @@ fn radio_thread(
     events: tokio::sync::mpsc::UnboundedSender<RadioEvt>,
     stop: &AtomicBool,
 ) {
-    let rc = cfg.radio.as_ref().expect("radio configured");
+    // The link in use: the one the node started with until [radio] changes.
+    let mut rebuilt: Option<Option<RadioConfig>> = None;
+    let mut settings = live.get().radio.link_settings();
+    let changed = |settings: &RadioSettings| {
+        cfg.radio_builder.is_some() && live.get().radio.link_settings() != *settings
+    };
     while !stop.load(Ordering::Relaxed) {
-        let session = |link: &mut dyn Link| {
+        let rc = match &rebuilt {
+            Some(r) => r.as_ref(),
+            None => cfg.radio.as_ref(),
+        };
+        let _ = events.send(RadioEvt::Using(rc.map(|r| r.describe())));
+        let session = |rc: &RadioConfig, link: &mut dyn Link| {
             let _ = events.send(RadioEvt::Up);
-            radio_session(cfg, rc, live, link, &cmds, &events, stop)
+            radio_session(cfg, rc, live, &settings, link, &cmds, &events, stop)
         };
-        let result = match &rc.link {
-            RadioLink::Kiss {
-                target,
-                tnc_port,
-                params,
-            } => KissLink::open(target, cfg.me, *tnc_port, *params).map(|mut l| session(&mut l)),
-            RadioLink::Modem { audio, ptt, csma, .. } => {
-                SoundLink::start(cfg.me, audio.clone(), ptt.clone(), *csma).map(|mut l| session(&mut l))
+        let result = match rc {
+            None => Err("the radio is off".to_string()),
+            Some(rc) => match &rc.link {
+                RadioLink::Kiss {
+                    target,
+                    tnc_port,
+                    params,
+                } => KissLink::open(target, cfg.me, *tnc_port, *params)
+                    .map(|mut l| session(rc, &mut l))
+                    .map_err(|e| format!("cannot open {}: {e}", rc.describe())),
+                RadioLink::Modem { audio, ptt, csma, .. } => {
+                    SoundLink::start(cfg.me, audio.clone(), ptt.clone(), *csma)
+                        .map(|mut l| session(rc, &mut l))
+                        .map_err(|e| format!("cannot open {}: {e}", rc.describe()))
+                }
+            },
+        };
+        let off = rc.is_none();
+        let wait = match result {
+            Ok(Ok(Ended::Stopped)) => return,
+            Ok(Ok(Ended::Reconfigure)) => {
+                let _ = events.send(RadioEvt::Down("the radio settings changed".into()));
+                false
             }
-        };
-        match result {
-            Ok(Ok(())) => return, // stopped
             Ok(Err(e)) => {
                 let _ = events.send(RadioEvt::Down(e.to_string()));
+                true
             }
             Err(e) => {
-                let _ = events.send(RadioEvt::Down(format!("cannot open {}: {e}", rc.describe())));
+                let _ = events.send(RadioEvt::Down(e));
+                true
             }
-        }
+        };
+        // Wait to reconnect (while off: until switched on), unless [radio] changes.
         let until = Instant::now() + RECONNECT;
-        while Instant::now() < until && !stop.load(Ordering::Relaxed) {
+        while wait && (off || Instant::now() < until) && !changed(&settings) {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
             // Commands sent while the radio is down are answered by RadioEvt::Down.
             while cmds.try_recv().is_ok() {}
             thread::sleep(Duration::from_millis(100));
         }
+        if changed(&settings) {
+            let now = live.get().radio;
+            settings = now.link_settings();
+            match cfg.radio_builder.as_ref().expect("checked by changed")(&now) {
+                Ok(r) => rebuilt = Some(r),
+                Err(e) => log(format!(
+                    "radio settings not applied, keeping the link in use: {e}"
+                )),
+            }
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn radio_session(
     cfg: &NodeConfig,
     rc: &RadioConfig,
     live: &LiveConfig,
+    settings: &RadioSettings,
     link: &mut dyn Link,
     cmds: &mpsc::Receiver<RadioCmd>,
     events: &tokio::sync::mpsc::UnboundedSender<RadioEvt>,
     stop: &AtomicBool,
-) -> io::Result<()> {
+) -> io::Result<Ended> {
     let mut live_version = live.version();
     let station = Station {
         key: &cfg.key,
@@ -621,6 +746,9 @@ fn radio_session(
         if live.version() != live_version {
             live_version = live.version();
             let live = live.get();
+            if cfg.radio_builder.is_some() && live.radio.link_settings() != *settings {
+                return Ok(Ended::Reconfigure);
+            }
             x.set_trust(live.trust.iter());
             if live.beacon_secs != beacon_secs {
                 // A new interval: the next beacon one (new) interval from now, or none.
@@ -631,8 +759,16 @@ fn radio_session(
         if let (Some(at), Some(every)) = (next_beacon, beacon_every(beacon_secs)) {
             if Instant::now() >= at {
                 let t = unix_now();
-                let frame = beacon_frame(&cfg.key.identity, cfg.me, flags, t as u32, heard.for_beacon(t))
-                    .map_err(|e| io::Error::other(format!("beacon: {e}")))?;
+                let locator = live.get().locator;
+                let frame = beacon_frame(
+                    &cfg.key.identity,
+                    cfg.me,
+                    flags,
+                    t as u32,
+                    locator,
+                    heard.for_beacon(t),
+                )
+                .map_err(|e| io::Error::other(format!("beacon: {e}")))?;
                 link.send(&frame)?;
                 let jitter = every.as_millis() as u64 / 10;
                 let ms = every.as_millis() as u64 - jitter + rng.below(2 * jitter + 1);
@@ -677,7 +813,7 @@ fn radio_session(
             }
         }
         if stop.load(Ordering::Relaxed) {
-            return Ok(());
+            return Ok(Ended::Stopped);
         }
         let t = now();
         match x.next_deadline() {

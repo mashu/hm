@@ -113,7 +113,7 @@ enum TrustCmd {
 }
 
 /// Overrides for this run; anything not given comes from station.toml.
-#[derive(Args)]
+#[derive(Args, Clone)]
 struct StationArgs {
     /// Station key file [station.key].
     #[arg(long)]
@@ -151,7 +151,7 @@ struct StationArgs {
 }
 
 /// `hm node` overrides for this run.
-#[derive(Args)]
+#[derive(Args, Clone)]
 struct NodeArgs {
     /// Message store [station.store].
     #[arg(long)]
@@ -178,6 +178,9 @@ struct NodeArgs {
     /// Beacon interval in minutes, 0 for none [radio.beacon_minutes].
     #[arg(long)]
     beacon_minutes: Option<u64>,
+    /// Grid locator sent in beacons, like JO89xi [station.locator].
+    #[arg(long)]
+    locator: Option<String>,
 }
 
 /// Put `v` in `slot` if given, noting which setting was overridden.
@@ -254,6 +257,13 @@ impl NodeArgs {
             "radio.beacon_minutes",
             o,
         );
+        set(
+            &mut c.station.locator,
+            self.locator.clone().map(Some),
+            "station.locator",
+            o,
+        );
+        c.locator()?;
         Ok(())
     }
 }
@@ -297,20 +307,11 @@ fn open_station(c: &Config) -> Result<(KeyFile, Callsign), String> {
 }
 
 fn timing(c: &Config) -> LinkTiming {
-    LinkTiming {
-        bitrate_bps: c.radio.bitrate,
-        txdelay_ms: c.radio.txdelay_ms,
-        guard_ms: c.radio.guard_ms,
-        max_rounds: 12,
-    }
+    c.radio.timing()
 }
 
 fn tnc_params(c: &Config) -> TncParams {
-    TncParams {
-        txdelay_ms: c.radio.txdelay_ms as u32,
-        persist: c.radio.persist,
-        slot_ms: c.radio.slottime_ms as u32,
-    }
+    c.radio.tnc_params()
 }
 
 fn open_kiss(c: &Config, me: Callsign) -> Result<(KissLink, KissTarget), String> {
@@ -532,7 +533,12 @@ fn api_token(store: &Path) -> Result<String, String> {
     Ok(token)
 }
 
-fn node(config_path: &Path, c: &Config, overridden: &[String]) -> Result<(), String> {
+fn node(
+    config_path: &Path,
+    c: &Config,
+    overridden: &[String],
+    overrides: hm_cli::node::live::Overrides,
+) -> Result<(), String> {
     let (key, me) = open_station(c)?;
     let live =
         hm_cli::node::live::Live::from_config(c).map_err(|e| format!("{}: {e}", config_path.display()))?;
@@ -540,35 +546,7 @@ fn node(config_path: &Path, c: &Config, overridden: &[String]) -> Result<(), Str
     let internet = (listen.is_some() || !live.peers.is_empty()).then(|| hm_cli::node::InternetConfig {
         listen: listen.unwrap_or_else(|| "0.0.0.0:0".parse().expect("valid")),
     });
-    let radio = match (c.radio.enabled, &c.radio.audio) {
-        (false, _) => None,
-        (true, None) => Some(hm_cli::node::RadioLink::Kiss {
-            target: KissTarget::parse(&c.radio.kiss)?,
-            tnc_port: c.radio.tnc_port,
-            params: tnc_params(c),
-        }),
-        (true, Some(device)) => {
-            let (device, spec) = (device.clone(), c.radio.ptt.clone());
-            let describe = format!("sound card {device}, PTT {spec}");
-            Some(hm_cli::node::RadioLink::Modem {
-                audio: std::sync::Arc::new(move || {
-                    Ok(Box::new(hm_rig::soundcard::SoundCard::open(&device)?) as Box<dyn hm_rig::AudioPort>)
-                }),
-                ptt: std::sync::Arc::new(move || hm_rig::ptt::open(&spec)),
-                csma: hm_cli::sound_link::Csma {
-                    persist: c.radio.persist,
-                    slot: Duration::from_millis(c.radio.slottime_ms),
-                    txdelay_ms: c.radio.txdelay_ms as u32,
-                    ..Default::default()
-                },
-                describe,
-            })
-        }
-    }
-    .map(|link| hm_cli::node::RadioConfig {
-        link,
-        timing: timing(c),
-    });
+    let radio = hm_cli::node::radio_config(&c.radio)?;
     if radio.is_none() && internet.is_none() {
         return Err(
             "no way to reach other stations: with the radio off, set internet.listen or add [[internet.peers]]"
@@ -581,8 +559,11 @@ fn node(config_path: &Path, c: &Config, overridden: &[String]) -> Result<(), Str
         key,
         live,
         config_file: Some(config_path.to_path_buf()),
+        overrides: Some(overrides),
+        overridden: overridden.to_vec(),
         me,
         radio,
+        radio_builder: Some(std::sync::Arc::new(hm_cli::node::radio_config)),
         internet,
         store: store.clone(),
         http: c.http()?,
@@ -649,7 +630,13 @@ fn main() -> ExitCode {
         Cmd::Listen { station } => with_overrides(path, station, None).and_then(|(c, _)| listen(&c)),
         Cmd::AudioDevices => audio_devices(),
         Cmd::Node { station, node: n } => {
-            with_overrides(path, station, Some(n)).and_then(|(c, o)| node(path, &c, &o))
+            let (s2, n2) = (station.clone(), n.clone());
+            let overrides: hm_cli::node::live::Overrides = std::sync::Arc::new(move |c: &mut Config| {
+                let mut o = Vec::new();
+                s2.apply(c, &mut o);
+                let _ = n2.apply(c, &mut o);
+            });
+            with_overrides(path, station, Some(n)).and_then(|(c, o)| node(path, &c, &o, overrides))
         }
     };
     match result {

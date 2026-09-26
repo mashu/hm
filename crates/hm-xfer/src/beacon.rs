@@ -9,7 +9,7 @@
 use alloc::vec::Vec;
 
 use hm_ident::{Identity, PublicKey};
-use hm_wire::{Beacon, Callsign, Dest, FrameHeader, FrameType, Heard, WireError};
+use hm_wire::{Beacon, Callsign, Dest, FrameHeader, FrameType, Heard, Locator, WireError};
 
 /// A beacon frame from `me`, signed now.
 pub fn beacon_frame(
@@ -17,12 +17,14 @@ pub fn beacon_frame(
     me: Callsign,
     flags: u8,
     time: u32,
+    locator: Option<Locator>,
     heard: Vec<Heard>,
 ) -> Result<Vec<u8>, WireError> {
     let mut b = Beacon {
         flags,
         key: identity.public().0,
         time,
+        locator,
         heard,
         signature: [0; 64],
     };
@@ -78,12 +80,21 @@ mod tests {
             call: call("SO5KM-1"),
             minutes: 4,
         }];
-        let f = beacon_frame(&id, call("SA0KAM-10"), FLAG_MAILBOX, 1_790_000_000, heard.clone()).unwrap();
+        let f = beacon_frame(
+            &id,
+            call("SA0KAM-10"),
+            FLAG_MAILBOX,
+            1_790_000_000,
+            Locator::parse("JO89").ok(),
+            heard.clone(),
+        )
+        .unwrap();
         let got = read_beacon(&f).expect("verifies");
         assert_eq!(got.from, call("SA0KAM-10"));
         assert_eq!(got.key(), id.public());
         assert_eq!((got.beacon.flags, got.beacon.time), (FLAG_MAILBOX, 1_790_000_000));
         assert_eq!(got.beacon.heard, heard);
+        assert_eq!(got.beacon.locator.unwrap().to_string(), "JO89");
 
         // Every single-bit change is caught: header source, body or signature.
         for byte in 1..f.len() {
@@ -111,7 +122,7 @@ mod tests {
                 minutes: i as u8,
             })
             .collect();
-        let good = beacon_frame(&id, call("SA0KAM"), 0x07, 1_790_000_000, heard).unwrap();
+        let good = beacon_frame(&id, call("SA0KAM"), 0x07, 1_790_000_000, None, heard).unwrap();
         let mut g = DetRng::from_seed(9);
         let mut accepted = 0;
         for _ in 0..2_000 {

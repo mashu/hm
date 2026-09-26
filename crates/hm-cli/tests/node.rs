@@ -5,10 +5,11 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hm_cli::config::Config;
+use hm_cli::config::{Config, RadioSettings};
 use hm_cli::files::{KeyFile, Trust};
 use hm_cli::kiss_link::{KissTarget, TncParams};
 use hm_cli::node::choose::Costs;
@@ -16,7 +17,7 @@ use hm_cli::node::live::Live;
 use hm_cli::node::{self, NodeConfig, NodeHandle, RadioConfig, RadioLink};
 use hm_cli::station::LinkTiming;
 use hm_store::RetryPolicy;
-use hm_wire::Callsign;
+use hm_wire::{Callsign, Locator};
 use serde_json::{json, Value};
 
 mod common;
@@ -154,8 +155,19 @@ fn start(s: Setup) -> NodeHandle {
             retry: s.retry,
             beacon_secs: s.beacon_every.map_or(0, |d| d.as_secs()),
             peers,
+            locator: Locator::parse("JO89xi").ok(),
+            radio: RadioSettings {
+                enabled: s.tnc.is_some(),
+                kiss: s.tnc.map_or(RadioSettings::default().kiss, |t| t.to_string()),
+                bitrate: FAST.bitrate_bps,
+                txdelay_ms: FAST.txdelay_ms,
+                guard_ms: FAST.guard_ms,
+                ..RadioSettings::default()
+            },
         },
         config_file: s.trust_file,
+        overrides: None,
+        overridden: vec![],
         me: call(s.me),
         radio: s.tnc.map(|t| RadioConfig {
             link: RadioLink::Kiss {
@@ -165,6 +177,7 @@ fn start(s: Setup) -> NodeHandle {
             },
             timing: FAST,
         }),
+        radio_builder: Some(Arc::new(node::radio_config)),
         internet: s.internet.map(|i| node::InternetConfig { listen: i.listen }),
         store: s.store.0.clone(),
         http: "127.0.0.1:0".parse().unwrap(),
@@ -478,6 +491,12 @@ fn radio_nodes_beacon_and_list_each_other() {
         assert_eq!(seen["key"], "trusted", "{seen}");
         assert_eq!(seen["offers"], serde_json::json!([]), "{seen}");
         assert!(seen["clock_offset"].as_i64().unwrap().abs() <= 5, "{seen}");
+        // Both give JO89xi: the same square, no distance.
+        assert_eq!(
+            (seen["locator"].as_str(), seen["distance_km"].as_f64()),
+            (Some("JO89xi"), Some(0.0)),
+            "{seen}"
+        );
     }
     a.stop().unwrap();
     b.stop().unwrap();
@@ -620,11 +639,13 @@ fn trusted_stations_change_while_the_node_runs() {
         hub.http_addr,
         "PATCH",
         "/api/settings",
-        Some(&json!({"internet_cost": 0.5, "retry_attempts": 7})),
+        Some(&json!({"internet_cost": 0.5, "retry_attempts": 7, "locator": "ko02md"})),
         Some(TOKEN),
     );
     assert_eq!(status, 200, "{body}");
     let now = get(hub.http_addr, "/api/settings");
+    assert_eq!(now["live"]["locator"], "KO02md");
+    assert_eq!(get(hub.http_addr, "/api/status")["locator"], "KO02md");
     assert_eq!(
         (
             now["live"]["internet_cost"].as_f64(),
@@ -634,6 +655,7 @@ fn trusted_stations_change_while_the_node_runs() {
     );
     let c = Config::load(&trust_file).unwrap();
     assert_eq!((c.delivery.internet_cost, c.delivery.retry_attempts), (0.5, 7));
+    assert_eq!(c.station.locator.as_deref(), Some("KO02md"));
     let (status, _) = http(
         hub.http_addr,
         "PATCH",
@@ -686,4 +708,84 @@ fn trusted_stations_change_while_the_node_runs() {
     a.stop().unwrap();
     hub.stop().unwrap();
     std::fs::remove_file(&trust_file).unwrap();
+}
+
+/// Radio settings change without a restart: the node opens the link the new
+/// settings describe, and mail waiting for the radio goes out on it.
+#[test]
+fn radio_settings_change_while_the_node_runs() {
+    let (here, there) = (fake_tnc(0), fake_tnc(0));
+    let (alice, bob) = keys();
+    let (a_db, b_db) = (Tmp::new("radio-a"), Tmp::new("radio-b"));
+    let setup = |key, me, peer, tnc, store| Setup {
+        key,
+        me,
+        peer,
+        also: &[],
+        tnc: Some(tnc),
+        internet: None,
+        store,
+        retry: QUICK,
+        beacon_every: None,
+        trust_file: None,
+    };
+    // Bob listens on the other channel; nothing Alice sends reaches him.
+    let b = start(setup(&bob, "SO5KM-1", &alice, there.addr, &b_db));
+    let a = start(setup(&alice, "SA0KAM", &bob, here.addr, &a_db));
+    let up_on = |n: &NodeHandle, addr: SocketAddr| {
+        let st = get(n.http_addr, "/api/status");
+        (st["radio"] == true
+            && st["radio_via"]
+                .as_str()
+                .is_some_and(|v| v.contains(&addr.to_string())))
+        .then_some(())
+    };
+    wait_for(Duration::from_secs(10), "the radio up", || up_on(&a, here.addr));
+    send(
+        a.http_addr,
+        json!({"to": "SO5KM-1", "text": "over the other channel"}),
+    );
+    thread::sleep(Duration::from_secs(2));
+    assert!(inbox(b.http_addr).is_empty());
+
+    let (status, body) = http(
+        a.http_addr,
+        "PATCH",
+        "/api/settings",
+        Some(&json!({"radio": {"kiss": there.addr.to_string()}})),
+        Some(TOKEN),
+    );
+    assert_eq!(status, 200, "{body}");
+    let now: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(now["live"]["radio"]["kiss"], there.addr.to_string());
+    assert_eq!(now["radio_applies_now"], true);
+    wait_for(Duration::from_secs(10), "the radio on the new TNC", || {
+        up_on(&a, there.addr)
+    });
+    delivered(a.http_addr, 1, "delivery on the new channel");
+    assert_eq!(inbox(b.http_addr)[0]["text"], "over the other channel");
+
+    // Settings that cannot work are refused and change nothing.
+    let (status, _) = http(
+        a.http_addr,
+        "PATCH",
+        "/api/settings",
+        Some(&json!({"radio": {"kiss": "serial:"}})),
+        Some(TOKEN),
+    );
+    assert_eq!(status, 400);
+    // Switched off: the status says no radio.
+    let (status, _) = http(
+        a.http_addr,
+        "PATCH",
+        "/api/settings",
+        Some(&json!({"radio": {"enabled": false}})),
+        Some(TOKEN),
+    );
+    assert_eq!(status, 200);
+    wait_for(Duration::from_secs(10), "the radio off", || {
+        get(a.http_addr, "/api/status")["radio"].is_null().then_some(())
+    });
+    a.stop().unwrap();
+    b.stop().unwrap();
 }

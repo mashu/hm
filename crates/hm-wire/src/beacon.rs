@@ -1,13 +1,13 @@
 use alloc::vec::Vec;
 
-use crate::{Callsign, WireError};
+use crate::{Callsign, Locator, WireError};
 
 /// Signature domain of a beacon.
 pub const BEACON_SIG_PREFIX: &[u8] = b"hm/beacon-sig/v0";
 /// Most stations one beacon lists as heard.
 pub const MAX_HEARD: usize = 16;
 /// Bytes of a beacon payload before the heard list.
-const FIXED: usize = 38;
+const FIXED: usize = 44;
 const SIG_LEN: usize = 64;
 
 /// Flag: the station holds mail for other stations (a mailbox node).
@@ -31,6 +31,8 @@ pub struct Heard {
 /// flags     u8        FLAG_MAILBOX | FLAG_RELAY | FLAG_INTERNET; other bits 0
 /// key       [u8; 32]  the station's Ed25519 key
 /// time      u32       Unix seconds when sent
+/// locator   [u8; 6]   Maidenhead locator, upper case ASCII, 4 characters
+///                     followed by two zero bytes, or all zero for none
 /// n         u8        stations heard, at most 16
 /// heard     n x (callsign [u8; 6], minutes u8)
 /// signature [u8; 64]  Ed25519 by `key` over
@@ -44,6 +46,8 @@ pub struct Beacon {
     pub flags: u8,
     pub key: [u8; 32],
     pub time: u32,
+    /// Where the station is, as precisely as it chose to say.
+    pub locator: Option<Locator>,
     pub heard: Vec<Heard>,
     pub signature: [u8; SIG_LEN],
 }
@@ -59,6 +63,7 @@ impl Beacon {
         b.push(self.flags);
         b.extend_from_slice(&self.key);
         b.extend_from_slice(&self.time.to_be_bytes());
+        b.extend_from_slice(&Locator::option_bytes(self.locator));
         b.push(self.heard.len() as u8);
         for h in &self.heard {
             b.extend_from_slice(&h.call.to_bytes());
@@ -88,7 +93,7 @@ impl Beacon {
         if p.len() < FIXED + SIG_LEN {
             return Err(WireError::TooShort);
         }
-        let n = p[37] as usize;
+        let n = p[43] as usize;
         if n > MAX_HEARD {
             return Err(WireError::OutOfRange);
         }
@@ -112,6 +117,7 @@ impl Beacon {
             flags: p[0],
             key: p[1..33].try_into().expect("32 bytes"),
             time: u32::from_be_bytes(p[33..37].try_into().expect("4 bytes")),
+            locator: Locator::from_bytes(p[37..43].try_into().expect("6 bytes"))?,
             heard,
             signature: p[len - SIG_LEN..].try_into().expect("64 bytes"),
         })
@@ -127,6 +133,7 @@ mod tests {
             flags: FLAG_MAILBOX | FLAG_INTERNET,
             key: [7; 32],
             time: 1_790_000_000,
+            locator: Some(Locator::parse("JO89ab").unwrap()),
             heard: vec![
                 Heard {
                     call: Callsign::parse("SO5KM-1").unwrap(),
@@ -145,10 +152,11 @@ mod tests {
     fn roundtrip_and_layout() {
         let b = sample();
         let v = b.to_vec().unwrap();
-        assert_eq!(v.len(), 38 + 14 + 64);
+        assert_eq!(v.len(), 44 + 14 + 64);
         assert_eq!(v[0], 0x05);
         assert_eq!(&v[33..37], &1_790_000_000u32.to_be_bytes());
-        assert_eq!(v[37], 2);
+        assert_eq!(&v[37..43], b"JO89AB");
+        assert_eq!(v[43], 2);
         assert_eq!(Beacon::decode(&v).unwrap(), b);
         let s = b.signed_bytes(Callsign::parse("SA0KAM").unwrap()).unwrap();
         assert_eq!(&s[..16], BEACON_SIG_PREFIX);
@@ -164,13 +172,21 @@ mod tests {
         long.push(0);
         assert_eq!(Beacon::decode(&long), Err(WireError::Trailing));
         let mut many = v.clone();
-        many[37] = 17;
+        many[43] = 17;
         assert_eq!(Beacon::decode(&many), Err(WireError::OutOfRange));
         let mut too_many = sample();
         too_many.heard = vec![too_many.heard[0]; 17];
         assert_eq!(too_many.to_vec(), Err(WireError::OutOfRange));
-        let mut zero_call = v;
-        zero_call[38..44].fill(0);
+        let mut zero_call = v.clone();
+        zero_call[44..50].fill(0);
         assert!(Beacon::decode(&zero_call).is_err());
+        let mut bad_grid = v.clone();
+        bad_grid[37] = b'Z';
+        assert_eq!(Beacon::decode(&bad_grid), Err(WireError::BadLocator));
+        let mut none = sample();
+        none.locator = None;
+        let w = none.to_vec().unwrap();
+        assert_eq!(&w[37..43], &[0; 6]);
+        assert_eq!(Beacon::decode(&w).unwrap(), none);
     }
 }

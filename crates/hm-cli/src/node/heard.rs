@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use hm_wire::{Callsign, Heard, FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY, MAX_HEARD};
+use hm_wire::{Callsign, Heard, Locator, FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY, MAX_HEARD};
 use hm_xfer::beacon::HeardBeacon;
 
 use crate::files::Trust;
@@ -48,6 +48,8 @@ pub struct BeaconSeen {
     pub clock_offset: i64,
     /// Stations it says it has heard.
     pub heard: Vec<Heard>,
+    /// Where it says it is.
+    pub locator: Option<Locator>,
 }
 
 impl BeaconSeen {
@@ -108,6 +110,7 @@ impl HeardTable {
             flags: b.beacon.flags,
             clock_offset: b.beacon.time as i64 - now as i64,
             heard: b.beacon.heard.clone(),
+            locator: b.beacon.locator,
         });
         key
     }
@@ -138,6 +141,20 @@ impl HeardTable {
     }
 }
 
+/// Great-circle distance in km and initial bearing in degrees (0 = north)
+/// from the centre of one grid square to the centre of another.
+pub fn distance(from: Locator, to: Locator) -> (f64, f64) {
+    const EARTH_KM: f64 = 6371.0;
+    let ((la1, lo1), (la2, lo2)) = (from.centre(), to.centre());
+    let (p1, p2) = (la1.to_radians(), la2.to_radians());
+    let dl = (lo2 - lo1).to_radians();
+    let a = ((p2 - p1) / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dl / 2.0).sin().powi(2);
+    let km = 2.0 * EARTH_KM * a.sqrt().min(1.0).asin();
+    let y = dl.sin() * p2.cos();
+    let x = p1.cos() * p2.sin() - p1.sin() * p2.cos() * dl.cos();
+    (km, (y.atan2(x).to_degrees() + 360.0) % 360.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +171,7 @@ mod tests {
             call(from),
             FLAG_MAILBOX,
             time,
+            Locator::parse("KO02").ok(),
             vec![],
         )
         .unwrap();
@@ -186,6 +204,7 @@ mod tests {
         let kam10 = list.iter().find(|s| s.call == call("SA0KAM-10")).unwrap();
         let seen = kam10.beacon.as_ref().unwrap();
         assert_eq!((seen.clock_offset, seen.offers()), (5, vec!["mailbox"]));
+        assert_eq!(seen.locator.unwrap().to_string(), "KO02");
     }
 
     #[test]
@@ -205,5 +224,15 @@ mod tests {
         assert_eq!(t.for_beacon(3700).len(), MAX_HEARD);
         t.expire(10 + FORGET_AFTER);
         assert!(t.list().iter().all(|s| s.call != call("SP5AAA")));
+    }
+
+    #[test]
+    fn distance_and_bearing_between_squares() {
+        let l = |s| Locator::parse(s).unwrap();
+        // Stockholm to Warsaw: about 810 km, south-south-east.
+        let (km, deg) = distance(l("JO89xi"), l("KO02md"));
+        assert!((km - 810.0).abs() < 25.0, "{km}");
+        assert!((150.0..170.0).contains(&deg), "{deg}");
+        assert_eq!(distance(l("JO89"), l("JO89")).0, 0.0);
     }
 }

@@ -22,11 +22,12 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use hm_bundle::{Address, Opened, Precedence};
 use hm_store::{Direction, Record, Store};
-use hm_wire::{Callsign, ObjectId};
+use hm_wire::{Callsign, Locator, ObjectId};
 use serde::{Deserialize, Serialize};
 
 use super::live::{Change, LiveConfig};
 use super::{NodeConfig, Status};
+use crate::config::RadioSettings;
 use crate::files::Trust;
 use crate::station::{build_bundle, unix_now};
 
@@ -110,6 +111,8 @@ struct StatusView {
     call: String,
     public_key: String,
     trust_line: String,
+    /// Our grid locator, as sent in beacons.
+    locator: Option<String>,
     /// `null` when the node has no radio; otherwise whether the TNC is connected.
     radio: Option<bool>,
     /// How the radio is reached, when the node has one.
@@ -136,16 +139,24 @@ struct HeardView {
     clock_offset: Option<i64>,
     /// Stations its beacon says it has heard.
     hears: Option<Vec<String>>,
+    /// The grid locator its beacon gives.
+    locator: Option<String>,
+    /// From our locator to its, centre to centre, when both are known.
+    distance_km: Option<f64>,
+    /// Initial great-circle bearing from us, degrees from north.
+    bearing: Option<f64>,
 }
 
 async fn status(State(s): State<AppState>) -> Json<StatusView> {
     let st = s.status.lock().expect("lock").clone();
+    let mine = s.live.get().locator;
     Json(StatusView {
+        locator: mine.map(|l| l.to_string()),
         call: s.cfg.me.to_string(),
         public_key: crate::hex::encode(&s.cfg.key.identity.public().0),
         trust_line: s.cfg.key.trust_line(),
         radio: st.radio,
-        radio_via: s.cfg.radio.as_ref().map(|r| r.describe()),
+        radio_via: st.radio_via.clone(),
         internet_listen: st.internet_listen.map(|a| a.to_string()),
         internet_peers: st.internet_peers.iter().map(|c| c.to_string()).collect(),
         estimates: st
@@ -163,7 +174,12 @@ async fn status(State(s): State<AppState>) -> Json<StatusView> {
                 .iter()
                 .map(|h| {
                     let b = h.beacon.as_ref();
+                    let theirs = b.and_then(|b| b.locator);
+                    let far = mine.zip(theirs).map(|(a, t)| super::heard::distance(a, t));
                     HeardView {
+                        locator: theirs.map(|l| l.to_string()),
+                        distance_km: far.map(|(km, _)| km.round()),
+                        bearing: far.map(|(_, deg)| deg.round()),
                         station: h.call.to_string(),
                         ago: now.saturating_sub(h.last),
                         key: b.map(|b| b.key.as_str()),
@@ -414,6 +430,66 @@ struct PeerView {
     address: String,
 }
 
+/// `[radio]`; `PATCH` takes any of the fields. A change opens a new radio link.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RadioView {
+    enabled: Option<bool>,
+    kiss: Option<String>,
+    tnc_port: Option<u8>,
+    /// The built-in modem's sound card; "" for a KISS TNC instead.
+    audio: Option<String>,
+    ptt: Option<String>,
+    persist: Option<u8>,
+    slottime_ms: Option<u64>,
+    bitrate: Option<u32>,
+    txdelay_ms: Option<u64>,
+    guard_ms: Option<u64>,
+}
+
+impl RadioView {
+    fn of(r: &RadioSettings) -> RadioView {
+        RadioView {
+            enabled: Some(r.enabled),
+            kiss: Some(r.kiss.clone()),
+            tnc_port: Some(r.tnc_port),
+            audio: Some(r.audio.clone().unwrap_or_default()),
+            ptt: Some(r.ptt.clone()),
+            persist: Some(r.persist),
+            slottime_ms: Some(r.slottime_ms),
+            bitrate: Some(r.bitrate),
+            txdelay_ms: Some(r.txdelay_ms),
+            guard_ms: Some(r.guard_ms),
+        }
+    }
+
+    /// `r` with the fields given here changed.
+    fn apply(self, r: &RadioSettings) -> RadioSettings {
+        let mut r = r.clone();
+        let audio = self
+            .audio
+            .map(|a| Some(a.trim().to_string()).filter(|a| !a.is_empty()));
+        macro_rules! take {
+            ($($f:ident),*) => { $(if let Some(v) = self.$f { r.$f = v; })* };
+        }
+        take!(
+            enabled,
+            kiss,
+            tnc_port,
+            ptt,
+            persist,
+            slottime_ms,
+            bitrate,
+            txdelay_ms,
+            guard_ms
+        );
+        if let Some(a) = audio {
+            r.audio = a;
+        }
+        r
+    }
+}
+
 /// Settings that apply at once; `PATCH` takes any of them.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -425,12 +501,14 @@ struct LiveView {
     retry_max_secs: Option<u64>,
     retry_attempts: Option<u32>,
     peers: Option<Vec<PeerView>>,
+    /// A grid locator; "" removes it.
+    locator: Option<String>,
+    radio: Option<RadioView>,
 }
 
 /// Settings read at start-up; changing them in the file takes a restart.
 #[derive(Serialize)]
 struct FixedView {
-    radio: Option<String>,
     internet_listen: Option<String>,
     http: String,
     store: String,
@@ -440,6 +518,12 @@ struct FixedView {
 struct SettingsView {
     file: Option<String>,
     live: LiveView,
+    /// Whether `[radio]` changes open a new link at once (otherwise they are
+    /// saved and take a restart).
+    radio_applies_now: bool,
+    /// Settings the command line sets for this run; the file's values for
+    /// these are saved but not used until the node runs without them.
+    overridden: Vec<String>,
     restart_to_change: FixedView,
 }
 
@@ -463,9 +547,12 @@ fn settings_view(s: &AppState) -> SettingsView {
                     })
                     .collect(),
             ),
+            locator: Some(l.locator.map(|g| g.to_string()).unwrap_or_default()),
+            radio: Some(RadioView::of(&l.radio)),
         },
+        radio_applies_now: s.cfg.radio_builder.is_some(),
+        overridden: s.cfg.overridden.clone(),
         restart_to_change: FixedView {
-            radio: s.cfg.radio.as_ref().map(|r| r.describe()),
             internet_listen: s
                 .status
                 .lock()
@@ -502,8 +589,18 @@ async fn change_settings(
                 .collect::<Result<Vec<_>, _>>()?,
         ),
     };
+    let locator = match req.locator.as_deref().map(str::trim) {
+        None => None,
+        Some("") => Some(None),
+        Some(g) => Some(Some(
+            Locator::parse(g).map_err(|e| bad(format!("locator {g:?}: {e}")))?,
+        )),
+    };
+    let radio = req.radio.map(|r| r.apply(&s.live.get().radio));
     s.live
         .change(Change {
+            radio,
+            locator,
             beacon_minutes: req.beacon_minutes,
             radio_cost: req.radio_cost,
             internet_cost: req.internet_cost,
