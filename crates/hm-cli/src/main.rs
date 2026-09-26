@@ -32,7 +32,8 @@ struct Cli {
 enum Cmd {
     /// Create a station key file.
     Keygen {
-        /// Your callsign (any SSID is dropped; all SSIDs share one key).
+        /// Your callsign. With an SSID (SA0KAM-2) the key is for that station only;
+        /// without one it can run as any SSID chosen with `--ssid`.
         #[arg(long)]
         call: String,
         #[arg(long, default_value = "station.key")]
@@ -116,7 +117,7 @@ struct StationArgs {
     /// Station key file, from `hm keygen`.
     #[arg(long, default_value = "station.key")]
     key: PathBuf,
-    /// SSID to operate as (0-15); the key file holds the base call.
+    /// SSID to operate as (0-15), when the key file has none.
     #[arg(long, default_value_t = 0)]
     ssid: u8,
     /// KISS TNC: a TCP server such as Direwolf's KISSPORT (`HOST:PORT`), or a
@@ -185,6 +186,11 @@ impl StationArgs {
         let key = KeyFile::load(&self.key).map_err(|e| format!("{}: {e}", self.key.display()))?;
         let me = if self.ssid == 0 {
             key.call
+        } else if key.call != key.call.base() {
+            return Err(format!(
+                "the key file is for {} only; leave out --ssid, or make a key for another SSID",
+                key.call
+            ));
         } else {
             if self.ssid > 15 {
                 return Err("SSID must be 0-15".into());
@@ -274,7 +280,7 @@ fn send(
             let check = match receipt {
                 Receipt::Verified => "receipt verified".to_string(),
                 Receipt::Unverified => {
-                    format!("receipt NOT verified: no key for {} in the trust file", to.base())
+                    format!("receipt NOT verified: no key for {to} in the trust file")
                 }
             };
             println!(

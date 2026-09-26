@@ -9,8 +9,14 @@
 //!
 //! Trust file, one station per line, as printed by `hm whoami`:
 //! ```text
-//! SO5KM 8a1e...   (64 hex digits of the Ed25519 public key)
+//! SO5KM-1 8a1e...   (64 hex digits of the Ed25519 public key)
+//! SP5AAA  41c7...   (no SSID: this key speaks for every SSID of SP5AAA)
 //! ```
+//!
+//! Every SSID is a station of its own and may have its own key: SA0KAM-1 and
+//! SA0KAM-2 can be two nodes. A line with an SSID names exactly that station;
+//! a line without one covers all SSIDs of the callsign that have no line of
+//! their own.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -26,7 +32,9 @@ fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-/// A station's callsign (base call, no SSID) and private key.
+/// A station's callsign and private key. A key file without an SSID lets the
+/// station choose one when it starts (`--ssid`); one with an SSID is that
+/// station only.
 pub struct KeyFile {
     pub call: Callsign,
     pub identity: Identity,
@@ -38,7 +46,7 @@ impl KeyFile {
         let mut secret = [0u8; 32];
         getrandom::fill(&mut secret).map_err(|e| io::Error::other(format!("no system randomness: {e}")))?;
         Ok(KeyFile {
-            call: call.base(),
+            call,
             identity: Identity::from_secret(secret),
         })
     }
@@ -71,7 +79,7 @@ impl KeyFile {
         let call = call.ok_or_else(|| invalid("key file: missing `call`"))?;
         let secret = secret.ok_or_else(|| invalid("key file: missing `secret`"))?;
         Ok(KeyFile {
-            call: call.base(),
+            call,
             identity: Identity::from_secret(secret),
         })
     }
@@ -118,7 +126,7 @@ impl Trust {
             let call =
                 Callsign::parse(call).map_err(|e| invalid(format!("trust file line {}: {e}", n + 1)))?;
             let key = hex::decode_32(key).map_err(|e| invalid(format!("trust file line {}: {e}", n + 1)))?;
-            t.keys.insert(call.base(), PublicKey(key));
+            t.keys.insert(call, PublicKey(key));
         }
         Ok(t)
     }
@@ -127,8 +135,10 @@ impl Trust {
         Trust::parse(&fs::read_to_string(path)?)
     }
 
+    /// Trust `key` for `call`: that station only when `call` has an SSID,
+    /// every SSID without a line of its own when it has none.
     pub fn insert(&mut self, call: Callsign, key: PublicKey) {
-        self.keys.insert(call.base(), key);
+        self.keys.insert(call, key);
     }
 
     /// Every trusted station and its key.
@@ -136,9 +146,12 @@ impl Trust {
         self.keys.iter().map(|(c, k)| (*c, *k))
     }
 
-    /// The key for a station, ignoring any SSID.
+    /// The key for a station: its own line, else the line for its base callsign.
     pub fn key_for(&self, call: Callsign) -> Option<PublicKey> {
-        self.keys.get(&call.base()).copied()
+        self.keys
+            .get(&call)
+            .or_else(|| self.keys.get(&call.base()))
+            .copied()
     }
 }
 
@@ -147,11 +160,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn key_file_roundtrip_strips_ssid() {
+    fn key_file_roundtrip_keeps_the_ssid() {
         let k = KeyFile::generate(Callsign::parse("SA0KAM-7").unwrap()).unwrap();
-        assert_eq!(k.call.to_string(), "SA0KAM");
+        assert_eq!(k.call.to_string(), "SA0KAM-7");
+        assert!(k.trust_line().starts_with("SA0KAM-7 "));
         let back = KeyFile::parse(&k.to_text()).unwrap();
-        assert_eq!(back.identity.public(), k.identity.public());
+        assert_eq!((back.call, back.identity.public()), (k.call, k.identity.public()));
         assert!(KeyFile::parse("call SA0KAM\n").is_err());
         assert!(KeyFile::parse("secret 00\ncall SA0KAM").is_err());
     }
@@ -176,14 +190,25 @@ mod tests {
     }
 
     #[test]
-    fn trust_file_lookup_ignores_ssid() {
-        let k = KeyFile::generate(Callsign::parse("SO5KM").unwrap()).unwrap();
-        let t = Trust::parse(&format!("# friends\n\n{}\n", k.trust_line())).unwrap();
-        assert_eq!(
-            t.key_for(Callsign::parse("SO5KM-1").unwrap()),
-            Some(k.identity.public())
-        );
-        assert_eq!(t.key_for(Callsign::parse("SA0KAM").unwrap()), None);
+    fn trust_lines_name_one_station_or_every_ssid() {
+        let call = |s: &str| Callsign::parse(s).unwrap();
+        let base = KeyFile::generate(call("SO5KM")).unwrap();
+        let one = KeyFile::generate(call("SO5KM-2")).unwrap();
+        let t = Trust::parse(&format!(
+            "# friends\n\n{}\n{}\n",
+            base.trust_line(),
+            one.trust_line()
+        ))
+        .unwrap();
+        // A line without an SSID covers every SSID with no line of its own...
+        assert_eq!(t.key_for(call("SO5KM")), Some(base.identity.public()));
+        assert_eq!(t.key_for(call("SO5KM-1")), Some(base.identity.public()));
+        // ...and a line with one names exactly that station.
+        assert_eq!(t.key_for(call("SO5KM-2")), Some(one.identity.public()));
+        assert_eq!(t.key_for(call("SA0KAM")), None);
+        let only_two = Trust::parse(&one.trust_line()).unwrap();
+        assert_eq!(only_two.key_for(call("SO5KM-1")), None);
+        assert_eq!(only_two.key_for(call("SO5KM")), None);
         assert!(Trust::parse("SO5KM").is_err());
         assert!(Trust::parse("SO5KM 1234").is_err());
     }

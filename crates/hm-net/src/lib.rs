@@ -252,7 +252,7 @@ pub struct Net {
     identity: Identity,
     /// Trusted keys by base callsign.
     keys: BTreeMap<Callsign, PublicKey>,
-    /// Key -> base callsign, to name authenticated peers.
+    /// Key -> callsign as the trust file lists it, to name authenticated peers.
     names: BTreeMap<[u8; 32], Callsign>,
     conns: Mutex<BTreeMap<Callsign, Connection>>,
     accept: Accept,
@@ -263,7 +263,7 @@ impl Net {
     /// Must be called inside a Tokio runtime.
     pub fn start(cfg: NetConfig, accept: Accept) -> io::Result<Arc<Net>> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let keys: BTreeMap<Callsign, PublicKey> = cfg.trust.iter().map(|(c, k)| (c.base(), *k)).collect();
+        let keys: BTreeMap<Callsign, PublicKey> = cfg.trust.iter().copied().collect();
         let names: BTreeMap<[u8; 32], Callsign> = keys.iter().map(|(c, k)| (k.0, *c)).collect();
         let verifier = Arc::new(TrustVerifier {
             keys: names.clone(),
@@ -319,13 +319,18 @@ impl Net {
         self.endpoint.local_addr()
     }
 
-    /// Whether a live connection to `peer` (any SSID) exists.
+    /// The live connection to `peer`: named by its own callsign, or by its base
+    /// callsign when the trust file lists the key without an SSID.
+    fn conn_for(&self, peer: Callsign) -> Option<Connection> {
+        let conns = self.conns.lock().expect("lock");
+        [peer, peer.base()]
+            .iter()
+            .find_map(|c| conns.get(c).filter(|c| c.close_reason().is_none()).cloned())
+    }
+
+    /// Whether a live connection to `peer` exists.
     pub fn is_connected(&self, peer: Callsign) -> bool {
-        self.conns
-            .lock()
-            .expect("lock")
-            .get(&peer.base())
-            .is_some_and(|c| c.close_reason().is_none())
+        self.conn_for(peer).is_some()
     }
 
     pub fn connected(&self) -> Vec<Callsign> {
@@ -339,15 +344,12 @@ impl Net {
 
     /// Send `object` to `to` and wait for its verified receipt.
     pub async fn deliver(&self, to: Callsign, object: &[u8]) -> Result<(), NetError> {
-        let to = to.base();
-        let conn = self
-            .conns
-            .lock()
-            .expect("lock")
+        let conn = self.conn_for(to).ok_or(NetError::NotConnected)?;
+        let key = *self
+            .keys
             .get(&to)
-            .cloned()
+            .or_else(|| self.keys.get(&to.base()))
             .ok_or(NetError::NotConnected)?;
-        let key = *self.keys.get(&to).ok_or(NetError::NotConnected)?;
         let exchange = async {
             let (mut send, mut recv) = conn.open_bi().await.map_err(|e| NetError::Io(e.to_string()))?;
             let mut msg = Vec::with_capacity(8 + object.len());
@@ -365,7 +367,7 @@ impl Net {
             match reply.split_first() {
                 Some((0, sig)) if sig.len() == 64 => {
                     let sig: [u8; 64] = sig.try_into().expect("length checked");
-                    let statement = receipt_statement(to, self.me, 0, &object_id(object));
+                    let statement = receipt_statement(to.base(), self.me, 0, &object_id(object));
                     key.verify(&statement, &sig).map_err(|_| NetError::BadReceipt)
                 }
                 Some((1, rest)) if rest.len() >= 2 => {
@@ -428,7 +430,8 @@ async fn dial_loop(net: Arc<Net>, peers: Vec<(Callsign, SocketAddr)>) {
             }
             if let Ok(connecting) = net.endpoint.connect(*addr, "hm-net") {
                 if let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(5), connecting).await {
-                    if net.peer_of(&conn).map(|c| c.base()) != Some(call.base()) {
+                    let named = net.peer_of(&conn);
+                    if named != Some(*call) && named != Some(call.base()) {
                         conn.close(1u32.into(), b"unexpected station");
                     } else if confirmed(&conn).await {
                         net.register(conn);
@@ -475,7 +478,7 @@ async fn serve_connection(net: Arc<Net>, peer: Callsign, conn: Connection) {
                         .unwrap_or_else(|_| Verdict::Rejected("internal error".into()));
                     match verdict {
                         Verdict::Stored | Verdict::Duplicate => {
-                            let sig = net.identity.sign(&receipt_statement(net.me, peer, 0, &id));
+                            let sig = net.identity.sign(&receipt_statement(net.me, peer.base(), 0, &id));
                             let mut r = vec![0u8];
                             r.extend_from_slice(&sig);
                             r

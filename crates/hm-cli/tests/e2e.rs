@@ -253,3 +253,37 @@ fn hm_binary_end_to_end() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_key_for_one_ssid_is_that_station_only() {
+    let hm = env!("CARGO_BIN_EXE_hm");
+    let dir = std::env::temp_dir().join(format!("hm-ssid-key-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = dir.join("server.key");
+    let run = |args: &[&str]| Command::new(hm).args(args).output().unwrap();
+    assert!(
+        run(&["keygen", "--call", "SA0KAM-2", "--out", key.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let whoami = String::from_utf8(run(&["whoami", "--key", key.to_str().unwrap()]).stdout).unwrap();
+    assert!(whoami.starts_with("SA0KAM-2 "), "{whoami}");
+    // Running it as another SSID is refused before anything goes on air.
+    let out = run(&[
+        "send",
+        "--key",
+        key.to_str().unwrap(),
+        "--ssid",
+        "1",
+        "--to",
+        "SO5KM",
+        "--text",
+        "x",
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("is for SA0KAM-2 only"),
+        "{err}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

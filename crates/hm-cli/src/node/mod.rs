@@ -169,9 +169,24 @@ enum RadioEvt {
     Heard(Vec<heard::Station>),
 }
 
+/// Whether mail to station `to` is ours. Every SSID is a station of its own,
+/// so SA0KAM-1 does not take mail for SA0KAM-2. A node whose key file names
+/// the bare callsign (and picked its SSID with `--ssid`) also takes mail for
+/// the bare callsign.
+pub fn addressed_to_us(to: Callsign, me: Callsign, key_call: Callsign) -> bool {
+    to == me || (to == key_call && key_call == key_call.base())
+}
+
 /// The one gate for everything that arrives: a bundle, addressed to us, not
 /// failing its signature check, stored once.
-fn accept(store: &Store, trust: &Trust, me: Callsign, via: Callsign, object: &[u8]) -> Verdict {
+fn accept(
+    store: &Store,
+    trust: &Trust,
+    me: Callsign,
+    key_call: Callsign,
+    via: Callsign,
+    object: &[u8],
+) -> Verdict {
     let m = open_message(via, object, trust);
     let Some(bundle) = &m.bundle else {
         return Verdict::Rejected(format!("not a bundle: {}", m.error.unwrap_or_default()));
@@ -179,9 +194,9 @@ fn accept(store: &Store, trust: &Trust, me: Callsign, via: Callsign, object: &[u
     let ours = bundle
         .to
         .iter()
-        .any(|a| matches!(a, Address::Station(c) if c.base() == me.base()));
+        .any(|a| matches!(a, Address::Station(c) if addressed_to_us(*c, me, key_call)));
     if !ours {
-        return Verdict::Rejected(format!("not addressed to {}", me.base()));
+        return Verdict::Rejected(format!("not addressed to {me}"));
     }
     if m.verification == Verification::BadSignature {
         log(format!(
@@ -248,9 +263,10 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                 let net = match &cfg.internet {
                     None => None,
                     Some(ic) => {
-                        let (store, trust, me) = (store.clone(), cfg.trust.clone(), cfg.me);
+                        let (store, trust, me, key_call) =
+                            (store.clone(), cfg.trust.clone(), cfg.me, cfg.key.call);
                         let gate: hm_net::Accept =
-                            Arc::new(move |via, obj| accept(&store, &trust, me, via, &obj));
+                            Arc::new(move |via, obj| accept(&store, &trust, me, key_call, via, &obj));
                         let nc = NetConfig {
                             me: cfg.me,
                             secret: cfg.key.identity.secret(),
@@ -406,7 +422,7 @@ async fn coordinator(
                     }
                 }
                 RadioEvt::Received { from, object } => {
-                    accept(store, &cfg.trust, cfg.me, from, &object);
+                    accept(store, &cfg.trust, cfg.me, cfg.key.call, from, &object);
                 }
                 RadioEvt::Heard(list) => {
                     status.lock().expect("lock").heard = list;
@@ -656,12 +672,36 @@ fn hear(table: &mut heard::HeardTable, trust: &Trust, me: Callsign, frame: &[u8]
             if table.beacon(t, &b, trust) == heard::KeyCheck::Mismatch {
                 log(format!(
                     "beacon from {} carries a different key than the trust file lists for {}",
-                    b.from,
-                    b.from.base()
+                    b.from, b.from
                 ));
             }
             true
         }
         None => new,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::addressed_to_us;
+    use hm_wire::Callsign;
+
+    fn call(s: &str) -> Callsign {
+        Callsign::parse(s).unwrap()
+    }
+
+    #[test]
+    fn every_ssid_is_a_station_of_its_own() {
+        // A node with its own key for SA0KAM-1 takes mail for SA0KAM-1 only.
+        let (me, key) = (call("SA0KAM-1"), call("SA0KAM-1"));
+        assert!(addressed_to_us(call("SA0KAM-1"), me, key));
+        assert!(!addressed_to_us(call("SA0KAM-2"), me, key));
+        assert!(!addressed_to_us(call("SA0KAM"), me, key));
+        // A node on a key for the bare callsign, run as -1 with --ssid, also
+        // takes mail for the bare callsign, but still not for another SSID.
+        let key = call("SA0KAM");
+        assert!(addressed_to_us(call("SA0KAM-1"), me, key));
+        assert!(addressed_to_us(call("SA0KAM"), me, key));
+        assert!(!addressed_to_us(call("SA0KAM-2"), me, key));
     }
 }

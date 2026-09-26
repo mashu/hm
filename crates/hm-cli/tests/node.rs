@@ -113,6 +113,8 @@ struct Setup<'a> {
     key: &'a KeyFile,
     me: &'a str,
     peer: &'a KeyFile,
+    /// More stations to trust, besides `peer`.
+    also: &'a [&'a KeyFile],
     tnc: Option<SocketAddr>,
     internet: Option<InternetConfig>,
     store: &'a Tmp,
@@ -123,6 +125,9 @@ struct Setup<'a> {
 fn start(s: Setup) -> NodeHandle {
     let mut trust = Trust::default();
     trust.insert(s.peer.call, s.peer.identity.public());
+    for k in s.also {
+        trust.insert(k.call, k.identity.public());
+    }
     node::start(NodeConfig {
         key: KeyFile::parse(&s.key.to_text()).unwrap(),
         trust,
@@ -176,6 +181,7 @@ fn radio_nodes_exchange_mail_and_survive_a_restart() {
         key: &bob,
         me: "SO5KM-1",
         peer: &alice,
+        also: &[],
         tnc: Some(tnc.addr),
         internet: None,
         store: &b_db,
@@ -187,6 +193,7 @@ fn radio_nodes_exchange_mail_and_survive_a_restart() {
         key: &alice,
         me: "SA0KAM",
         peer: &bob,
+        also: &[],
         tnc: Some(tnc.addr),
         internet: None,
         store: &a_db,
@@ -260,6 +267,7 @@ fn mail_waits_while_the_receiver_is_off_air() {
         key: &alice,
         me: "SA0KAM",
         peer: &bob,
+        also: &[],
         tnc: Some(tnc.addr),
         internet: None,
         store: &a_db,
@@ -280,6 +288,7 @@ fn mail_waits_while_the_receiver_is_off_air() {
         key: &bob,
         me: "SO5KM-1",
         peer: &alice,
+        also: &[],
         tnc: Some(tnc.addr),
         internet: None,
         store: &b_db,
@@ -301,6 +310,7 @@ fn internet_only_nodes_exchange_mail_both_ways() {
         key: &bob,
         me: "SO5KM",
         peer: &alice,
+        also: &[],
         tnc: None,
         internet: Some(InternetConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -315,6 +325,7 @@ fn internet_only_nodes_exchange_mail_both_ways() {
         key: &alice,
         me: "SA0KAM",
         peer: &bob,
+        also: &[],
         tnc: None,
         internet: Some(InternetConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -351,6 +362,7 @@ fn radio_first_and_the_internet_when_radio_fails() {
         key: &alice,
         me: "SA0KAM",
         peer: &bob,
+        also: &[],
         tnc: Some(tnc.addr),
         internet: Some(InternetConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -364,6 +376,7 @@ fn radio_first_and_the_internet_when_radio_fails() {
         key: &bob,
         me: "SO5KM-1",
         peer: &alice,
+        also: &[],
         tnc: Some(tnc.addr),
         internet: Some(InternetConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -413,6 +426,7 @@ fn radio_nodes_beacon_and_list_each_other() {
         key,
         me,
         peer,
+        also: &[],
         tnc: Some(tnc.addr),
         internet: None,
         store,
@@ -436,4 +450,71 @@ fn radio_nodes_beacon_and_list_each_other() {
     }
     a.stop().unwrap();
     b.stop().unwrap();
+}
+
+/// Two stations of one operator, SA0KAM-1 and SA0KAM-2, each with its own key:
+/// mail to one reaches that one only, with a receipt from its own key.
+#[test]
+fn two_ssids_are_two_stations_with_their_own_keys() {
+    let tnc = fake_tnc(0);
+    let sender = KeyFile::generate(call("SO5KM")).unwrap();
+    let home = KeyFile::generate(call("SA0KAM-1")).unwrap();
+    let server = KeyFile::generate(call("SA0KAM-2")).unwrap();
+    let (s_db, h_db, v_db) = (Tmp::new("ssid-s"), Tmp::new("ssid-1"), Tmp::new("ssid-2"));
+    let s = start(Setup {
+        key: &sender,
+        me: "SO5KM",
+        peer: &home,
+        also: &[&server],
+        tnc: Some(tnc.addr),
+        internet: None,
+        store: &s_db,
+        retry: QUICK,
+        beacon_every: None,
+    });
+    let station = |key, me, store| {
+        start(Setup {
+            key,
+            me,
+            peer: &sender,
+            also: &[],
+            tnc: Some(tnc.addr),
+            internet: None,
+            store,
+            retry: QUICK,
+            beacon_every: None,
+        })
+    };
+    let h = station(&home, "SA0KAM-1", &h_db);
+    let v = station(&server, "SA0KAM-2", &v_db);
+
+    send(s.http_addr, json!({"to": "SA0KAM-2", "text": "for the server"}));
+    let got = wait_for(Duration::from_secs(60), "the message at SA0KAM-2", || {
+        let i = inbox(v.http_addr);
+        (i.len() == 1).then(|| i[0].clone())
+    });
+    assert_eq!(
+        (got["text"].as_str(), got["verified"].as_bool()),
+        (Some("for the server"), Some(true))
+    );
+    let sent = delivered(s.http_addr, 1, "delivery to SA0KAM-2");
+    assert_eq!(
+        sent["verified"].as_bool(),
+        Some(true),
+        "receipt from SA0KAM-2's own key"
+    );
+
+    send(s.http_addr, json!({"to": "SA0KAM-1", "text": "for home"}));
+    let got = wait_for(Duration::from_secs(60), "the message at SA0KAM-1", || {
+        let i = inbox(h.http_addr);
+        (i.len() == 1).then(|| i[0].clone())
+    });
+    assert_eq!(got["text"].as_str(), Some("for home"));
+    delivered(s.http_addr, 2, "delivery to SA0KAM-1");
+    // Each station holds only its own mail.
+    assert_eq!(inbox(v.http_addr).len(), 1);
+    assert_eq!(inbox(h.http_addr).len(), 1);
+    for n in [s, h, v] {
+        n.stop().unwrap();
+    }
 }
