@@ -5,18 +5,30 @@ use crate::WireError;
 /// Most completed-object prefixes one ACK may carry.
 pub const MAX_ACK_COMPLETED: usize = 16;
 
+/// `need` value meaning "I have symbols for this session but missed the OFFER;
+/// send it again".
+pub const NEED_OFFER: u16 = 0xFFFF;
+
+/// Bytes of the optional receipt signature at the end of an ACK.
+pub const RECEIPT_LEN: usize = 64;
+
 /// Acknowledgement payload of a [`crate::FrameType::Ack`] frame.
 ///
-/// Fixed binary layout, big-endian, 7 + 8n bytes:
+/// Binary layout, big-endian, 7 + 8n bytes, plus 64 when a receipt is present:
 ///
 /// ```text
-/// need      u16   symbols still needed for the current object (0 = done)
+/// need      u16   symbols still needed for the current object
+///                 (0 = done, 0xFFFF = send the OFFER again)
 /// snr       i8    received SNR in dB, -128 = unknown
 /// mode      u8    suggested modem mode for the peer, 255 = no suggestion
 /// credit    u16   airtime the peer may use before the next ACK, in ms
 /// n         u8    number of completed object prefixes that follow (<= 16)
 /// prefix[n] 8 B   first 8 bytes of each completed object id
+/// receipt   64 B  optional: the receiver's Ed25519 signature proving completion
 /// ```
+///
+/// The receipt is present exactly when the payload is 64 bytes longer than
+/// the prefixes require.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Ack {
     pub need: u16,
@@ -26,6 +38,7 @@ pub struct Ack {
     pub mode_hint: Option<u8>,
     pub credit_ms: u16,
     pub completed: Vec<[u8; 8]>,
+    pub receipt: Option<[u8; RECEIPT_LEN]>,
 }
 
 impl Ack {
@@ -44,11 +57,14 @@ impl Ack {
         for p in &self.completed {
             out.extend_from_slice(p);
         }
+        if let Some(r) = &self.receipt {
+            out.extend_from_slice(r);
+        }
         Ok(())
     }
 
     pub fn to_vec(&self) -> Result<Vec<u8>, WireError> {
-        let mut v = Vec::with_capacity(7 + 8 * self.completed.len());
+        let mut v = Vec::with_capacity(7 + 8 * self.completed.len() + RECEIPT_LEN);
         self.encode(&mut v)?;
         Ok(v)
     }
@@ -65,24 +81,24 @@ impl Ack {
         if b.len() < expected {
             return Err(WireError::TooShort);
         }
-        if b.len() > expected {
-            return Err(WireError::Trailing);
-        }
+        let receipt = match b.len() - expected {
+            0 => None,
+            RECEIPT_LEN => {
+                let mut r = [0u8; RECEIPT_LEN];
+                r.copy_from_slice(&b[expected..]);
+                Some(r)
+            }
+            _ => return Err(WireError::Trailing),
+        };
         let snr = b[2] as i8;
-        let completed = b[7..]
-            .chunks_exact(8)
-            .map(|c| {
-                let mut p = [0u8; 8];
-                p.copy_from_slice(c);
-                p
-            })
-            .collect();
+        let completed = b[7..expected].as_chunks::<8>().0.to_vec();
         Ok(Ack {
             need: u16::from_be_bytes([b[0], b[1]]),
             snr_db: if snr == i8::MIN { None } else { Some(snr) },
             mode_hint: if b[3] == u8::MAX { None } else { Some(b[3]) },
             credit_ms: u16::from_be_bytes([b[4], b[5]]),
             completed,
+            receipt,
         })
     }
 }
@@ -101,10 +117,24 @@ mod tests {
             mode_hint: Some(2),
             credit_ms: 1500,
             completed: vec![[1, 2, 3, 4, 5, 6, 7, 8]],
+            receipt: None,
         };
         let b = a.to_vec().unwrap();
         assert_eq!(b, [0, 3, 0xFC, 2, 0x05, 0xDC, 1, 1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(Ack::decode(&b).unwrap(), a);
+    }
+
+    #[test]
+    fn receipt_is_the_trailing_64_bytes() {
+        let a = Ack {
+            completed: vec![[9; 8]],
+            receipt: Some([0xAB; 64]),
+            ..Ack::default()
+        };
+        let b = a.to_vec().unwrap();
+        assert_eq!(b.len(), 7 + 8 + 64);
+        assert_eq!(Ack::decode(&b).unwrap(), a);
+        assert_eq!(Ack::decode(&b[..b.len() - 1]), Err(WireError::Trailing));
     }
 
     #[test]

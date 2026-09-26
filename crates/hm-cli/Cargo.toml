@@ -1,0 +1,29 @@
+[package]
+name = "hm-cli"
+description = "The hm command: keys, and sending and receiving bundles through a KISS TNC such as Direwolf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hm"
+path = "src/main.rs"
+
+[dependencies]
+hm-core = { path = "../hm-core" }
+hm-wire = { path = "../hm-wire" }
+hm-ident = { path = "../hm-ident" }
+hm-bundle = { path = "../hm-bundle" }
+hm-bearer = { path = "../hm-bearer" }
+hm-xfer = { path = "../hm-xfer" }
+hm-store = { path = "../hm-store" }
+hm-net = { path = "../hm-net" }
+hm-rig = { path = "../hm-rig" }
+hm-modem-afsk = { path = "../hm-modem-afsk" }
+axum = "0.8"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "time", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+getrandom = "0.4"

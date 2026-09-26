@@ -1,0 +1,487 @@
+//! Internet bearer: QUIC between stations.
+//!
+//! Each station authenticates with its own Ed25519 station key, carried in a
+//! self-signed certificate. Both sides verify the other's key against their
+//! trust file (mutual TLS 1.3, Ed25519 only), so only known stations connect,
+//! and every connection is bound to a callsign. There is no certificate
+//! authority and no central server.
+//!
+//! One endpoint both listens and dials; configured peers are redialled when
+//! their connection drops. A bundle travels on its own bidirectional stream:
+//!
+//! ```text
+//! sender   -> "HMD0" | length u32 BE | object bytes
+//! receiver -> 0x00 | receipt (64 B)             stored or already held
+//!           | 0x01 | reason length u16 | reason  rejected
+//! ```
+//!
+//! The receipt is the same statement as on radio (see `hm-xfer`), with base
+//! callsigns and session 0: the receiver's signature proving it holds the object.
+
+use std::collections::BTreeMap;
+use std::io;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use hm_ident::{Identity, PublicKey};
+use hm_wire::Callsign;
+use hm_xfer::{object_id, receipt_statement};
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use quinn::{Connection, Endpoint, TransportConfig};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::CryptoProvider;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
+
+/// Application protocol name negotiated in the TLS handshake.
+pub const ALPN: &[u8] = b"hm-net/0";
+const MAGIC: &[u8; 4] = b"HMD0";
+/// Largest object accepted over the internet.
+pub const MAX_OBJECT: usize = 1024 * 1024;
+const REDIAL_EVERY: Duration = Duration::from_secs(3);
+const DELIVER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What the node did with an object that arrived.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    Stored,
+    /// Already held; still acknowledged with a receipt.
+    Duplicate,
+    Rejected(String),
+}
+
+/// Called for every object that arrives: `(sender's base callsign, object)`.
+pub type Accept = Arc<dyn Fn(Callsign, Vec<u8>) -> Verdict + Send + Sync>;
+
+#[derive(Debug)]
+pub enum NetError {
+    NotConnected,
+    Io(String),
+    Rejected(String),
+    BadReceipt,
+    Timeout,
+}
+
+impl std::fmt::Display for NetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NetError::NotConnected => f.write_str("no internet connection to that station"),
+            NetError::Io(e) => write!(f, "internet link: {e}"),
+            NetError::Rejected(r) => write!(f, "rejected by the receiver: {r}"),
+            NetError::BadReceipt => f.write_str("receipt did not verify"),
+            NetError::Timeout => f.write_str("no answer in time"),
+        }
+    }
+}
+
+impl std::error::Error for NetError {}
+
+pub struct NetConfig {
+    /// Our callsign; the base call is used on this bearer.
+    pub me: Callsign,
+    /// Our station key (32 secret bytes).
+    pub secret: [u8; 32],
+    /// Stations allowed to connect, and whose receipts we check.
+    pub trust: Vec<(Callsign, PublicKey)>,
+    pub listen: SocketAddr,
+    /// Stations to keep a connection to.
+    pub dial: Vec<(Callsign, SocketAddr)>,
+}
+
+const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+const ED25519_PKCS8_PREFIX: [u8; 16] = [
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+];
+
+/// The Ed25519 public key in a certificate. The SubjectPublicKeyInfo of an
+/// Ed25519 key has one fixed DER encoding, so it can be found without a full
+/// X.509 parser.
+pub fn ed25519_key_in_cert(der: &[u8]) -> Option<[u8; 32]> {
+    let at = der
+        .windows(ED25519_SPKI_PREFIX.len())
+        .position(|w| w == ED25519_SPKI_PREFIX)?;
+    der.get(at + 12..at + 44)?.try_into().ok()
+}
+
+/// A self-signed certificate carrying the station key.
+pub fn station_certificate(
+    secret: [u8; 32],
+) -> io::Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+    let mut pkcs8 = ED25519_PKCS8_PREFIX.to_vec();
+    pkcs8.extend_from_slice(&secret);
+    let der = PrivatePkcs8KeyDer::from(pkcs8.clone());
+    let kp =
+        rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&der, &rcgen::PKCS_ED25519).map_err(io::Error::other)?;
+    let params = rcgen::CertificateParams::new(vec!["hm-net".to_string()]).map_err(io::Error::other)?;
+    let cert = params.self_signed(&kp).map_err(io::Error::other)?;
+    Ok((
+        cert.der().clone(),
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8)),
+    ))
+}
+
+/// Accepts exactly the station keys in the trust file.
+#[derive(Debug)]
+struct TrustVerifier {
+    keys: BTreeMap<[u8; 32], Callsign>,
+    provider: Arc<CryptoProvider>,
+}
+
+impl TrustVerifier {
+    fn check(&self, cert: &CertificateDer<'_>) -> Result<(), rustls::Error> {
+        let key = ed25519_key_in_cert(cert)
+            .ok_or_else(|| rustls::Error::General("not an Ed25519 station key".into()))?;
+        if self.keys.contains_key(&key) {
+            Ok(())
+        } else {
+            Err(rustls::Error::General("station key not in the trust file".into()))
+        }
+    }
+
+    fn tls13(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+}
+
+impl ServerCertVerifier for TrustVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        self.check(end_entity).map(|_| ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General("TLS 1.2 is not used".into()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.tls13(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![SignatureScheme::ED25519]
+    }
+}
+
+impl ClientCertVerifier for TrustVerifier {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        self.check(end_entity).map(|_| ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General("TLS 1.2 is not used".into()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.tls13(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![SignatureScheme::ED25519]
+    }
+}
+
+fn transport() -> Arc<TransportConfig> {
+    let mut t = TransportConfig::default();
+    t.keep_alive_interval(Some(Duration::from_secs(5)));
+    t.max_idle_timeout(Some(Duration::from_secs(20).try_into().expect("in range")));
+    Arc::new(t)
+}
+
+/// The internet bearer of one station.
+pub struct Net {
+    endpoint: Endpoint,
+    me: Callsign,
+    identity: Identity,
+    /// Trusted keys by base callsign.
+    keys: BTreeMap<Callsign, PublicKey>,
+    /// Key -> base callsign, to name authenticated peers.
+    names: BTreeMap<[u8; 32], Callsign>,
+    conns: Mutex<BTreeMap<Callsign, Connection>>,
+    accept: Accept,
+}
+
+impl Net {
+    /// Bind, start accepting connections, and keep dialling `cfg.dial`.
+    /// Must be called inside a Tokio runtime.
+    pub fn start(cfg: NetConfig, accept: Accept) -> io::Result<Arc<Net>> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let keys: BTreeMap<Callsign, PublicKey> = cfg.trust.iter().map(|(c, k)| (c.base(), *k)).collect();
+        let names: BTreeMap<[u8; 32], Callsign> = keys.iter().map(|(c, k)| (k.0, *c)).collect();
+        let verifier = Arc::new(TrustVerifier {
+            keys: names.clone(),
+            provider: provider.clone(),
+        });
+        let (cert, key) = station_certificate(cfg.secret)?;
+        let tls13 = &[&rustls::version::TLS13];
+
+        let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(tls13)
+            .map_err(io::Error::other)?
+            .with_client_cert_verifier(verifier.clone())
+            .with_single_cert(vec![cert.clone()], key.clone_key())
+            .map_err(io::Error::other)?;
+        server.alpn_protocols = vec![ALPN.to_vec()];
+        let mut client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(tls13)
+            .map_err(io::Error::other)?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_client_auth_cert(vec![cert], key)
+            .map_err(io::Error::other)?;
+        client.alpn_protocols = vec![ALPN.to_vec()];
+
+        let mut server = quinn::ServerConfig::with_crypto(Arc::new(
+            QuicServerConfig::try_from(server).map_err(io::Error::other)?,
+        ));
+        server.transport_config(transport());
+        let mut client = quinn::ClientConfig::new(Arc::new(
+            QuicClientConfig::try_from(client).map_err(io::Error::other)?,
+        ));
+        client.transport_config(transport());
+        let mut endpoint = Endpoint::server(server, cfg.listen)?;
+        endpoint.set_default_client_config(client);
+
+        let net = Arc::new(Net {
+            endpoint,
+            me: cfg.me.base(),
+            identity: Identity::from_secret(cfg.secret),
+            keys,
+            names,
+            conns: Mutex::new(BTreeMap::new()),
+            accept,
+        });
+        tokio::spawn(accept_loop(net.clone()));
+        if !cfg.dial.is_empty() {
+            tokio::spawn(dial_loop(net.clone(), cfg.dial));
+        }
+        Ok(net)
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.endpoint.local_addr()
+    }
+
+    /// Whether a live connection to `peer` (any SSID) exists.
+    pub fn is_connected(&self, peer: Callsign) -> bool {
+        self.conns
+            .lock()
+            .expect("lock")
+            .get(&peer.base())
+            .is_some_and(|c| c.close_reason().is_none())
+    }
+
+    pub fn connected(&self) -> Vec<Callsign> {
+        let conns = self.conns.lock().expect("lock");
+        conns
+            .iter()
+            .filter(|(_, c)| c.close_reason().is_none())
+            .map(|(k, _)| *k)
+            .collect()
+    }
+
+    /// Send `object` to `to` and wait for its verified receipt.
+    pub async fn deliver(&self, to: Callsign, object: &[u8]) -> Result<(), NetError> {
+        let to = to.base();
+        let conn = self
+            .conns
+            .lock()
+            .expect("lock")
+            .get(&to)
+            .cloned()
+            .ok_or(NetError::NotConnected)?;
+        let key = *self.keys.get(&to).ok_or(NetError::NotConnected)?;
+        let exchange = async {
+            let (mut send, mut recv) = conn.open_bi().await.map_err(|e| NetError::Io(e.to_string()))?;
+            let mut msg = Vec::with_capacity(8 + object.len());
+            msg.extend_from_slice(MAGIC);
+            msg.extend_from_slice(&(object.len() as u32).to_be_bytes());
+            msg.extend_from_slice(object);
+            send.write_all(&msg)
+                .await
+                .map_err(|e| NetError::Io(e.to_string()))?;
+            send.finish().map_err(|e| NetError::Io(e.to_string()))?;
+            let reply = recv
+                .read_to_end(4096)
+                .await
+                .map_err(|e| NetError::Io(e.to_string()))?;
+            match reply.split_first() {
+                Some((0, sig)) if sig.len() == 64 => {
+                    let sig: [u8; 64] = sig.try_into().expect("length checked");
+                    let statement = receipt_statement(to, self.me, 0, &object_id(object));
+                    key.verify(&statement, &sig).map_err(|_| NetError::BadReceipt)
+                }
+                Some((1, rest)) if rest.len() >= 2 => {
+                    let n = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+                    let reason = String::from_utf8_lossy(rest.get(2..2 + n).unwrap_or(&[])).into_owned();
+                    Err(NetError::Rejected(reason))
+                }
+                _ => Err(NetError::Io("malformed reply".into())),
+            }
+        };
+        tokio::time::timeout(DELIVER_TIMEOUT, exchange)
+            .await
+            .map_err(|_| NetError::Timeout)?
+    }
+
+    pub fn close(&self) {
+        self.endpoint.close(0u32.into(), b"shutdown");
+    }
+
+    fn peer_of(&self, conn: &Connection) -> Option<Callsign> {
+        let certs = conn
+            .peer_identity()?
+            .downcast::<Vec<CertificateDer<'static>>>()
+            .ok()?;
+        let key = ed25519_key_in_cert(certs.first()?)?;
+        self.names.get(&key).copied()
+    }
+
+    fn register(self: &Arc<Self>, conn: Connection) {
+        let Some(peer) = self.peer_of(&conn) else {
+            conn.close(1u32.into(), b"unknown station");
+            return;
+        };
+        self.conns.lock().expect("lock").insert(peer, conn.clone());
+        tokio::spawn(serve_connection(self.clone(), peer, conn));
+    }
+}
+
+async fn accept_loop(net: Arc<Net>) {
+    while let Some(incoming) = net.endpoint.accept().await {
+        let net = net.clone();
+        tokio::spawn(async move {
+            if let Ok(conn) = incoming.await {
+                net.register(conn);
+            }
+        });
+    }
+}
+
+async fn dial_loop(net: Arc<Net>, peers: Vec<(Callsign, SocketAddr)>) {
+    loop {
+        for (call, addr) in &peers {
+            if net.is_connected(*call) {
+                continue;
+            }
+            if let Ok(connecting) = net.endpoint.connect(*addr, "hm-net") {
+                if let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(5), connecting).await {
+                    if net.peer_of(&conn).map(|c| c.base()) == Some(call.base()) {
+                        net.register(conn);
+                    } else {
+                        conn.close(1u32.into(), b"unexpected station");
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(REDIAL_EVERY).await;
+    }
+}
+
+async fn serve_connection(net: Arc<Net>, peer: Callsign, conn: Connection) {
+    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+        let net = net.clone();
+        tokio::spawn(async move {
+            let reply = match read_object(&mut recv).await {
+                Ok(object) => {
+                    let id = object_id(&object);
+                    let accept = net.accept.clone();
+                    let verdict = tokio::task::spawn_blocking(move || accept(peer, object))
+                        .await
+                        .unwrap_or_else(|_| Verdict::Rejected("internal error".into()));
+                    match verdict {
+                        Verdict::Stored | Verdict::Duplicate => {
+                            let sig = net.identity.sign(&receipt_statement(net.me, peer, 0, &id));
+                            let mut r = vec![0u8];
+                            r.extend_from_slice(&sig);
+                            r
+                        }
+                        Verdict::Rejected(reason) => rejection(&reason),
+                    }
+                }
+                Err(reason) => rejection(&reason),
+            };
+            let _ = send.write_all(&reply).await;
+            let _ = send.finish();
+        });
+    }
+    let mut conns = net.conns.lock().expect("lock");
+    if conns
+        .get(&peer)
+        .is_some_and(|c| c.stable_id() == conn.stable_id())
+    {
+        conns.remove(&peer);
+    }
+}
+
+fn rejection(reason: &str) -> Vec<u8> {
+    let bytes = reason.as_bytes();
+    let n = bytes.len().min(512);
+    let mut r = vec![1u8];
+    r.extend_from_slice(&(n as u16).to_be_bytes());
+    r.extend_from_slice(&bytes[..n]);
+    r
+}
+
+async fn read_object(recv: &mut quinn::RecvStream) -> Result<Vec<u8>, String> {
+    let mut head = [0u8; 8];
+    recv.read_exact(&mut head).await.map_err(|e| e.to_string())?;
+    if &head[..4] != MAGIC {
+        return Err("unknown message type".into());
+    }
+    let len = u32::from_be_bytes([head[4], head[5], head[6], head[7]]) as usize;
+    if len > MAX_OBJECT {
+        return Err(format!("object of {len} bytes exceeds {MAX_OBJECT}"));
+    }
+    let mut object = vec![0u8; len];
+    recv.read_exact(&mut object).await.map_err(|e| e.to_string())?;
+    Ok(object)
+}

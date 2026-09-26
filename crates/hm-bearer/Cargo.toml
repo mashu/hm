@@ -1,0 +1,13 @@
+[package]
+name = "hm-bearer"
+description = "Bearers: KISS framing and AX.25 UI encapsulation (sans-IO); device adapters come later"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hm-wire = { path = "../hm-wire" }
+
+[dev-dependencies]
+proptest.workspace = true

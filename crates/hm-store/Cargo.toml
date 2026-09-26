@@ -1,0 +1,12 @@
+[package]
+name = "hm-store"
+description = "Persistent station store: content-addressed objects, inbox, outbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hm-wire = { path = "../hm-wire" }
+minicbor = { workspace = true, features = ["std"] }
+redb = "4"

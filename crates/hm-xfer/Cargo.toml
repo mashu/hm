@@ -1,0 +1,17 @@
+[package]
+name = "hm-xfer"
+description = "Fountain-coded transfer of objects between two stations over half-duplex radio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hm-core = { path = "../hm-core" }
+hm-wire = { path = "../hm-wire" }
+hm-ident = { path = "../hm-ident" }
+blake3.workspace = true
+raptorq = { version = "2", default-features = false }
+
+[dev-dependencies]
+hm-sim = { path = "../hm-sim" }

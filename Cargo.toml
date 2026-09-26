@@ -5,11 +5,17 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 minicbor = { version = "2", default-features = false, features = ["alloc", "derive"] }
 ed25519-dalek = { version = "3", default-features = false }
-blake3 = { version = "1", default-features = false }
+# `no_neon` keeps aarch64 on the pure-Rust hasher. Otherwise blake3 compiles C
+# intrinsics, and the Android and iOS cross-checks have no C toolchain.
+blake3 = { version = "1", default-features = false, features = ["no_neon"] }
 proptest = "1"
+
+# The modem does DSP on every audio sample; keep it optimised in debug and test builds too.
+[profile.dev.package.hm-modem-afsk]
+opt-level = 3

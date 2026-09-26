@@ -15,21 +15,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: ALSA headers for the sound-card crate
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Fuzz targets run nightly; here we only make sure they still compile.
+      - run: cargo check --manifest-path fuzz/Cargo.toml --bins
 
   test:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        toolchain: [stable, "1.88"]
+        toolchain: [stable, "1.90"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
+      - name: ALSA headers for the sound-card crate
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
       # Includes the pinned simulator trace, so this also checks that runs are
       # identical across operating systems.
       - run: cargo test --workspace

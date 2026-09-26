@@ -1,0 +1,17 @@
+[package]
+name = "hm-rig"
+description = "Radio hardware: sound card audio (cpal), PTT (rigctld, serial RTS/DTR, CM108 GPIO, VOX), and a virtual ether for tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["soundcard", "serial"]
+soundcard = ["dep:cpal"]
+serial = ["dep:serialport"]
+
+[dependencies]
+hm-core = { path = "../hm-core" }
+cpal = { version = "0.18", optional = true }
+serialport = { version = "4", default-features = false, optional = true }

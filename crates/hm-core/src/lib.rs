@@ -63,20 +63,24 @@ pub trait Machine {
     fn next_deadline(&self) -> Option<Millis>;
 }
 
-/// Standard input of a station-level machine attached to one radio channel.
+/// Local radio interface number. A station may have several radios, for
+/// example port 0 on the VHF access channel and port 1 on an HF backbone link.
+pub type Port = u8;
+
+/// Standard input of a station-level machine.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input<C> {
-    /// A frame decoded by the bearer (after the modem's own FEC and CRC).
-    Frame(Vec<u8>),
+    /// A frame decoded by the bearer on `port` (after the modem's own FEC and CRC).
+    Frame { port: Port, data: Vec<u8> },
     /// A command from the local application or operator.
     Command(C),
 }
 
-/// Standard output of a station-level machine attached to one radio channel.
+/// Standard output of a station-level machine.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Output<E> {
-    /// Ask the bearer to transmit this frame as soon as the radio is free.
-    Transmit(Vec<u8>),
+    /// Ask the bearer on `port` to transmit this frame as soon as its radio is free.
+    Transmit { port: Port, data: Vec<u8> },
     /// An event for the local application (message delivered, link state, ...).
     Event(E),
 }

@@ -5,9 +5,12 @@
 //! Keys come from fixed secrets so the output is reproducible; Ed25519
 //! signatures are deterministic.
 
+use hm_bearer::{ax25, kiss};
 use hm_bundle::{Address, Bundle, Kind, Precedence};
+use hm_core::{DetRng, Input, Machine, Millis, Output};
 use hm_ident::{Attestation, BindingRecord, Identity, BINDING, BUNDLE};
 use hm_wire::{Ack, Callsign, Dest, FrameHeader, FrameType};
+use hm_xfer::{object_id, Command, Config, Xfer};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -43,6 +46,7 @@ fn main() {
         mode_hint: Some(2),
         credit_ms: 1500,
         completed: vec![[1, 2, 3, 4, 5, 6, 7, 8]],
+        receipt: None,
     };
     println!("{}", hex(&a.to_vec().unwrap()));
 
@@ -88,4 +92,57 @@ fn main() {
     println!("id   {}", mail.id());
     println!("wire {}", hex(&mail.to_vec()));
     assert_eq!(mail.envelope().id(&BUNDLE), mail.id());
+
+    println!("\n## AX.25 UI and KISS (the frame header vector above, from SA0KAM)");
+    let hm_frame = h.frame(b"hello").unwrap();
+    let ui = ax25::wrap(call("SA0KAM"), &hm_frame).unwrap();
+    println!("ax25 {}", hex(&ui));
+    println!("kiss {}", hex(&kiss::data_frame(0, &ui)));
+
+    println!("\n## Transfer of the chat bundle (SA0KAM -> SO5KM-1, symbol size 200, first over)");
+    let object = chat.to_vec();
+    println!("object_id {}", object_id(&object));
+    let mut cfg = Config::vhf_1200(call("SA0KAM"));
+    cfg.duty_cycle_permille = 1000;
+    let mut x = Xfer::new(cfg, Identity::from_secret([7; 32]), DetRng::from_seed(0)).unwrap();
+    let mut out = Vec::new();
+    x.handle(
+        Millis(0),
+        Input::Command(Command::Send {
+            to: call("SO5KM-1"),
+            object,
+            precedence: 0,
+        }),
+        &mut out,
+    );
+    let mut over = Vec::new();
+    for o in out {
+        if let Output::Transmit { data, .. } = o {
+            let kind = match FrameHeader::decode(&data).unwrap().0.ftype {
+                FrameType::Ctrl => "offer",
+                FrameType::Data => "data ",
+                _ => "other",
+            };
+            println!("{kind} {}", hex(&data));
+            over.push(data);
+        }
+    }
+
+    println!("\n## Receipt ACK from SO5KM-1 (secret 0x0c x 32) for that transfer");
+    let receiver = Identity::from_secret([12; 32]);
+    println!("public key {}", hex(&receiver.public().0));
+    let mut rcfg = Config::vhf_1200(call("SO5KM-1"));
+    rcfg.duty_cycle_permille = 1000;
+    let mut r = Xfer::new(rcfg, receiver, DetRng::from_seed(0)).unwrap();
+    let mut rout = Vec::new();
+    for f in over {
+        r.handle(Millis(0), Input::Frame { port: 0, data: f }, &mut rout);
+    }
+    let t = r.next_deadline().unwrap();
+    r.on_deadline(t, &mut rout);
+    for o in rout {
+        if let Output::Transmit { data, .. } = o {
+            println!("ack   {}", hex(&data));
+        }
+    }
 }

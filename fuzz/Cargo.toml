@@ -1,0 +1,84 @@
+[package]
+name = "hm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hm-wire = { path = "../crates/hm-wire" }
+hm-ident = { path = "../crates/hm-ident" }
+hm-bundle = { path = "../crates/hm-bundle" }
+hm-bearer = { path = "../crates/hm-bearer" }
+hm-core = { path = "../crates/hm-core" }
+hm-xfer = { path = "../crates/hm-xfer" }
+
+# Kept out of the main workspace: cargo-fuzz needs nightly and sanitizer flags.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ack"
+path = "fuzz_targets/ack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bundle"
+path = "fuzz_targets/bundle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "binding"
+path = "fuzz_targets/binding.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "callsign"
+path = "fuzz_targets/callsign.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kiss"
+path = "fuzz_targets/kiss.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ax25"
+path = "fuzz_targets/ax25.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xfer"
+path = "fuzz_targets/xfer.rs"
+test = false
+doc = false
+bench = false

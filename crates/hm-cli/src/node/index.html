@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hm-net station</title>
+<style>
+  :root {
+    --ink: #1b2a33; --muted: #5b6b73; --paper: #f5f7f6; --sheet: #ffffff;
+    --rule: #c9d3d6; --focus: #1f6fb2; --ok: #1e7a46; --warn: #9a6400; --bad: #b3261e;
+    --priority: #c99a00; --immediate: #d0620a; --flash: #c62828;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink: #e3eaec; --muted: #9aabb2; --paper: #121a1f; --sheet: #182329;
+      --rule: #2c3b43; --focus: #6fb0e8; --ok: #5ec48a; --warn: #e0b04a; --bad: #f07a72;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--paper); color: var(--ink);
+    font: 16px/1.5 "Atkinson Hyperlegible", "Segoe UI", system-ui, -apple-system, sans-serif;
+    font-variant-numeric: tabular-nums;
+  }
+  header { padding: 1.5rem clamp(1rem, 4vw, 2.5rem) 1rem; border-bottom: 2px solid var(--ink); }
+  h1 { margin: 0; font-size: clamp(2rem, 6vw, 3.25rem); line-height: 1; letter-spacing: 0.04em; font-weight: 800; }
+  .station-line { margin: 0.4rem 0 0; color: var(--muted); font-size: 0.95rem; }
+  main {
+    display: grid; gap: 2rem; padding: 1.5rem clamp(1rem, 4vw, 2.5rem) 3rem;
+    grid-template-columns: minmax(0, 22rem) minmax(0, 1fr); align-items: start;
+  }
+  @media (max-width: 52rem) { main { grid-template-columns: minmax(0, 1fr); } }
+  h2 { font-size: 1.15rem; margin: 0 0 0.75rem; }
+  form { background: var(--sheet); border: 1px solid var(--rule); padding: 1rem; }
+  label { display: block; font-weight: 600; margin: 0.75rem 0 0.25rem; }
+  label:first-of-type { margin-top: 0; }
+  .hint { font-weight: 400; color: var(--muted); }
+  input, textarea, select, button { font: inherit; color: inherit; }
+  input, textarea, select {
+    width: 100%; padding: 0.5rem 0.6rem; background: var(--paper); border: 1px solid var(--rule); border-radius: 2px;
+  }
+  textarea { min-height: 8rem; resize: vertical; }
+  #to { text-transform: uppercase; font-weight: 700; letter-spacing: 0.04em; }
+  button {
+    margin-top: 1rem; padding: 0.6rem 1rem; border: 2px solid var(--ink); background: var(--ink);
+    color: var(--paper); font-weight: 700; cursor: pointer; border-radius: 2px;
+  }
+  :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+  #form-status { margin: 0.75rem 0 0; min-height: 1.5em; }
+  .tabs { display: flex; gap: 0; border-bottom: 1px solid var(--rule); margin-bottom: 0.25rem; }
+  .tabs button {
+    margin: 0; background: none; color: var(--muted); border: 0; border-bottom: 3px solid transparent;
+    padding: 0.5rem 0.9rem; font-weight: 600;
+  }
+  .tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--ink); }
+  ol.log { list-style: none; margin: 0; padding: 0; }
+  ol.log li {
+    display: grid; grid-template-columns: 5.5rem 7rem minmax(0, 1fr); gap: 0.25rem 1rem;
+    padding: 0.7rem 0.5rem 0.7rem 0.9rem; border-bottom: 1px solid var(--rule); border-left: 4px solid transparent;
+  }
+  ol.log li.p1 { border-left-color: var(--priority); }
+  ol.log li.p2 { border-left-color: var(--immediate); }
+  ol.log li.p3 { border-left-color: var(--flash); }
+  ol.log li.unread .body { font-weight: 700; }
+  @media (max-width: 34rem) { ol.log li { grid-template-columns: 4.5rem minmax(0, 1fr); } ol.log .body { grid-column: 1 / -1; } }
+  .when { color: var(--muted); }
+  .who { font-weight: 700; letter-spacing: 0.03em; overflow-wrap: anywhere; }
+  .body { overflow-wrap: anywhere; white-space: pre-wrap; }
+  .subject { display: block; font-weight: 700; }
+  .state { display: block; font-size: 0.9rem; margin-top: 0.2rem; color: var(--muted); }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .empty { color: var(--muted); padding: 1rem 0; }
+  button.read { margin: 0.3rem 0 0; padding: 0.15rem 0.5rem; font-size: 0.85rem; background: none; color: var(--ink); border-width: 1px; }
+  #token-form { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; margin-top: 0.75rem; max-width: 40rem; border: 0; padding: 0; background: none; }
+  #token-form[hidden] { display: none; }
+  #token-form label { margin: 0; flex-basis: 100%; }
+  #token-form input { flex: 1 1 16rem; width: auto; }
+  #token-form button { margin: 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="call">…</h1>
+  <p class="station-line" id="station-line">Connecting to the node…</p>
+  <form id="token-form" hidden>
+    <label for="token">Access token <span class="hint">(printed by <code>hm node</code> at start-up, and kept in the file beside the store)</span></label>
+    <input id="token" autocomplete="off" spellcheck="false">
+    <button type="submit">Use token</button>
+  </form>
+</header>
+<main>
+  <section aria-labelledby="compose-title">
+    <h2 id="compose-title">New message</h2>
+    <form id="compose" autocomplete="off">
+      <label for="to">To</label>
+      <input id="to" name="to" required maxlength="9" placeholder="SO5KM-1" spellcheck="false">
+      <label for="subject">Subject <span class="hint">(optional; makes it mail)</span></label>
+      <input id="subject" name="subject" maxlength="128">
+      <label for="text">Message</label>
+      <textarea id="text" name="text" required></textarea>
+      <label for="precedence">Precedence</label>
+      <select id="precedence" name="precedence">
+        <option value="routine">Routine</option>
+        <option value="priority">Priority</option>
+        <option value="immediate">Immediate</option>
+        <option value="flash">Flash</option>
+      </select>
+      <button type="submit">Queue message</button>
+      <p id="form-status" role="status"></p>
+    </form>
+  </section>
+  <section aria-labelledby="log-title">
+    <h2 id="log-title" hidden>Messages</h2>
+    <div class="tabs" role="tablist">
+      <button role="tab" id="tab-in" aria-selected="true" aria-controls="log">Inbox</button>
+      <button role="tab" id="tab-out" aria-selected="false" aria-controls="log">Sent</button>
+    </div>
+    <ol class="log" id="log" aria-live="polite"></ol>
+  </section>
+</main>
+<script>
+"use strict";
+// Every message field comes from the air: build DOM nodes and set textContent only.
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined && text !== null) n.textContent = text;
+  return n;
+};
+const hhmm = (unix) => new Date(unix * 1000).toISOString().slice(11, 16) + "Z";
+const day = (unix) => new Date(unix * 1000).toISOString().slice(5, 10);
+let direction = "in";
+let me = "";
+// The token comes from the #token= link hm node prints, or the form; it stays in this browser.
+if (location.hash.startsWith("#token=")) {
+  localStorage.setItem("hm-token", decodeURIComponent(location.hash.slice(7)));
+  history.replaceState(null, "", location.pathname);
+}
+const api = async (path, opts = {}) => {
+  const headers = Object.assign({ Authorization: "Bearer " + (localStorage.getItem("hm-token") || "") }, opts.headers || {});
+  const r = await fetch(path, Object.assign({}, opts, { headers }));
+  if (r.status === 401) {
+    document.getElementById("token-form").hidden = false;
+    throw new Error("the access token is missing or wrong");
+  }
+  return r;
+};
+
+function describeOut(m) {
+  if (m.state === "Delivered") {
+    const by = m.delivered_by ? " by " + m.delivered_by : "";
+    return m.verified ? ["Delivered" + by + ", receipt verified", "ok"] : ["Delivered" + by + ", receipt not verified (no key for the receiver)", "warn"];
+  }
+  if (m.state === "Failed") return ["Not delivered: " + (m.note || "gave up"), "bad"];
+  const next = m.next_attempt * 1000 > Date.now() ? ", next try " + hhmm(m.next_attempt) : "";
+  return ["Queued" + (m.attempts ? " after " + m.attempts + " attempt" + (m.attempts > 1 ? "s" : "") : "") + next, "warn"];
+}
+
+function render(list) {
+  const log = document.getElementById("log");
+  log.replaceChildren();
+  if (list.length === 0) {
+    log.append(el("li", "empty", direction === "in"
+      ? "No messages yet. Messages addressed to " + me + " appear here."
+      : "Nothing sent yet. Queue a message with the form."));
+    return;
+  }
+  for (const m of list) {
+    const li = el("li", "p" + Math.min(m.precedence, 3) + (m.state === "Unread" ? " unread" : ""));
+    const when = el("span", "when");
+    when.append(el("span", null, day(m.at)), document.createElement("br"), el("span", null, hhmm(m.at)));
+    const who = el("span", "who", direction === "in" ? (m.from || m.peer) : m.peer);
+    const body = el("span", "body");
+    if (m.subject) body.append(el("span", "subject", m.subject));
+    body.append(el("span", null, m.text !== null ? m.text : "(no text)"));
+    if (direction === "in") {
+      const via = m.from && m.from !== m.peer ? ", via " + m.peer : "";
+      body.append(el("span", "state " + (m.verified ? "ok" : "warn"),
+        (m.verified ? "Signature verified" : "Signature not verified (sender not in the trust file)") + via));
+      if (m.state === "Unread") {
+        const b = el("button", "read", "Mark read");
+        b.addEventListener("click", async () => { await api("/api/read/" + m.id, { method: "POST" }); refresh(); });
+        body.append(b);
+      }
+    } else {
+      const [text, cls] = describeOut(m);
+      body.append(el("span", "state " + cls, text));
+    }
+    li.append(when, who, body);
+    log.append(li);
+  }
+}
+
+async function refresh() {
+  try {
+    const r = await api("/api/messages?direction=" + direction + "&limit=200");
+    if (!r.ok) throw new Error((await r.json()).error || r.statusText);
+    render(await r.json());
+  } catch (e) {
+    document.getElementById("station-line").textContent = "Cannot reach the node: " + e.message;
+  }
+}
+
+async function loadStatus() {
+  try {
+    const s = await (await api("/api/status")).json();
+    me = s.call;
+    document.getElementById("call").textContent = s.call;
+    document.title = s.call + " · hm-net";
+    const radio = s.radio === null ? "No radio." : s.radio ? "Radio up: " + s.radio_via + "." : "Radio down (" + s.radio_via + ").";
+    const peers = s.internet_peers.length ? "linked to " + s.internet_peers.join(", ") : "no stations linked";
+    const net = s.internet_listen ? " Internet: " + peers + "." : "";
+    document.getElementById("station-line").textContent = radio + net + " Your trust-file line: " + s.trust_line;
+    document.getElementById("token-form").hidden = true;
+  } catch (e) {
+    document.getElementById("station-line").textContent = "Cannot reach the node: " + e.message;
+  }
+}
+
+document.getElementById("token-form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  localStorage.setItem("hm-token", document.getElementById("token").value.trim());
+  loadStatus();
+  refresh();
+});
+
+for (const [id, dir] of [["tab-in", "in"], ["tab-out", "out"]]) {
+  document.getElementById(id).addEventListener("click", () => {
+    direction = dir;
+    document.getElementById("tab-in").setAttribute("aria-selected", String(dir === "in"));
+    document.getElementById("tab-out").setAttribute("aria-selected", String(dir === "out"));
+    refresh();
+  });
+}
+
+document.getElementById("compose").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const f = ev.target;
+  const status = document.getElementById("form-status");
+  const body = { to: f.to.value.trim().toUpperCase(), text: f.text.value, precedence: f.precedence.value };
+  if (f.subject.value.trim()) body.subject = f.subject.value.trim();
+  status.className = "";
+  status.textContent = "Queuing…";
+  try {
+    const r = await api("/api/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error);
+    status.className = "ok";
+    status.textContent = "Queued for " + body.to + ". It goes out when the channel allows; follow it under Sent.";
+    f.text.value = ""; f.subject.value = "";
+    if (direction === "out") refresh();
+  } catch (e) {
+    status.className = "bad";
+    status.textContent = "Not queued: " + e.message;
+  }
+});
+
+loadStatus();
+refresh();
+setInterval(refresh, 3000);
+setInterval(loadStatus, 10000);
+</script>
+</body>
+</html>

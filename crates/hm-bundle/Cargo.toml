@@ -13,3 +13,6 @@ minicbor.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+hm-core = { path = "../hm-core" }
+hm-bearer = { path = "../hm-bearer" }
+hm-xfer = { path = "../hm-xfer" }

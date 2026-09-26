@@ -1,0 +1,255 @@
+//! End to end over real TCP sockets, through a fake KISS TNC that plays the
+//! radio channel: every data frame from one client goes to all the others,
+//! optionally dropping every n-th one.
+
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use hm_bearer::{ax25, kiss};
+use hm_bundle::Precedence;
+use hm_cli::driver::Flow;
+use hm_cli::files::{KeyFile, Trust};
+use hm_cli::kiss_tcp::KissLink;
+use hm_cli::station::{self, LinkTiming, Message, SendOutcome, Station, Verification};
+use hm_wire::Callsign;
+
+mod common;
+use common::fake_tnc;
+use hm_xfer::Receipt;
+
+/// Fast link so the test runs in seconds: overs are predicted at 9600 bd.
+const FAST: LinkTiming = LinkTiming {
+    bitrate_bps: 9600,
+    txdelay_ms: 50,
+    guard_ms: 300,
+    max_rounds: 12,
+};
+
+fn call(s: &str) -> Callsign {
+    Callsign::parse(s).unwrap()
+}
+
+/// A station on the channel sending APRS position reports: noise hm must ignore.
+fn aprs_noise(addr: SocketAddr, stop: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut s = TcpStream::connect(addr).unwrap();
+        let mut ui = ax25::wrap(call("SP5ZZZ"), b"!5213.00N/02100.00E-PHG2360").unwrap();
+        let apdw: Vec<u8> = b"APDW18".iter().map(|c| c << 1).collect();
+        ui[..6].copy_from_slice(&apdw);
+        while !stop.load(Ordering::Relaxed) {
+            let _ = s.write_all(&kiss::data_frame(0, &ui));
+            thread::sleep(Duration::from_millis(150));
+        }
+    })
+}
+
+fn exchange(drop_every: usize, text: &str) -> (SendOutcome, Vec<Message>, usize) {
+    let tnc = fake_tnc(drop_every);
+    let alice = KeyFile::generate(call("SA0KAM")).unwrap();
+    let bob = KeyFile::generate(call("SO5KM")).unwrap();
+    let mut trust = Trust::default();
+    trust.insert(alice.call, alice.identity.public());
+    let mut alice_trust = Trust::default();
+    alice_trust.insert(bob.call, bob.identity.public());
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let got: Arc<Mutex<Vec<Message>>> = Arc::default();
+    let listener = {
+        let (stop, got, addr) = (stop.clone(), got.clone(), tnc.addr.to_string());
+        thread::spawn(move || {
+            let mut link = KissLink::connect(&addr, call("SO5KM-1"), 0).unwrap();
+            let st = Station {
+                key: &bob,
+                trust: &trust,
+                me: call("SO5KM-1"),
+                timing: FAST,
+            };
+            st.listen(&mut link, None, Some(&stop), |m| {
+                got.lock().unwrap().push(m);
+                Flow::Continue
+            })
+            .unwrap();
+        })
+    };
+    let noise = aprs_noise(tnc.addr, stop.clone());
+    thread::sleep(Duration::from_millis(300)); // everyone connected before sending
+
+    let mut link = KissLink::connect(&tnc.addr.to_string(), call("SA0KAM"), 0).unwrap();
+    let bundle = station::build_bundle(
+        &alice,
+        call("SA0KAM"),
+        call("SO5KM-1"),
+        text,
+        None,
+        Precedence::Routine,
+    )
+    .unwrap();
+    let st = Station {
+        key: &alice,
+        trust: &alice_trust,
+        me: call("SA0KAM"),
+        timing: FAST,
+    };
+    let outcome = st
+        .send_object(
+            &mut link,
+            call("SO5KM-1"),
+            bundle.to_vec(),
+            0,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(500));
+    stop.store(true, Ordering::Relaxed);
+    listener.join().unwrap();
+    noise.join().unwrap();
+    let msgs = got.lock().unwrap().clone();
+    (outcome, msgs, tnc.dropped.load(Ordering::SeqCst))
+}
+
+#[test]
+fn chat_over_kiss_tcp_is_delivered_and_verified() {
+    let (outcome, msgs, _) = exchange(0, "73 de SA0KAM, test over KISS");
+    assert!(
+        matches!(
+            outcome,
+            SendOutcome::Delivered {
+                rounds: 1,
+                receipt: Receipt::Verified,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(msgs.len(), 1, "{msgs:?}");
+    assert_eq!(msgs[0].verification, Verification::Verified);
+    assert_eq!(msgs[0].text(), Some("73 de SA0KAM, test over KISS"));
+    assert_eq!(msgs[0].via, call("SA0KAM"));
+}
+
+#[test]
+fn lossy_channel_still_delivers_exactly_once() {
+    let text: String = "The quick brown fox jumps over the lazy dog. ".repeat(40);
+    let (outcome, msgs, dropped) = exchange(4, &text);
+    assert!(
+        matches!(
+            outcome,
+            SendOutcome::Delivered {
+                receipt: Receipt::Verified,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert!(dropped > 0, "the channel dropped frames");
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].text(), Some(text.as_str()));
+}
+
+/// The real binary: keygen, whoami, listen, send.
+#[test]
+fn hm_binary_end_to_end() {
+    let hm = env!("CARGO_BIN_EXE_hm");
+    let dir = std::env::temp_dir().join(format!("hm-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (a_key, b_key, trust) = (dir.join("a.key"), dir.join("b.key"), dir.join("trusted.txt"));
+    let run = |args: &[&str]| Command::new(hm).args(args).output().unwrap();
+    assert!(
+        run(&["keygen", "--call", "SA0KAM", "--out", a_key.to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert!(
+        run(&["keygen", "--call", "SO5KM", "--out", b_key.to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert!(
+        !run(&["keygen", "--call", "SO5KM", "--out", b_key.to_str().unwrap()])
+            .status
+            .success(),
+        "no overwrite"
+    );
+    let whoami = run(&["whoami", "--key", a_key.to_str().unwrap()]);
+    std::fs::write(&trust, &whoami.stdout).unwrap();
+    let b_trust = dir.join("b-trusted.txt");
+    std::fs::write(
+        &b_trust,
+        run(&["whoami", "--key", b_key.to_str().unwrap()]).stdout,
+    )
+    .unwrap();
+
+    let tnc = fake_tnc(0);
+    let addr = tnc.addr.to_string();
+    let fast = ["--bitrate", "9600", "--txdelay", "50", "--guard", "300"];
+    let mut listener = Command::new(hm)
+        .args([
+            "listen",
+            "--key",
+            b_key.to_str().unwrap(),
+            "--ssid",
+            "1",
+            "--kiss",
+            &addr,
+        ])
+        .args(["--trust", trust.to_str().unwrap()])
+        .args(fast)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(500));
+    let send = Command::new(hm)
+        .args([
+            "send",
+            "--key",
+            a_key.to_str().unwrap(),
+            "--kiss",
+            &addr,
+            "--to",
+            "SO5KM-1",
+        ])
+        .args([
+            "--text",
+            "hello from the hm binary",
+            "--subject",
+            "test",
+            "--precedence",
+            "priority",
+        ])
+        .args(fast)
+        .args(["--timeout", "60", "--trust", b_trust.to_str().unwrap()])
+        .output()
+        .unwrap();
+    thread::sleep(Duration::from_millis(500));
+    listener.kill().unwrap();
+    let mut printed = String::new();
+    listener
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut printed)
+        .unwrap();
+    let _ = listener.wait();
+    let sent = String::from_utf8_lossy(&send.stdout);
+    assert!(
+        send.status.success(),
+        "send failed: {sent} {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+    assert!(
+        sent.contains("Delivered to SO5KM-1") && sent.contains("receipt verified"),
+        "{sent}"
+    );
+    assert!(
+        printed.contains("SA0KAM via SA0KAM (verified) Mail [test]: hello from the hm binary"),
+        "{printed}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

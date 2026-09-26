@@ -1,0 +1,16 @@
+[package]
+name = "hm-net"
+description = "Internet bearer: QUIC between stations, mutually authenticated with station keys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hm-wire = { path = "../hm-wire" }
+hm-ident = { path = "../hm-ident" }
+hm-xfer = { path = "../hm-xfer" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "crypto"] }
+tokio = { version = "1", features = ["rt", "net", "sync", "time", "macros", "io-util"] }

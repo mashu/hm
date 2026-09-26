@@ -3,6 +3,7 @@
 //! - [`Callsign`]: base-40 packing of up to 9 characters into 48 bits.
 //! - [`FrameHeader`]: the 18-byte header carried by every radio frame.
 //! - [`Ack`]: the fixed-layout acknowledgement payload.
+//! - [`DataPreamble`] and [`Offer`]: DATA and CTRL payloads used by transfers.
 //! - [`ObjectId`]: 32-byte content hash naming bundles, records and attachments.
 //!
 //! Layouts are specified in `SPEC.md` at the repository root.
@@ -13,11 +14,13 @@ extern crate alloc;
 
 mod ack;
 mod callsign;
+mod data;
 mod frame;
 mod id;
 
-pub use ack::{Ack, MAX_ACK_COMPLETED};
+pub use ack::{Ack, MAX_ACK_COMPLETED, NEED_OFFER, RECEIPT_LEN};
 pub use callsign::{Callsign, CALLSIGN_MAX_LEN};
+pub use data::{DataPreamble, Offer, CTRL_OFFER, DATA_PREAMBLE_LEN, MAX_OBJECT_LEN, OFFER_LEN};
 pub use frame::{Dest, FrameHeader, FrameType, HEADER_LEN, MAX_INDEX, WIRE_VERSION};
 pub use id::ObjectId;
 

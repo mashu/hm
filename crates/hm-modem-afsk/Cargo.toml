@@ -1,0 +1,13 @@
+[package]
+name = "hm-modem-afsk"
+description = "Bell 202 AFSK 1200 modem: HDLC framing, multi-slicer demodulator with PLL clock recovery and carrier detect"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+libm = "0.2"
+
+[dev-dependencies]
+hm-core = { path = "../hm-core" }
