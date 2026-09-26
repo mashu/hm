@@ -21,6 +21,13 @@
 //! receiver's key can prove it was the receiver who got it. When the sender
 //! knows the receiver's key, an ACK without a valid receipt is ignored as forged.
 //!
+//! Before the first transfer to a peer, the first over also carries an OPEN:
+//! what this station offers (feature bits) and the largest object, symbol and
+//! number of parallel transfers it accepts. The peer answers with its own OPEN
+//! next to its ACK, so neither costs a turnaround. A receiver that cannot take
+//! a transfer says so with a CLOSE (too large, busy until a given time, or
+//! refused) instead of leaving the sender to retry into silence.
+//!
 //! The airtime budget (duty cycle with a burst allowance) protects the
 //! transmitter's finals. Channel access (CSMA) is not done here; on the KISS
 //! path the TNC does it, and the built-in modem will get its own MAC.
@@ -35,8 +42,9 @@ use alloc::vec::Vec;
 use hm_core::{DetRng, Input, Machine, Millis, Output, Port};
 use hm_ident::{Identity, PublicKey};
 use hm_wire::{
-    Ack, Callsign, DataPreamble, Dest, FrameHeader, FrameType, ObjectId, Offer, CTRL_OFFER,
-    DATA_PREAMBLE_LEN, HEADER_LEN, MAX_INDEX, MAX_OBJECT_LEN, NEED_OFFER,
+    Ack, Callsign, Close, CloseReason, DataPreamble, Dest, FrameHeader, FrameType, ObjectId, Offer, Open,
+    CTRL_CLOSE, CTRL_OFFER, CTRL_OPEN, DATA_PREAMBLE_LEN, HEADER_LEN, MAX_INDEX, MAX_OBJECT_LEN, NEED_OFFER,
+    OPEN_LEN, OPEN_REPLY,
 };
 use raptorq::{Decoder, EncodingPacket, ObjectTransmissionInformation, PayloadId, SourceBlockEncoder};
 
@@ -53,6 +61,8 @@ const MAX_LOSS_PERMILLE: u32 = 800;
 /// Largest "frames remaining" believed when predicting the end of a peer's over,
 /// so one corrupted byte cannot hold our answers back for minutes.
 const MAX_REMAINING_TRUSTED: u8 = 64;
+/// Largest symbol size a receiver can take (a multiple of 8 that fits in u16).
+const MAX_SYMBOL_SIZE: u16 = u16::MAX - u16::MAX % SYMBOL_ALIGNMENT;
 /// Cap on the exponent of the retry backoff.
 const MAX_BACKOFF_DOUBLINGS: u32 = 5;
 /// Bursts are sized to deliver enough symbols with this probability. An extra
@@ -161,6 +171,12 @@ pub struct Config {
     pub duty_cycle_permille: u32,
     /// Airtime that may be used at once before the duty cycle applies.
     pub bucket: Millis,
+    /// Send OPEN with the first over to a peer (and answer the peer's).
+    pub sessions: bool,
+    /// Feature bits sent in OPEN (`hm_wire::FEATURE_*`).
+    pub features: u32,
+    /// A busy receiver asks senders to come back after this many seconds.
+    pub busy_retry_secs: u16,
 }
 
 impl Config {
@@ -186,6 +202,9 @@ impl Config {
             done_ttl: Millis::from_secs(1800),
             duty_cycle_permille: 500,
             bucket: Millis::from_secs(120),
+            sessions: true,
+            features: 0,
+            busy_retry_secs: 60,
         }
     }
 
@@ -243,6 +262,8 @@ pub enum Failure {
     Empty,
     /// Sending to ourselves.
     SelfAddressed,
+    /// The receiver said it will not take objects from us.
+    Refused,
 }
 
 /// How far a delivery confirmation could be checked.
@@ -296,6 +317,8 @@ struct Outgoing {
     session: u16,
     id: ObjectId,
     len: u32,
+    /// Symbol size of this transfer.
+    t: u16,
     precedence: u8,
     encoder: SourceBlockEncoder,
     source: Vec<EncodingPacket>,
@@ -303,6 +326,8 @@ struct Outgoing {
     next_esi: u32,
     rounds: u8,
     offer_next: bool,
+    /// The next over starts with our OPEN (the peer has none from us lately).
+    open_next: bool,
     /// Receiver's last reported deficit (K before any ACK).
     need: u32,
     /// Next over is a short probe after a missing ACK.
@@ -312,6 +337,8 @@ struct Outgoing {
     /// Airtime of the last over, the unit of the backoff.
     last_cost: Millis,
     sent_last_round: u32,
+    /// The last over carried an OPEN, so the answer may carry one too.
+    opened: bool,
     state: OutState,
 }
 
@@ -382,6 +409,12 @@ pub struct Xfer {
     loss: BTreeMap<Callsign, u32>,
     tokens_ms: i64,
     tokens_at: Millis,
+    /// Each peer's latest OPEN, and when we heard it.
+    peers: BTreeMap<Callsign, (Open, Millis)>,
+    /// Peers whose OPEN we answer with our next frames to them.
+    open_replies: BTreeSet<Callsign>,
+    /// CLOSEs to send once the peer's over ends: (peer, session) -> (close, when).
+    closes: BTreeMap<(Callsign, u16), (Close, Millis)>,
 }
 
 impl Xfer {
@@ -402,7 +435,33 @@ impl Xfer {
             loss: BTreeMap::new(),
             tokens_ms,
             tokens_at: Millis::ZERO,
+            peers: BTreeMap::new(),
+            open_replies: BTreeSet::new(),
+            closes: BTreeMap::new(),
         })
+    }
+
+    /// What `peer` told us in its latest OPEN, if it sent one lately.
+    pub fn peer(&self, peer: Callsign) -> Option<Open> {
+        self.peers.get(&peer).map(|(o, _)| *o)
+    }
+
+    /// Our OPEN, as sent to `to`.
+    fn our_open(&self, reply: bool) -> Open {
+        Open {
+            flags: if reply { OPEN_REPLY } else { 0 },
+            features: self.cfg.features,
+            max_object: self.cfg.max_object_len.min(MAX_OBJECT_LEN),
+            max_symbol: MAX_SYMBOL_SIZE,
+            max_parallel: self.cfg.max_incoming_per_sender.min(255) as u8,
+        }
+    }
+
+    /// Whether `peer`'s OPEN is recent enough to rely on.
+    fn knows(&self, peer: Callsign, now: Millis) -> bool {
+        self.peers
+            .get(&peer)
+            .is_some_and(|(_, at)| *at + self.cfg.done_ttl > now)
     }
 
     pub fn config(&self) -> &Config {
@@ -531,15 +590,36 @@ impl Xfer {
         let _ = now;
     }
 
-    fn start_next(&mut self, now: Millis) {
+    fn start_next(&mut self, now: Millis, out: &mut Vec<Output<Event>>) {
         if self.active.is_some() {
             return;
         }
         let Some(p) = self.queue.pop_front() else { return };
         let len = p.object.len() as u32;
-        let (t, k) = self
-            .check_params(len, self.cfg.symbol_size as usize)
-            .expect("checked when queued");
+        // What the peer told us it takes: larger objects fail at once, and
+        // symbols are no larger than it accepts.
+        let mut t = self.cfg.symbol_size;
+        if let Some((open, _)) = self.peers.get(&p.to).filter(|_| self.knows(p.to, now)) {
+            if len > open.max_object {
+                out.push(Output::Event(Event::Failed {
+                    to: p.to,
+                    id: object_id(&p.object),
+                    reason: Failure::TooLarge,
+                }));
+                return self.start_next(now, out);
+            }
+            let theirs = open.max_symbol - open.max_symbol % SYMBOL_ALIGNMENT;
+            if theirs >= SYMBOL_ALIGNMENT {
+                t = t.min(theirs);
+            }
+        }
+        let (t, k) = match self.check_params(len, t as usize) {
+            Some(tk) => tk,
+            // Too many symbols at the peer's size: ours was checked when queued.
+            None => self
+                .check_params(len, self.cfg.symbol_size as usize)
+                .expect("checked when queued"),
+        };
         // The block encoder wants whole symbols; the decoder truncates to `len` again.
         let mut padded = p.object;
         padded.resize(k as usize * t as usize, 0);
@@ -552,6 +632,7 @@ impl Xfer {
             session: self.rng.next_u64() as u16,
             id,
             len,
+            t,
             precedence: p.precedence,
             encoder,
             source,
@@ -559,11 +640,13 @@ impl Xfer {
             next_esi: 0,
             rounds: 0,
             offer_next: true,
+            open_next: self.cfg.sessions && !self.knows(p.to, now),
             need: k,
             probe: false,
             timeouts: 0,
             last_cost: Millis::ZERO,
             sent_last_round: 0,
+            opened: false,
             state: OutState::Ready { at: now },
         });
     }
@@ -582,7 +665,7 @@ impl Xfer {
 
     /// Start the next over if one is due and the channel is ours.
     fn pump(&mut self, now: Millis, out: &mut Vec<Output<Event>>) {
-        self.start_next(now);
+        self.start_next(now, out);
         if self.receiving() {
             return; // a peer's over is still under way; answer it first
         }
@@ -598,7 +681,7 @@ impl Xfer {
                 id: o.id,
                 reason: Failure::NoAnswer,
             }));
-            self.start_next(now);
+            self.start_next(now, out);
             return self.pump(now, out);
         }
 
@@ -611,11 +694,15 @@ impl Xfer {
         } else {
             burst_size(o.need, loss, cap)
         };
-        let t = self.cfg.symbol_size as usize;
+        let t = o.t as usize;
         let frame_air = self.cfg.air(1, self.cfg.data_frame_len(t));
         let mut fixed = self.cfg.txdelay;
         if o.offer_next {
             fixed += self.cfg.air(1, HEADER_LEN + hm_wire::OFFER_LEN);
+        }
+        let open = (o.offer_next && o.open_next) || self.open_replies.contains(&o.to);
+        if open {
+            fixed += self.open_air();
         }
         // An over never costs more than the bucket holds (but always carries a symbol).
         let n = if self.cfg.duty_cycle_permille < 1000 {
@@ -632,8 +719,17 @@ impl Xfer {
             return;
         }
 
+        let (to, session) = {
+            let o = self.active.as_ref().expect("checked");
+            (o.to, o.session)
+        };
+        let mut frames = Vec::with_capacity(n as usize + 2);
+        if open {
+            let reply = self.open_replies.remove(&to);
+            let ours = self.our_open(reply).to_bytes().expect("in range");
+            frames.push(self.frame(FrameType::Ctrl, to, session, 0, &ours));
+        }
         let o = self.active.as_ref().expect("checked");
-        let mut frames = Vec::with_capacity(n as usize + 1);
         if o.offer_next {
             let offer = Offer {
                 hash: o.id.0,
@@ -665,14 +761,17 @@ impl Xfer {
         }
         self.tokens_ms -= cost.0 as i64;
 
-        // The peer answers after our over: its guard, its key-up, a full ACK, our slack.
-        let ack_air = self.ack_air();
+        // The peer answers after our over: its guard, its key-up, a full ACK
+        // (and its OPEN, if we sent ours), our slack.
+        let ack_air = self.ack_air() + if open { self.open_air() } else { Millis::ZERO };
         let jitter = Millis(self.rng.below(self.cfg.ack_guard.0 + 1));
         let until = now + cost + self.cfg.ack_guard + ack_air + self.cfg.ack_guard + jitter;
         let o = self.active.as_mut().expect("checked");
         o.next_esi += n;
         o.rounds += 1;
         o.offer_next = false;
+        o.open_next = false;
+        o.opened = open;
         o.probe = false;
         o.last_cost = cost;
         o.sent_last_round = n;
@@ -747,6 +846,7 @@ impl Xfer {
                 let window = (o.last_cost.0 + self.cfg.ack_guard.0) << o.timeouts.min(MAX_BACKOFF_DOUBLINGS);
                 let backoff = Millis(self.rng.below(window + 1));
                 o.offer_next = true;
+                o.open_next = o.opened;
                 o.probe = true;
                 o.state = OutState::Ready { at: now + backoff };
             }
@@ -763,7 +863,22 @@ impl Xfer {
     /// We answer once every over we are hearing has ended, so an ACK never
     /// talks over another station's over.
     fn answer_at(&self) -> Option<Millis> {
-        self.incoming.values().filter_map(|i| i.ack_at).max()
+        let acks = self.incoming.values().filter_map(|i| i.ack_at);
+        acks.chain(self.closes.values().map(|(_, at)| *at)).max()
+    }
+
+    /// Whether a new transfer from `sender` would have to push out work in
+    /// progress from other stations: every slot holds a live, offered,
+    /// unfinished transfer from someone else. Then we ask it to come back later.
+    fn busy_for(&self, now: Millis, sender: Callsign) -> bool {
+        let idle = self.cfg.idle_timeout;
+        let live = |i: &Incoming| !i.done && i.id.is_some() && i.last_heard + idle > now;
+        let others = self.incoming.iter().filter(|((c, _), _)| *c != sender);
+        let from_sender = self.incoming.keys().filter(|(c, _)| *c == sender).count();
+        from_sender < self.cfg.max_incoming_per_sender
+            && self.incoming.len() >= self.cfg.max_incoming
+            && others.clone().count() == self.incoming.len()
+            && others.map(|(_, i)| i).all(live)
     }
 
     /// Make room for a new transfer from `sender`. A sender at its own limit
@@ -819,11 +934,28 @@ impl Xfer {
         let Ok(offer) = hm_wire::Offer::decode(payload) else {
             return;
         };
+        let key = (from, session);
+        let answer = self.ack_at(now, offer.remaining, offer.symbol_size as usize);
+        if offer.object_len > self.cfg.max_object_len {
+            let close = Close {
+                reason: CloseReason::TooLarge,
+                retry_after: 0,
+            };
+            self.closes.insert(key, (close, answer));
+            return;
+        }
         let Some((t, k)) = self.check_params(offer.object_len, offer.symbol_size as usize) else {
             return;
         };
-        let key = (from, session);
         let id = ObjectId(offer.hash);
+        if !self.incoming.contains_key(&key) && !self.seen.contains_key(&id) && self.busy_for(now, from) {
+            let close = Close {
+                reason: CloseReason::Busy,
+                retry_after: self.cfg.busy_retry_secs,
+            };
+            self.closes.insert(key, (close, answer));
+            return;
+        }
         if self
             .incoming
             .get(&key)
@@ -865,6 +997,18 @@ impl Xfer {
             return;
         };
         let key = (from, session);
+        // Every DATA frame repeats the object length: if it fits after all, the
+        // OFFER that seemed too large was corrupted on the way. Take back the CLOSE.
+        if let Some((close, _)) = self.closes.get(&key) {
+            if close.reason == CloseReason::TooLarge && pre.object_len <= self.cfg.max_object_len {
+                self.closes.remove(&key);
+            }
+        }
+        // Symbols for a transfer we are turning away, or would have to make
+        // room for by dropping others' work, are not collected.
+        if self.closes.contains_key(&key) || (!self.incoming.contains_key(&key) && self.busy_for(now, from)) {
+            return;
+        }
         if !self.slot(now, key, pre.object_len, t, k, false) {
             return;
         }
@@ -926,7 +1070,26 @@ impl Xfer {
             .filter(|(_, i)| i.ack_at.is_some())
             .map(|(k, _)| *k)
             .collect();
+        let closes: Vec<((Callsign, u16), Close)> = core::mem::take(&mut self.closes)
+            .into_iter()
+            .map(|(k, (c, _))| (k, c))
+            .collect();
+        for (key, close) in closes {
+            // Our OPEN first, so the sender learns the limit it ran into.
+            if self.open_replies.remove(&key.0) {
+                let ours = self.our_open(true).to_bytes().expect("in range");
+                let f = self.frame(FrameType::Ctrl, key.0, key.1, 0, &ours);
+                self.transmit(f, out);
+            }
+            let f = self.frame(FrameType::Ctrl, key.0, key.1, 0, &close.to_bytes());
+            self.transmit(f, out);
+        }
         for key in due {
+            if self.open_replies.remove(&key.0) {
+                let ours = self.our_open(true).to_bytes().expect("in range");
+                let f = self.frame(FrameType::Ctrl, key.0, key.1, 0, &ours);
+                self.transmit(f, out);
+            }
             let inc = self.incoming.get_mut(&key).expect("collected above");
             inc.ack_at = None;
             let ack = if inc.done {
@@ -989,6 +1152,71 @@ impl Xfer {
         }
     }
 
+    fn on_open(&mut self, now: Millis, from: Callsign, payload: &[u8]) {
+        let Ok(open) = Open::decode(payload) else { return };
+        self.peers.insert(from, (open, now));
+        if !open.is_reply() && self.cfg.sessions {
+            self.open_replies.insert(from);
+        }
+    }
+
+    fn on_close(
+        &mut self,
+        now: Millis,
+        from: Callsign,
+        session: u16,
+        payload: &[u8],
+        out: &mut Vec<Output<Event>>,
+    ) {
+        let Ok(close) = Close::decode(payload) else { return };
+        if close.reason == CloseReason::Done {
+            // The sender is finished with us: forget its finished transfers.
+            self.incoming
+                .retain(|(c, s), i| !(*c == from && (session == 0 || *s == session) && i.done));
+            return;
+        }
+        let Some(o) = self.active.as_mut() else { return };
+        if o.to != from || (session != 0 && session != o.session) {
+            return;
+        }
+        let reason = match close.reason {
+            CloseReason::Busy => {
+                // Not a failure: come back when asked, starting afresh.
+                let wait = Millis::from_secs(u64::from(close.retry_after.max(1)));
+                o.offer_next = true;
+                o.timeouts = 0;
+                o.state = OutState::Ready { at: now + wait };
+                return;
+            }
+            // Believed only when the peer's own OPEN agrees; otherwise the
+            // CLOSE answered a corrupted OFFER, so offer again.
+            CloseReason::TooLarge
+                if !self
+                    .peers
+                    .get(&from)
+                    .is_some_and(|(open, _)| o.len > open.max_object) =>
+            {
+                o.offer_next = true;
+                o.open_next = true;
+                o.state = OutState::Ready { at: now };
+                return;
+            }
+            CloseReason::TooLarge => Failure::TooLarge,
+            _ => Failure::Refused,
+        };
+        let o = self.active.take().expect("checked");
+        out.push(Output::Event(Event::Failed {
+            to: o.to,
+            id: o.id,
+            reason,
+        }));
+    }
+
+    /// Airtime of an OPEN frame.
+    fn open_air(&self) -> Millis {
+        self.cfg.air(1, HEADER_LEN + OPEN_LEN)
+    }
+
     /// Airtime of an ACK with a receipt, key-up included.
     fn ack_air(&self) -> Millis {
         self.cfg.txdelay + self.cfg.air(1, HEADER_LEN + 7 + 8 + hm_wire::RECEIPT_LEN)
@@ -1009,6 +1237,10 @@ impl Xfer {
             FrameType::Data => self.on_data(now, h.src, h.session, h.index, payload, out),
             FrameType::Ctrl if payload.first() == Some(&CTRL_OFFER) => {
                 self.on_offer(now, h.src, h.session, payload, out)
+            }
+            FrameType::Ctrl if payload.first() == Some(&CTRL_OPEN) => self.on_open(now, h.src, payload),
+            FrameType::Ctrl if payload.first() == Some(&CTRL_CLOSE) => {
+                self.on_close(now, h.src, h.session, payload, out)
             }
             FrameType::Ack => self.on_ack(now, h.src, h.session, payload, out),
             _ => {}

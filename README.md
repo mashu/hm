@@ -16,16 +16,16 @@ clear, identities signed.
 | `hm-bundle` | Messages: build, seal, open, verify; receipts; attachment references |
 | `hm-sim` | Discrete-event simulator: multiple channels and radios per station, airtime with keyed-PTT bursts and AX.25/HDLC framing checked against the modulator, half-duplex, p-persistent CSMA with a measured carrier-detect delay, hidden-terminal collisions, Bernoulli / Gilbert–Elliott / hourly HF loss or the built-in modem's measured loss by SNR and frame length, outages, partitions, clock drift, corrupted frames, airtime split by purpose, delivery and latency metrics |
 | `hm-bearer` | KISS framing (streaming decoder) and AX.25 UI encapsulation for Direwolf and hardware TNCs |
-| `hm-xfer` | Fountain-coded (RaptorQ) transfer engine: OFFER + symbol bursts, ACKs with the missing count, hash-verified delivery, signed delivery receipts, duplicate suppression, per-sender resource limits, loss-adaptive burst sizing, random exponential backoff, airtime budget |
+| `hm-xfer` | Fountain-coded (RaptorQ) transfer engine: OFFER + symbol bursts, ACKs with the missing count, hash-verified delivery, signed delivery receipts, duplicate suppression, per-sender resource limits, sessions (OPEN with feature bits and limits, CLOSE for busy, refused or too large), loss-adaptive burst sizing, random exponential backoff, airtime budget |
 | `hm-store` | Persistent store on `redb` (pure Rust, crash-safe): content-addressed messages, inbox, outbox ordered by precedence, retries with exponential backoff, exactly-once across restarts |
 | `hm-net` | Internet links: QUIC with mutual TLS 1.3 on Ed25519 station keys (only trusted stations connect), automatic redial, one stream per bundle with a signed receipt |
 | `hm-modem-afsk` | Our own AFSK 1200 modem (Bell 202), pure Rust and `no_std`: HDLC framing and CRC, multi-slicer demodulator with per-tone AGC and PLL clock recovery, carrier detect |
 | `hm-rig` | Radio hardware: sound cards through `cpal` (ALSA, CoreAudio, WASAPI); PTT by rigctld (Hamlib CAT), serial RTS/DTR, CM108 GPIO (AIOC, Digirig) or VOX; a virtual radio channel for tests |
 | `hm-cli` | The `hm` command: `node` (the station daemon: radio and/or internet links, web interface, JSON API with access token, settings applied live), `keygen`, `whoami`, `trust`, `send`, `listen`, all set up by one `station.toml`; KISS links over TCP or a serial port, and a real-time driver |
 
-Phase 1 still to do: an on-air test, IL2P framing and better decoding deep in noise for
+Phase 1 still to do: the on-air test ([plan](docs/on-air-test-plan.md)), IL2P framing and better decoding deep in noise for
 the built-in modem, stream modems (Mercury, ARDOP, VARA) as radio bearers,
-CTRL session open/close, and the Dioxus interface with a setup wizard. Relaying mail through
+and the Dioxus interface with a setup wizard. Relaying mail through
 other nodes is Phase 2.
 
 ## Run a station
@@ -271,19 +271,19 @@ airtime). SNR is measured in a 3 kHz bandwidth.
 
 | Scenario | Result | Reproduce |
 | --- | --- | --- |
-| 1 kB, 10% frame loss both ways, 10,000 trials | 100% delivered, 0 duplicates, every receipt verified; latency p50 9.0 s, p95 23.0 s | `HM_XFER_TRIALS=10000 cargo test -p hm-xfer --release --test sim exit_criterion_1kb -- --nocapture` |
-| 5 kB, clean link | hm headers and preambles 9.2%, OFFER and ACK with receipt 1.9%, TXDELAY and TXTAIL 2.8%; AX.25 framing and bit stuffing 9.5%; 73.7% of airtime is useful payload | `cargo test -p hm-xfer --release --test sim exit_criterion_overhead -- --nocapture` |
+| 1 kB, 10% frame loss both ways, 10,000 trials | 100% delivered, 0 duplicates, every receipt verified; latency p50 9.3 s, p95 23.9 s | `HM_XFER_TRIALS=10000 cargo test -p hm-xfer --release --test sim exit_criterion_1kb -- --nocapture` |
+| 5 kB, clean link | hm headers and preambles 9.6%, OPEN, OFFER and ACK with receipt 2.2%, TXDELAY and TXTAIL 2.7%; AX.25 framing and bit stuffing 9.9%; 72.6% of airtime is useful payload | `cargo test -p hm-xfer --release --test sim exit_criterion_overhead -- --nocapture` |
 | 2 kB, bursty loss (Gilbert–Elliott, ~12% mean) | 100/100 delivered | `cargo test -p hm-xfer --release --test sim bursty -- --nocapture` |
-| Two hidden senders to one node, no CSMA | 30/30 both delivered, last within 199 s | `cargo test -p hm-xfer --release --test sim two_senders -- --nocapture` |
-| 2 kB over the modem's measured loss at 7 / 8 / 9 dB SNR | 100/100 delivered at each; latency p50 26.1 / 17.2 / 17.1 s | `cargo test -p hm-xfer --release --test sim measured_modem -- --nocapture` |
-| Four stations to one hub, 1.5 kB each, 9 dB, all hear each other | without CSMA: last delivery p50 231 s, 4.8 overs per object, 124 receptions lost to collisions per run; with CSMA: p50 131 s, 1.9 overs per object, 47 lost, all from stations keying up within the 125 ms carrier-detect delay of each other | `cargo test -p hm-xfer --release --test sim busy_channel -- --nocapture` |
+| Two hidden senders to one node, no CSMA | 30/30 both delivered, last within 141 s | `cargo test -p hm-xfer --release --test sim two_senders -- --nocapture` |
+| 2 kB over the modem's measured loss at 7 / 8 / 9 dB SNR | 100/100 delivered at each; latency p50 26.7 / 17.5 / 17.5 s | `cargo test -p hm-xfer --release --test sim measured_modem -- --nocapture` |
+| Four stations to one hub, 1.5 kB each, 9 dB, all hear each other | without CSMA: last delivery p50 251 s, 4.8 overs per object, 153 receptions lost to collisions per run; with CSMA: p50 126 s, 1.8 overs per object, 44 lost, all from stations keying up within the 125 ms carrier-detect delay of each other | `cargo test -p hm-xfer --release --test sim busy_channel -- --nocapture` |
 | Receiver never keys up during an over, 8 kB at 15% loss | 0 frames talked over in 40 runs | `cargo test -p hm-xfer --release --test sim nobody_talks -- --nocapture` |
 | Modem frame loss vs SNR, 48 kHz, white noise | 50% of 40-byte frames lost at 5.5 dB, 41% of 360-byte frames at 7 dB, none above 9.5 dB; table in `crates/hm-sim/src/afsk_1200.rs` | `HM_WRITE_CURVE=1 cargo test -p hm-sim --release --test afsk afsk_1200_curve -- --ignored` |
 | Modem carrier detect | 68–101 ms after key-up at 7–20 dB SNR | `cargo test -p hm-sim --release --test afsk carrier_detect -- --nocapture` |
 | Modem vs Direwolf 1.7, `gen_packets -n 100` at 11–48 kHz | 241 frames decoded vs 236 for Direwolf's better profile (102%) | `cargo test -p hm-modem-afsk --release --test modem -- --nocapture` (needs `direwolf` installed) |
 | Modem vs Direwolf 1.7, held out: tilt ±6 dB/octave, SNR down to −4 dB | 322 vs 335 (96%); behind Direwolf deep in the noise | same |
 | Modem interop | Direwolf decodes 50/50 of our frames, clean and at 12 dB SNR | same |
-| 5% undetected frame corruption | 38/40 delivered, none corrupt | `cargo test -p hm-xfer --release --test sim heavy_corruption -- --nocapture` |
+| 5% undetected frame corruption | 33/40 delivered (92% over 400 runs), none corrupt | `cargo test -p hm-xfer --release --test sim heavy_corruption -- --nocapture` |
 
 The wire format is in [SPEC.md](SPEC.md), with test vectors verified by an
 independent Python implementation.

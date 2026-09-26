@@ -53,7 +53,7 @@ callsign is always in clear.
 | 0 | DATA | preamble and one RaptorQ symbol (section 7) |
 | 1 | ACK | section 3 |
 | 2 | SYNC | set reconciliation (defined in Phase 2) |
-| 3 | CTRL | first byte is the message type: 0x01 OFFER (section 7); others reserved |
+| 3 | CTRL | first byte is the message type: 0x01 OFFER, 0x02 OPEN, 0x03 CLOSE (section 7); others reserved |
 | 4 | BEACON | presence and identification (section 8) |
 
 Receivers drop frames with an unknown version or type.
@@ -225,7 +225,55 @@ nothing about who received it.
 **Receiver resources** (recommended): cap concurrent incoming transfers overall
 and per sender (8 and 2 by default). When full, evict the least valuable
 transfer: not finished before finished, no OFFER before OFFER seen, then fewest
-symbols, then least recently heard.
+symbols, then least recently heard. When every slot holds an offered, unfinished
+transfer from other senders, answer a new sender's OFFER with CLOSE busy instead.
+
+### Sessions
+
+Two stations tell each other what they offer and accept with OPEN, and a
+receiver that cannot take a transfer says so with CLOSE. Neither costs a
+turnaround: they travel in overs and answers that are sent anyway.
+
+OPEN (CTRL payload, 12 bytes):
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 1 | 0x02 |
+| 1 | 1 | flags: 0x01 reply (answers the peer's OPEN); other bits 0 |
+| 2 | 4 | feature bits: 0x01 mailbox (holds mail for others), 0x02 relay (passes bundles on, Phase 2), 0x04 IL2P (decodes IL2P framing on this link); unknown bits are ignored |
+| 6 | 3 | largest object accepted |
+| 9 | 2 | largest symbol size accepted (a multiple of 8) |
+| 11 | 1 | transfers accepted at once from this peer |
+
+CLOSE (CTRL payload, 4 bytes):
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 1 | 0x03 |
+| 1 | 1 | reason: 0 done (the sender has nothing more; the receiver may forget its finished transfers), 1 busy, 2 refused, 3 too large; unknown reasons count as refused |
+| 2 | 2 | seconds before trying again (busy); 0 otherwise |
+
+The frame header's session names the transfer the message belongs to; a CLOSE
+with session 0 applies to every transfer between the two stations.
+
+Rules:
+
+- A sender that has no OPEN from the peer from the last half hour puts its own
+  OPEN (flags 0) first in the first over of a transfer, before the OFFER, and
+  again in its probes until the peer answers.
+- A receiver answers an OPEN (flags 0) with its own (flags 1) in front of its
+  next ACK or CLOSE to that station, or of its next over to it.
+- A sender that holds the peer's OPEN sends no object larger than its limit
+  (the transfer fails at once) and no symbols larger than its limit.
+- A receiver answers an OFFER for an object larger than it accepts with CLOSE
+  too large, and a busy receiver answers with CLOSE busy, both once the over
+  ends, like an ACK. It does not collect symbols for such a transfer.
+- A DATA frame of the same transfer whose length the receiver accepts shows
+  that the OFFER was corrupted: the receiver then does not send CLOSE too large.
+- On CLOSE busy, the sender waits the given time, then offers again. On CLOSE
+  refused, the transfer fails. On CLOSE too large, it fails if the peer's OPEN
+  gives a limit below the object's length; otherwise the CLOSE answered a
+  corrupted OFFER, and the sender sends its OPEN and OFFER again.
 
 ## 8. Beacons
 
@@ -352,14 +400,19 @@ wire 82585ea90000014600004f8af6fb028282004600000207586b82036f71736c406578616d706
 ax25 909a9c8aa840e0a6826096829a6103f00000004f8af6fb001b97cbd86bbeef01234568656c6c6f
 kiss c000909a9c8aa840e0a6826096829a6103f00000004f8af6fb001b97cbd86bbeef01234568656c6c6fc0
 
-## Transfer of the chat bundle (SA0KAM -> SO5KM-1, symbol size 200, first over)
+## Transfer of the chat bundle (SA0KAM -> SO5KM-1, symbol size 200, first over, opening the session)
 object_id 26a90b587084a213a812a105b23553637c1afd5c125fc66381203f4583e09807
+open  0300004f8af6fb001b97cbd86bf2b4000000020000000000040000fff802
 offer 0300004f8af6fb001b97cbd86bf2b40000000126a90b587084a213a812a105b23553637c1afd5c125fc66381203f4583e0980700007700c80001
 data  0000004f8af6fb001b97cbd86bf2b400000000007700825832a70000014600004f8af6fb028182004600000207586b0301051a6ab13b8006190e100882004c3733206465205341304b414d5840ce3c7adc856375a2ce7cbb47011edcbbfa93ff43bf4346232367268be9e35cf86d01b31ab2408b6ba8954f5088b430c211eca59261c6d9805cd446f9773aa602000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 
-## Receipt ACK from SO5KM-1 (secret 0x0c x 32) for that transfer
+## Receipt ACK from SO5KM-1 (secret 0x0c x 32) for that transfer, after its OPEN reply
 public key 0b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e39f2d
+open  03001b97cbd86b00004f8af6fbf2b4000000020100000000040000fff802
 ack   01001b97cbd86b00004f8af6fbf2b4000000000080ff00000126a90b587084a21311b09926955fc1657ddf7c42bcd35089e157a8f522ae8b7fdef4005e57dfc38369d6f4e7ee8c50ba3f1b1fb1659e1139f6b4bc0d8783a6ea8ed55498b5025204
+
+## CLOSE from SO5KM-1 to SA0KAM (busy, retry after 90 s, session 0xBEEF)
+close 03001b97cbd86b00004f8af6fbbeef0000000301005a
 
 ## Beacon from SA0KAM-10 (secret 0x0b x 32, mailbox, JO89xi, heard SO5KM-1 3 min ago)
 beacon 04a53e713ef6fbffffffffffff00000000000166be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a6ab13b804a4f3839584901001b97cbd86b036310c680632414ca1c334f57df9df4b445475c36b99df19b143662928e5b8bdb1a2d9709298a363a5c9781d062ccba553c8b2b75e4a78d978bb209f6f2fac302
@@ -367,6 +420,5 @@ beacon 04a53e713ef6fbffffffffffff00000000000166be7e332c7a453332bd9d0a7f7db055f5c
 
 ## 13. Not yet specified
 
-CTRL session open/close with feature bits (later in Phase 1);
 SYNC reconciliation messages and the node directory (Phase 2); body compression
 dictionaries (codec 1, reserved).
