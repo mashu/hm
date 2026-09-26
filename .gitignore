@@ -4,4 +4,6 @@
 fuzz/target
 fuzz/artifacts
 fuzz/coverage
-station.*
+# Runtime files from `hm node` / `hm keygen` in the repo root.
+# A leading slash so this does not match crates/hm-cli/src/station.rs.
+/station.*
