@@ -117,6 +117,7 @@ struct Setup<'a> {
     internet: Option<InternetConfig>,
     store: &'a Tmp,
     retry: RetryPolicy,
+    beacon_every: Option<Duration>,
 }
 
 fn start(s: Setup) -> NodeHandle {
@@ -133,6 +134,7 @@ fn start(s: Setup) -> NodeHandle {
                 params: TncParams::default(),
             },
             timing: FAST,
+            beacon_every: s.beacon_every,
         }),
         internet: s.internet,
         costs: Costs::default(),
@@ -178,6 +180,7 @@ fn radio_nodes_exchange_mail_and_survive_a_restart() {
         internet: None,
         store: &b_db,
         retry: RetryPolicy::default(),
+        beacon_every: None,
     };
     let b = start(b_setup());
     let a = start(Setup {
@@ -188,6 +191,7 @@ fn radio_nodes_exchange_mail_and_survive_a_restart() {
         internet: None,
         store: &a_db,
         retry: RetryPolicy::default(),
+        beacon_every: None,
     });
 
     // The page is public; the API wants the token.
@@ -260,6 +264,7 @@ fn mail_waits_while_the_receiver_is_off_air() {
         internet: None,
         store: &a_db,
         retry: QUICK,
+        beacon_every: None,
     });
     send(a.http_addr, json!({"to": "SO5KM-1", "text": "are you there?"}));
     let queued = wait_for(Duration::from_secs(60), "a failed attempt", || {
@@ -279,6 +284,7 @@ fn mail_waits_while_the_receiver_is_off_air() {
         internet: None,
         store: &b_db,
         retry: QUICK,
+        beacon_every: None,
     });
     delivered(a.http_addr, 1, "delivery after the receiver came up");
     assert_eq!(inbox(b.http_addr)[0]["text"], "are you there?");
@@ -302,6 +308,7 @@ fn internet_only_nodes_exchange_mail_both_ways() {
         }),
         store: &c_db,
         retry: QUICK,
+        beacon_every: None,
     });
     let server_addr = server.internet_addr.unwrap();
     let a = start(Setup {
@@ -315,6 +322,7 @@ fn internet_only_nodes_exchange_mail_both_ways() {
         }),
         store: &a_db,
         retry: QUICK,
+        beacon_every: None,
     });
     assert!(get(a.http_addr, "/api/status")["radio"].is_null());
     send(a.http_addr, json!({"to": "SO5KM", "text": "via the internet"}));
@@ -350,6 +358,7 @@ fn radio_first_and_the_internet_when_radio_fails() {
         }),
         store: &a_db,
         retry: QUICK,
+        beacon_every: None,
     });
     let b = start(Setup {
         key: &bob,
@@ -362,6 +371,7 @@ fn radio_first_and_the_internet_when_radio_fails() {
         }),
         store: &b_db,
         retry: QUICK,
+        beacon_every: None,
     });
     wait_for(Duration::from_secs(20), "the internet link and the radio", || {
         let st = get(a.http_addr, "/api/status");
@@ -390,6 +400,40 @@ fn radio_first_and_the_internet_when_radio_fails() {
     assert_eq!(texts, vec!["two", "one"]);
     let est = get(a.http_addr, "/api/status")["estimates"].clone();
     eprintln!("estimates after the band died: {est}");
+    a.stop().unwrap();
+    b.stop().unwrap();
+}
+
+#[test]
+fn radio_nodes_beacon_and_list_each_other() {
+    let tnc = fake_tnc(0);
+    let (alice, bob) = keys();
+    let (a_db, b_db) = (Tmp::new("a-beacon"), Tmp::new("b-beacon"));
+    let setup = |key, me, peer, store| Setup {
+        key,
+        me,
+        peer,
+        tnc: Some(tnc.addr),
+        internet: None,
+        store,
+        retry: QUICK,
+        beacon_every: Some(Duration::from_secs(2)),
+    };
+    let a = start(setup(&alice, "SA0KAM", &bob, &a_db));
+    let b = start(setup(&bob, "SO5KM-1", &alice, &b_db));
+    // Each lists the other as trusted, and the other's beacon says it hears us.
+    for (node, me, other) in [(&a, "SA0KAM", "SO5KM-1"), (&b, "SO5KM-1", "SA0KAM")] {
+        let seen = wait_for(Duration::from_secs(30), "a beacon listing us", || {
+            let st = get(node.http_addr, "/api/status");
+            st["heard"].as_array().unwrap().iter().find_map(|h| {
+                let hears_us = h["hears"].as_array().is_some_and(|l| l.iter().any(|c| c == me));
+                (h["station"] == other && hears_us).then(|| h.clone())
+            })
+        });
+        assert_eq!(seen["key"], "trusted", "{seen}");
+        assert_eq!(seen["offers"], serde_json::json!([]), "{seen}");
+        assert!(seen["clock_offset"].as_i64().unwrap().abs() <= 5, "{seen}");
+    }
     a.stop().unwrap();
     b.stop().unwrap();
 }

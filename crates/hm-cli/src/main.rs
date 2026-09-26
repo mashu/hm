@@ -94,6 +94,10 @@ enum Cmd {
         /// Relative cost of a delivery attempt over the internet.
         #[arg(long, default_value_t = 2.0)]
         internet_cost: f64,
+        /// Send a signed BEACON (presence and identification) about this often
+        /// on the radio, in minutes; 0 sends none.
+        #[arg(long, default_value_t = 10)]
+        beacon_minutes: u64,
     },
     /// List the sound cards the built-in modem can use.
     AudioDevices,
@@ -377,6 +381,7 @@ fn node(
     listen: Option<std::net::SocketAddr>,
     peers: &[String],
     costs: hm_cli::node::choose::Costs,
+    beacon_minutes: u64,
 ) -> Result<(), String> {
     let (key, me) = s.open()?;
     let trust = load_trust(trust)?;
@@ -422,6 +427,7 @@ fn node(
         hm_cli::node::RadioConfig {
             link,
             timing: s.timing(),
+            beacon_every: (beacon_minutes > 0).then(|| Duration::from_secs(60 * beacon_minutes)),
         }
     });
     if radio.is_none() && internet.is_none() {
@@ -496,6 +502,7 @@ fn main() -> ExitCode {
             peers,
             radio_cost,
             internet_cost,
+            beacon_minutes,
         } => node(
             station,
             trust.as_deref(),
@@ -508,6 +515,7 @@ fn main() -> ExitCode {
                 radio: *radio_cost,
                 internet: *internet_cost,
             },
+            *beacon_minutes,
         ),
     };
     match result {

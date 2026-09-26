@@ -76,6 +76,13 @@
   #token-form label { margin: 0; flex-basis: 100%; }
   #token-form input { flex: 1 1 16rem; width: auto; }
   #token-form button { margin: 0; }
+  #heard-section { margin-top: 2rem; }
+  ul.heard { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--rule); }
+  ul.heard li { padding: 0.5rem 0; border-bottom: 1px solid var(--rule); }
+  ul.heard .detail { display: block; font-size: 0.9rem; color: var(--muted); }
+  ul.heard .detail.ok { color: var(--ok); } ul.heard .detail.warn { color: var(--warn); }
+  ul.heard .detail.bad { color: var(--bad); font-weight: 700; }
+  ol.log li.empty { display: block; }
 </style>
 </head>
 <body>
@@ -108,6 +115,10 @@
       <button type="submit">Queue message</button>
       <p id="form-status" role="status"></p>
     </form>
+    <div id="heard-section" aria-labelledby="heard-title">
+      <h2 id="heard-title">Heard on the radio</h2>
+      <ul class="heard" id="heard"></ul>
+    </div>
   </section>
   <section aria-labelledby="log-title">
     <h2 id="log-title" hidden>Messages</h2>
@@ -201,6 +212,36 @@ async function refresh() {
   }
 }
 
+const ago = (s) => s < 90 ? s + " s ago" : s < 5400 ? Math.round(s / 60) + " min ago" : Math.round(s / 3600) + " h ago";
+const KEY = {
+  trusted: ["Key matches your trust file", "ok"],
+  unknown: ["Not in your trust file", "warn"],
+  mismatch: ["Key differs from your trust file: an impostor, or a new key", "bad"],
+};
+
+function renderHeard(list) {
+  const ul = document.getElementById("heard");
+  ul.replaceChildren();
+  if (!list || list.length === 0) {
+    ul.append(el("li", "empty", "No stations heard yet."));
+    return;
+  }
+  for (const h of list) {
+    const li = el("li");
+    li.append(el("span", "who", h.station), el("span", "when", " · " + ago(h.ago)));
+    if (h.key) {
+      const [text, cls] = KEY[h.key] || [h.key, "warn"];
+      li.append(el("span", "detail " + cls, text));
+      const offers = h.offers.length ? "Offers " + h.offers.join(", ") + ". " : "";
+      const hears = h.hears.length ? "Hears " + h.hears.join(", ") + "." : "Hears no one yet.";
+      li.append(el("span", "detail", offers + hears));
+    } else {
+      li.append(el("span", "detail", "No beacon heard yet."));
+    }
+    ul.append(li);
+  }
+}
+
 async function loadStatus() {
   try {
     const s = await (await api("/api/status")).json();
@@ -211,6 +252,8 @@ async function loadStatus() {
     const peers = s.internet_peers.length ? "linked to " + s.internet_peers.join(", ") : "no stations linked";
     const net = s.internet_listen ? " Internet: " + peers + "." : "";
     document.getElementById("station-line").textContent = radio + net + " Your trust-file line: " + s.trust_line;
+    document.getElementById("heard-section").hidden = s.radio === null;
+    renderHeard(s.heard);
     document.getElementById("token-form").hidden = true;
   } catch (e) {
     document.getElementById("station-line").textContent = "Cannot reach the node: " + e.message;

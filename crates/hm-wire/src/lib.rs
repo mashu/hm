@@ -4,6 +4,7 @@
 //! - [`FrameHeader`]: the 18-byte header carried by every radio frame.
 //! - [`Ack`]: the fixed-layout acknowledgement payload.
 //! - [`DataPreamble`] and [`Offer`]: DATA and CTRL payloads used by transfers.
+//! - [`Beacon`]: signed presence and identification, broadcast.
 //! - [`ObjectId`]: 32-byte content hash naming bundles, records and attachments.
 //!
 //! Layouts are specified in `SPEC.md` at the repository root.
@@ -13,12 +14,14 @@
 extern crate alloc;
 
 mod ack;
+mod beacon;
 mod callsign;
 mod data;
 mod frame;
 mod id;
 
 pub use ack::{Ack, MAX_ACK_COMPLETED, NEED_OFFER, RECEIPT_LEN};
+pub use beacon::{Beacon, Heard, BEACON_SIG_PREFIX, FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY, MAX_HEARD};
 pub use callsign::{Callsign, CALLSIGN_MAX_LEN};
 pub use data::{DataPreamble, Offer, CTRL_OFFER, DATA_PREAMBLE_LEN, MAX_OBJECT_LEN, OFFER_LEN};
 pub use frame::{Dest, FrameHeader, FrameType, HEADER_LEN, MAX_INDEX, WIRE_VERSION};

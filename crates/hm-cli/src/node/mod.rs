@@ -3,7 +3,8 @@
 //! One process owns the store and the bearers:
 //!
 //! - **radio** (optional): a thread running the transfer engine over a KISS
-//!   TNC, reconnecting if the TNC goes away;
+//!   TNC or the built-in modem, reconnecting if the link goes away. It also
+//!   sends a signed BEACON now and then, and keeps the table of stations heard;
 //! - **internet** (optional): QUIC links to other stations (`hm-net`).
 //!
 //! A coordinator hands every due outbound message to one bearer, chosen per
@@ -17,6 +18,7 @@
 
 mod api;
 pub mod choose;
+pub mod heard;
 
 use std::collections::BTreeMap;
 use std::io;
@@ -31,7 +33,8 @@ use hm_bundle::Address;
 use hm_core::{DetRng, Input, Machine, Millis, Output};
 use hm_net::{Net, NetConfig, NetError, Verdict};
 use hm_store::{Retry, RetryPolicy, Store};
-use hm_wire::{Callsign, ObjectId};
+use hm_wire::{Callsign, FrameHeader, ObjectId, FLAG_INTERNET};
+use hm_xfer::beacon::{beacon_frame, read_beacon};
 use hm_xfer::{Command, Event, Failure, Receipt};
 
 use crate::driver::Link;
@@ -62,6 +65,8 @@ pub enum RadioLink {
 pub struct RadioConfig {
     pub link: RadioLink,
     pub timing: LinkTiming,
+    /// How often to send a BEACON (with ±10% jitter); `None` sends none.
+    pub beacon_every: Option<Duration>,
 }
 
 impl RadioConfig {
@@ -104,6 +109,8 @@ pub struct Status {
     pub internet_peers: Vec<Callsign>,
     /// (station, bearer, estimated success rate)
     pub estimates: Vec<(Callsign, &'static str, f64)>,
+    /// Stations heard on the radio, most recent first.
+    pub heard: Vec<heard::Station>,
 }
 
 /// A running node.
@@ -159,6 +166,7 @@ enum RadioEvt {
     Received { from: Callsign, object: Vec<u8> },
     Delivered { xfer_id: ObjectId, receipt: Receipt },
     Failed { xfer_id: ObjectId, reason: Failure },
+    Heard(Vec<heard::Station>),
 }
 
 /// The one gate for everything that arrives: a bundle, addressed to us, not
@@ -400,6 +408,9 @@ async fn coordinator(
                 RadioEvt::Received { from, object } => {
                     accept(store, &cfg.trust, cfg.me, from, &object);
                 }
+                RadioEvt::Heard(list) => {
+                    status.lock().expect("lock").heard = list;
+                }
                 RadioEvt::Delivered { xfer_id, receipt } => {
                     if let Some(id) = radio_ids.remove(&xfer_id) {
                         if let Some(f) = in_flight.remove(&id) {
@@ -479,6 +490,12 @@ async fn coordinator(
 }
 
 const RECONNECT: Duration = Duration::from_secs(5);
+/// The first beacon goes out at a random moment in this window after the radio
+/// comes up (or between half and one beacon interval, if that is shorter), so
+/// stations started together do not all beacon at once.
+const FIRST_BEACON_MS: (u64, u64) = (5_000, 30_000);
+/// Heard-table updates reach the status API at least this often.
+const HEARD_REPORT: Duration = Duration::from_secs(30);
 const MAX_WAIT: Duration = Duration::from_millis(200);
 
 /// Keep a KISS link up and run the transfer engine on it.
@@ -541,7 +558,34 @@ fn radio_session(
     let start = Instant::now();
     let now = || Millis(start.elapsed().as_millis() as u64);
     let mut out: Vec<Output<Event>> = Vec::new();
+    let mut rng = DetRng::from_seed(getrandom::u64().unwrap_or(0xBEAC));
+    let flags = if cfg.internet.is_some() { FLAG_INTERNET } else { 0 };
+    let mut heard = heard::HeardTable::default();
+    let mut next_beacon = rc.beacon_every.map(|every| {
+        let every = every.as_millis() as u64;
+        let (lo, hi) = (FIRST_BEACON_MS.0.min(every / 2), FIRST_BEACON_MS.1.min(every));
+        start + Duration::from_millis(lo + rng.below(hi - lo + 1))
+    });
+    let mut heard_changed = false;
+    let mut last_report = Instant::now();
     loop {
+        if let (Some(at), Some(every)) = (next_beacon, rc.beacon_every) {
+            if Instant::now() >= at {
+                let t = unix_now();
+                let frame = beacon_frame(&cfg.key.identity, cfg.me, flags, t as u32, heard.for_beacon(t))
+                    .map_err(|e| io::Error::other(format!("beacon: {e}")))?;
+                link.send(&frame)?;
+                let jitter = every.as_millis() as u64 / 10;
+                let ms = every.as_millis() as u64 - jitter + rng.below(2 * jitter + 1);
+                next_beacon = Some(Instant::now() + Duration::from_millis(ms));
+            }
+        }
+        if heard_changed || last_report.elapsed() >= HEARD_REPORT {
+            heard.expire(unix_now());
+            let _ = events.send(RadioEvt::Heard(heard.list()));
+            heard_changed = false;
+            last_report = Instant::now();
+        }
         while let Ok(RadioCmd::Send {
             object,
             to,
@@ -583,10 +627,41 @@ fn radio_session(
                 let wait = next
                     .map_or(MAX_WAIT, |d| Duration::from_millis(d.0 - t.0))
                     .min(MAX_WAIT);
+                let wait = match next_beacon {
+                    Some(at) => wait.min(at.saturating_duration_since(Instant::now())),
+                    None => wait,
+                };
                 if let Some(frame) = link.recv_timeout(wait)? {
+                    heard_changed |= hear(&mut heard, &cfg.trust, cfg.me, &frame);
                     x.handle(now(), Input::Frame { port, data: frame }, &mut out);
                 }
             }
         }
+    }
+}
+
+/// Note the station a frame came from, and check its beacon if it is one;
+/// true when the table changed in a way worth reporting.
+fn hear(table: &mut heard::HeardTable, trust: &Trust, me: Callsign, frame: &[u8]) -> bool {
+    let Ok((h, _)) = FrameHeader::decode(frame) else {
+        return false;
+    };
+    if h.src == me {
+        return false;
+    }
+    let t = unix_now();
+    let new = table.frame(t, h.src);
+    match read_beacon(frame) {
+        Some(b) => {
+            if table.beacon(t, &b, trust) == heard::KeyCheck::Mismatch {
+                log(format!(
+                    "beacon from {} carries a different key than the trust file lists for {}",
+                    b.from,
+                    b.from.base()
+                ));
+            }
+            true
+        }
+        None => new,
     }
 }

@@ -187,6 +187,7 @@ fn start(ether: &Ether, key: &KeyFile, me: &str, peer: &KeyFile, db: &Tmp) -> no
                 guard_ms: 1500,
                 max_rounds: 12,
             },
+            beacon_every: None,
         }),
         internet: None,
         costs: Costs::default(),

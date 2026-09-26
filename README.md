@@ -41,6 +41,12 @@ is also kept beside the store (`station.token`); the page asks for it if you ope
 plain address. The node keeps every message in `station.db` and retries undelivered mail
 with growing delays (1 minute doubling to an hour, 12 attempts).
 
+Every 10 minutes (`--beacon-minutes`, 0 for none) the node sends a signed beacon on the
+radio: its callsign and key, whether it has internet links, and the stations it has heard in
+the last hour. The status page lists every station heard, and for those that beacon whether
+their key matches your trust file. A beacon never adds a key to the trust file; a key that
+differs from the listed one is logged as a warning.
+
 ### The built-in modem
 
 Without Direwolf, the node runs its own AFSK 1200 modem on a sound card:
@@ -85,7 +91,7 @@ the queue; passing mail on through other nodes comes in Phase 2.
 
 | Method | Path | |
 | --- | --- | --- |
-| GET | `/api/status` | callsign, key, radio and internet state, estimated delivery rate per station and link |
+| GET | `/api/status` | callsign, key, radio and internet state, estimated delivery rate per station and link, stations heard on the radio with their beacons |
 | GET | `/api/messages?direction=in\|out&limit=n` | newest first, with delivery state and link |
 | POST | `/api/send` | `{"to", "text", "subject"?, "precedence"?}` → `201 {"id"}` |
 | POST | `/api/read/{id}` | mark an inbound message read |
@@ -186,7 +192,7 @@ cargo install --path crates/hm-cli   # installs the `hm` command
 | Simulator vs independent oracle | `HM_SEEDS=10000 cargo test -p hm-sim --release --test oracle` | 100 seeds | 10,000 seeds |
 | Simulated channel vs the modem | airtime of AX.25 frames against the modulator's output; carrier-detect delay against the demodulator; the frame-loss table re-measured (`cargo test -p hm-sim --release --test afsk -- --include-ignored`) | airtime, carrier detect | loss table |
 | Decoder mutations (no panic, no forgery) | `HM_MUTATIONS=1000000 cargo test -p hm-bundle --release --test mutations` | 5,000 | 1,000,000 |
-| Coverage-guided fuzzing | `cd fuzz && cargo +nightly fuzz run <target>`; targets: frame, ack, envelope, bundle, binding, callsign, kiss, ax25, xfer | compile only | 10 min per target |
+| Coverage-guided fuzzing | `cd fuzz && cargo +nightly fuzz run <target>`; targets: frame, ack, envelope, bundle, binding, callsign, kiss, ax25, xfer, beacon | compile only | 10 min per target |
 | Cross-platform determinism | pinned trace hash of a reference simulation | Linux, Windows, macOS | |
 | End to end over TCP | fake KISS TNC relaying frames (with drops and APRS noise) between `hm listen` and `hm send` processes | yes | |
 | KISS over serial | pseudo-terminals as serial TNCs: channel-access parameters on opening, frames both ways, the port released on close, `hm send` and `hm listen` delivering through two serial TNCs | Linux, macOS | |
