@@ -129,9 +129,27 @@ def check(text: str) -> None:
             assert d[22:] == chat_wire.ljust(200, b"\x00"), "systematic source symbol"
     print(f"ok  transfer OFFER and {len(datas)} DATA frame(s), systematic symbol")
 
+    # The first over to a new peer opens the session: OPEN before the OFFER,
+    # with the sender's features and limits (256 KiB, symbols up to 65528, 2 at once).
+    def check_open(frame, src, dst, reply):
+        assert frame[0] == 0x03 and unpack(frame[1:7]) == src and unpack(frame[7:13]) == dst
+        assert frame[13:15] == offer[13:15] and frame[15:18] == bytes(3), "session of the transfer, index 0"
+        body = frame[18:]
+        assert len(body) == 12 and body[0] == 0x02 and body[1] == (1 if reply else 0)
+        assert int.from_bytes(body[2:6], "big") == 0, "no features"
+        assert int.from_bytes(body[6:9], "big") == 256 * 1024
+        assert int.from_bytes(body[9:11], "big") == 65528 and body[11] == 2
+
+    lines = [l.split() for l in s_x.splitlines() if l[:5] in ("open ", "offer", "data ")]
+    assert [l[0] for l in lines[:2]] == ["open", "offer"], "OPEN comes first"
+    check_open(bytes.fromhex(lines[0][1]), "SA0KAM", "SO5KM-1", reply=False)
+    print("ok  OPEN before the first OFFER")
+
     # The receiver's final ACK: need 0, the id prefix, and a receipt signature
     # over "hm/xfer-receipt/v0" || receiver || sender || session || object id.
     s_r = section(text, "## Receipt ACK")
+    check_open(bytes.fromhex(re.search(r"open  ([0-9a-f]+)", s_r).group(1)), "SO5KM-1", "SA0KAM", reply=True)
+    print("ok  OPEN reply before the ACK")
     ack = bytes.fromhex(re.search(r"ack   ([0-9a-f]+)", s_r).group(1))
     receiver = nacl.signing.SigningKey(bytes([12] * 32)).verify_key
     assert ack[0] == 0x01 and unpack(ack[1:7]) == "SO5KM-1" and unpack(ack[7:13]) == "SA0KAM"
@@ -143,6 +161,13 @@ def check(text: str) -> None:
     statement = b"hm/xfer-receipt/v0" + ack[1:7] + ack[7:13] + ack[13:15] + bytes.fromhex(xid)
     receiver.verify(statement, receipt)
     print("ok  receipt ACK (signature by the receiver)")
+
+    # CLOSE: CTRL type 0x03, then reason 1 (busy) and 90 s to wait.
+    s_c = section(text, "## CLOSE")
+    c = bytes.fromhex(re.search(r"close ([0-9a-f]+)", s_c).group(1))
+    assert c[0] == 0x03 and unpack(c[1:7]) == "SO5KM-1" and unpack(c[7:13]) == "SA0KAM"
+    assert c[13:15] == b"\xbe\xef" and c[18:] == bytes([0x03, 1, 0, 90])
+    print("ok  CLOSE (busy, retry after)")
 
     # Beacon: broadcast, session and index 0, flags, key, time, locator, heard list,
     # and a signature over "hm/beacon-sig/v0" || source callsign || body.

@@ -4,6 +4,7 @@
 //! - [`FrameHeader`]: the 18-byte header carried by every radio frame.
 //! - [`Ack`]: the fixed-layout acknowledgement payload.
 //! - [`DataPreamble`] and [`Offer`]: DATA and CTRL payloads used by transfers.
+//! - [`Open`] and [`Close`]: CTRL messages that start and end sessions between two stations.
 //! - [`Beacon`]: signed presence and identification, broadcast.
 //! - [`Locator`]: Maidenhead grid locators, as beacons carry them.
 //! - [`ObjectId`]: 32-byte content hash naming bundles, records and attachments.
@@ -21,6 +22,7 @@ mod data;
 mod frame;
 mod id;
 mod locator;
+mod session;
 
 pub use ack::{Ack, MAX_ACK_COMPLETED, NEED_OFFER, RECEIPT_LEN};
 pub use beacon::{Beacon, Heard, BEACON_SIG_PREFIX, FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY, MAX_HEARD};
@@ -29,6 +31,10 @@ pub use data::{DataPreamble, Offer, CTRL_OFFER, DATA_PREAMBLE_LEN, MAX_OBJECT_LE
 pub use frame::{Dest, FrameHeader, FrameType, HEADER_LEN, MAX_INDEX, WIRE_VERSION};
 pub use id::ObjectId;
 pub use locator::Locator;
+pub use session::{
+    Close, CloseReason, Open, CLOSE_LEN, CTRL_CLOSE, CTRL_OPEN, FEATURE_IL2P, FEATURE_MAILBOX, FEATURE_RELAY,
+    OPEN_LEN, OPEN_REPLY,
+};
 
 /// Errors from encoding or decoding wire structures.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

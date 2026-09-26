@@ -9,7 +9,10 @@ use hm_bearer::{ax25, kiss};
 use hm_bundle::{Address, Bundle, Kind, Precedence};
 use hm_core::{DetRng, Input, Machine, Millis, Output};
 use hm_ident::{Attestation, BindingRecord, Identity, BINDING, BUNDLE};
-use hm_wire::{Ack, Callsign, Dest, FrameHeader, FrameType, Heard, Locator, FLAG_MAILBOX};
+use hm_wire::{
+    Ack, Callsign, Close, CloseReason, Dest, FrameHeader, FrameType, Heard, Locator, CTRL_CLOSE, CTRL_OFFER,
+    CTRL_OPEN, FLAG_MAILBOX,
+};
 use hm_xfer::beacon::beacon_frame;
 use hm_xfer::{object_id, Command, Config, Xfer};
 
@@ -19,6 +22,19 @@ fn hex(b: &[u8]) -> String {
 
 fn call(s: &str) -> Callsign {
     Callsign::parse(s).unwrap()
+}
+
+/// A label for a frame by its type (and CTRL message type).
+fn label(frame: &[u8]) -> &'static str {
+    let (h, p) = FrameHeader::decode(frame).unwrap();
+    match (h.ftype, p.first().copied()) {
+        (FrameType::Ctrl, Some(CTRL_OPEN)) => "open ",
+        (FrameType::Ctrl, Some(CTRL_OFFER)) => "offer",
+        (FrameType::Ctrl, Some(CTRL_CLOSE)) => "close",
+        (FrameType::Data, _) => "data ",
+        (FrameType::Ack, _) => "ack  ",
+        _ => "other",
+    }
 }
 
 fn main() {
@@ -100,7 +116,7 @@ fn main() {
     println!("ax25 {}", hex(&ui));
     println!("kiss {}", hex(&kiss::data_frame(0, &ui)));
 
-    println!("\n## Transfer of the chat bundle (SA0KAM -> SO5KM-1, symbol size 200, first over)");
+    println!("\n## Transfer of the chat bundle (SA0KAM -> SO5KM-1, symbol size 200, first over, opening the session)");
     let object = chat.to_vec();
     println!("object_id {}", object_id(&object));
     let mut cfg = Config::vhf_1200(call("SA0KAM"));
@@ -119,17 +135,12 @@ fn main() {
     let mut over = Vec::new();
     for o in out {
         if let Output::Transmit { data, .. } = o {
-            let kind = match FrameHeader::decode(&data).unwrap().0.ftype {
-                FrameType::Ctrl => "offer",
-                FrameType::Data => "data ",
-                _ => "other",
-            };
-            println!("{kind} {}", hex(&data));
+            println!("{} {}", label(&data), hex(&data));
             over.push(data);
         }
     }
 
-    println!("\n## Receipt ACK from SO5KM-1 (secret 0x0c x 32) for that transfer");
+    println!("\n## Receipt ACK from SO5KM-1 (secret 0x0c x 32) for that transfer, after its OPEN reply");
     let receiver = Identity::from_secret([12; 32]);
     println!("public key {}", hex(&receiver.public().0));
     let mut rcfg = Config::vhf_1200(call("SO5KM-1"));
@@ -143,9 +154,27 @@ fn main() {
     r.on_deadline(t, &mut rout);
     for o in rout {
         if let Output::Transmit { data, .. } = o {
-            println!("ack   {}", hex(&data));
+            println!("{} {}", label(&data), hex(&data));
         }
     }
+
+    println!("\n## CLOSE from SO5KM-1 to SA0KAM (busy, retry after 90 s, session 0xBEEF)");
+    let close = FrameHeader {
+        ftype: FrameType::Ctrl,
+        src: call("SO5KM-1"),
+        dst: Dest::Station(call("SA0KAM")),
+        session: 0xBEEF,
+        index: 0,
+    }
+    .frame(
+        &Close {
+            reason: CloseReason::Busy,
+            retry_after: 90,
+        }
+        .to_bytes(),
+    )
+    .unwrap();
+    println!("close {}", hex(&close));
 
     println!("\n## Beacon from SA0KAM-10 (secret 0x0b x 32, mailbox, JO89xi, heard SO5KM-1 3 min ago)");
     let beacon = beacon_frame(

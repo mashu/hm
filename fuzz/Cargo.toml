@@ -89,3 +89,10 @@ path = "fuzz_targets/beacon.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ctrl"
+path = "fuzz_targets/ctrl.rs"
+test = false
+doc = false
+bench = false
