@@ -96,12 +96,24 @@ even when the file changes; the web page lists them.
 
 ### The web page
 
-`hm node` prints a link such as `http://127.0.0.1:8080/#token=…`. Open it for the inbox,
-the sent log with each message's delivery state, and a form to queue messages. The token
-is also kept beside the store (`station.token`); the page asks for it if you open the
-plain address. The page also lists the trusted stations and has the live settings.
-The node keeps every message in `station.db` and retries undelivered mail with growing
-delays (1 minute doubling to an hour, 12 attempts, set in `[delivery]`).
+`hm node` prints a link such as `http://127.0.0.1:8080/#token=…`. The token is also kept
+beside the store (`station.token`); the page asks for it if you open the plain address.
+The page has four views:
+
+- **Chat**: conversations by station, like a messenger. Type a callsign to start one;
+  Enter sends. Each line shows whether it was delivered, by radio or internet, and whether
+  its signature or receipt verified. Lines from other stations appear as they arrive.
+- **Mail**: messages with a subject and precedence, with an inbox and a sent log.
+- **Stations**: stations heard on the radio (with their beacons, locators, distance and
+  bearing) and the trusted stations, which you can add and remove.
+- **Settings**: everything the node applies without a restart.
+
+The page stays up to date by itself: the node tells it what changed over a server-sent
+event stream (`/api/events`). A chat line between two stations linked over the internet
+arrives within a second; by radio it takes as long as the channel does. Chat and mail are
+both stored and forwarded: a line to a station out of reach waits and goes out when a link
+comes up. The node keeps every message in `station.db` and retries undelivered ones with
+growing delays (1 minute doubling to an hour, 12 attempts, set in `[delivery]`).
 
 Every 10 minutes (`beacon_minutes`, 0 for none) the node sends a signed beacon on the
 radio: its callsign and key, its grid locator (`locator = "JO89xi"` under `[station]`),
@@ -186,8 +198,9 @@ with a radio.
 | Method | Path | |
 | --- | --- | --- |
 | GET | `/api/status` | callsign, key, radio and internet state, estimated delivery rate per station and link, stations heard on the radio with their beacons |
-| GET | `/api/messages?direction=in\|out&limit=n` | newest first, with delivery state and link |
-| POST | `/api/send` | `{"to", "text", "subject"?, "precedence"?}` → `201 {"id"}` |
+| GET | `/api/messages?direction=in\|out\|all&peer=CALL&kind=chat\|mail&limit=n` | newest first, with delivery state and link; `peer` gives one conversation |
+| GET | `/api/events` | server-sent events, one `data:` line naming what changed: `message`, `status` or `settings` |
+| POST | `/api/send` | `{"to", "text", "subject"?, "precedence"?}` → `201 {"id"}`; without a subject it is a chat line |
 | POST | `/api/read/{id}` | mark an inbound message read |
 | GET | `/api/trust` | trusted stations with their notes, and the file they are saved to |
 | POST | `/api/trust` | `{"line": "SO5KM-1 8a1e…", "note"?}` (as `hm whoami` prints it) → `201` |

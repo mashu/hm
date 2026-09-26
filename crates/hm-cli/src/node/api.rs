@@ -8,7 +8,8 @@
 //! | --- | --- | --- |
 //! | GET | `/` | web page |
 //! | GET | `/api/status` | callsign, key, bearers and their estimated success per station |
-//! | GET | `/api/messages?direction=in\|out&limit=n` | newest first |
+//! | GET | `/api/messages?direction=in\|out\|all&peer=CALL&kind=chat\|mail&limit=n` | newest first |
+//! | GET | `/api/events` | server-sent events naming what changed: `message`, `status`, `settings` |
 //! | POST | `/api/send` | `{"to", "text", "subject"?, "precedence"?}` → `{"id"}` |
 //! | POST | `/api/read/{id}` | mark an inbound message read |
 
@@ -26,7 +27,7 @@ use hm_wire::{Callsign, Locator, ObjectId};
 use serde::{Deserialize, Serialize};
 
 use super::live::{Change, LiveConfig};
-use super::{NodeConfig, Status};
+use super::{NodeConfig, Notify, Status};
 use crate::config::RadioSettings;
 use crate::files::Trust;
 use crate::station::{build_bundle, unix_now};
@@ -37,12 +38,14 @@ pub struct AppState {
     pub cfg: Arc<NodeConfig>,
     pub status: Arc<Mutex<Status>>,
     pub live: Arc<LiveConfig>,
+    pub notify: Notify,
 }
 
 pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/api/status", get(status))
         .route("/api/messages", get(messages))
+        .route("/api/events", get(events))
         .route("/api/send", post(send))
         .route("/api/read/{id}", post(mark_read))
         .route("/api/trust", get(list_trust).post(add_trust))
@@ -197,6 +200,10 @@ async fn status(State(s): State<AppState>) -> Json<StatusView> {
 #[derive(Deserialize)]
 struct ListQuery {
     direction: Option<String>,
+    /// Only messages to or from this station (a conversation).
+    peer: Option<String>,
+    /// "chat" or "mail".
+    kind: Option<String>,
     limit: Option<usize>,
 }
 
@@ -205,6 +212,8 @@ struct ListQuery {
 #[derive(Serialize, Debug)]
 pub struct MessageView {
     id: String,
+    /// Order of arrival or queuing in this store, across both directions.
+    seq: u64,
     direction: &'static str,
     peer: String,
     at: u64,
@@ -226,6 +235,7 @@ fn view(r: Record, object: Option<Vec<u8>>) -> MessageView {
     let bundle = object.and_then(|o| Opened::decode(&o).ok()).map(|o| o.bundle);
     MessageView {
         id: r.id.to_string(),
+        seq: r.seq,
         direction: if r.direction == Direction::In { "in" } else { "out" },
         peer: r.peer.to_string(),
         at: r.at,
@@ -263,26 +273,72 @@ async fn messages(
     State(s): State<AppState>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Vec<MessageView>>, ApiError> {
-    let direction = match q.direction.as_deref().unwrap_or("in") {
-        "in" => Direction::In,
-        "out" => Direction::Out,
-        other => return Err(bad(format!("direction must be in or out, not {other:?}"))),
+    let directions = match q.direction.as_deref().unwrap_or("in") {
+        "in" => vec![Direction::In],
+        "out" => vec![Direction::Out],
+        "all" => vec![Direction::In, Direction::Out],
+        other => return Err(bad(format!("direction must be in, out or all, not {other:?}"))),
+    };
+    let peer = q
+        .peer
+        .as_deref()
+        .map(|p| Callsign::parse(p.trim()).map_err(|e| bad(format!("peer: {e}"))))
+        .transpose()?
+        .map(|c| c.to_string());
+    let kind = match q.kind.as_deref() {
+        None => None,
+        Some("chat") => Some("Chat"),
+        Some("mail") => Some("Mail"),
+        Some(other) => return Err(bad(format!("kind must be chat or mail, not {other:?}"))),
     };
     let limit = q.limit.unwrap_or(100).min(1000);
     let store = s.store.clone();
     tokio::task::spawn_blocking(move || {
-        let records = store.list(direction, limit).map_err(internal)?;
-        records
-            .into_iter()
-            .map(|r| {
+        // Filters apply to the newest 1000 of each direction.
+        let scan = if peer.is_some() || kind.is_some() {
+            1000
+        } else {
+            limit
+        };
+        let mut out = Vec::new();
+        for d in directions {
+            for r in store.list(d, scan).map_err(internal)? {
                 let obj = store.object(r.id).map_err(internal)?;
-                Ok(view(r, obj))
-            })
-            .collect::<Result<Vec<_>, ApiError>>()
+                let v = view(r, obj);
+                let with = |p: &String| v.peer == *p || v.from.as_ref() == Some(p) || v.to.contains(p);
+                if peer.as_ref().is_some_and(|p| !with(p))
+                    || kind.is_some_and(|k| v.kind.as_deref() != Some(k))
+                {
+                    continue;
+                }
+                out.push(v);
+            }
+        }
+        out.sort_by(|a, b| (b.at, b.seq).cmp(&(a.at, a.seq)));
+        out.truncate(limit);
+        Ok(out)
     })
     .await
     .map_err(internal)?
     .map(Json)
+}
+
+/// Server-sent events: one `data:` line per change, naming what changed. A
+/// page fetches what it shows again when told. A comment line every 15 s
+/// keeps idle connections open.
+async fn events(State(s): State<AppState>) -> impl IntoResponse {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    let rx = s.notify.subscribe();
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        let what = match rx.recv().await {
+            Ok(what) => what,
+            // Missed some: the page fetches everything.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => "all",
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+        };
+        Some((Ok::<_, std::convert::Infallible>(Event::default().data(what)), rx))
+    });
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
 }
 
 #[derive(Deserialize)]
@@ -321,6 +377,7 @@ async fn send(
         .await
         .map_err(internal)?
         .map_err(internal)?;
+    s.notify.send("message");
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({ "id": id.to_string() })),
@@ -334,7 +391,10 @@ async fn mark_read(State(s): State<AppState>, Path(id): Path<String>) -> Result<
         .await
         .map_err(internal)?
     {
-        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Ok(()) => {
+            s.notify.send("message");
+            Ok(StatusCode::NO_CONTENT)
+        }
         Err(hm_store::Error::NotFound) => Err(ApiError(StatusCode::NOT_FOUND, "no such message".into())),
         Err(e) => Err(internal(e)),
     }

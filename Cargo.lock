@@ -707,6 +707,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "futures-util",
  "getrandom 0.4.3",
  "hm-bearer",
  "hm-bundle",

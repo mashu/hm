@@ -232,6 +232,33 @@ enum RadioEvt {
     Heard(Vec<heard::Station>),
 }
 
+/// Tells open web pages what changed, so they fetch it again at once:
+/// `"message"` (one arrived, was queued, delivered or read), `"status"`
+/// (radio, links, stations heard) or `"settings"` (settings or trust).
+#[derive(Clone)]
+pub struct Notify(tokio::sync::broadcast::Sender<&'static str>);
+
+impl Notify {
+    pub fn new() -> Notify {
+        Notify(tokio::sync::broadcast::channel(64).0)
+    }
+
+    pub fn send(&self, what: &'static str) {
+        // Nobody listening is fine.
+        let _ = self.0.send(what);
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<&'static str> {
+        self.0.subscribe()
+    }
+}
+
+impl Default for Notify {
+    fn default() -> Notify {
+        Notify::new()
+    }
+}
+
 /// Whether mail to station `to` is ours. Every SSID is a station of its own,
 /// so SA0KAM-1 does not take mail for SA0KAM-2. A node whose key file names
 /// the bare callsign (and picked its SSID with `--ssid`) also takes mail for
@@ -244,6 +271,7 @@ pub fn addressed_to_us(to: Callsign, me: Callsign, key_call: Callsign) -> bool {
 /// failing its signature check, stored once.
 fn accept(
     store: &Store,
+    notify: &Notify,
     trust: &Trust,
     me: Callsign,
     key_call: Callsign,
@@ -277,6 +305,7 @@ fn accept(
                 bundle.from,
                 if verified { "verified" } else { "unverified" }
             ));
+            notify.send("message");
             Verdict::Stored
         }
         Ok(false) => Verdict::Duplicate,
@@ -300,6 +329,7 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
     let (radio_evt_tx, radio_evt_rx) = tokio::sync::mpsc::unbounded_channel();
     let (radio_cmd_tx, radio_cmd_rx) = mpsc::channel();
     let status = Arc::new(Mutex::new(Status::default()));
+    let notify = Notify::new();
     let live = Arc::new(
         LiveConfig::new(cfg.live.clone(), cfg.config_file.clone()).with_overrides(cfg.overrides.clone()),
     );
@@ -318,7 +348,13 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
     // The internet endpoint is bound here so its address is known on return.
     let (addr_tx, addr_rx) = mpsc::channel::<io::Result<Option<SocketAddr>>>();
     let main = {
-        let (cfg, store, status, live) = (cfg.clone(), store.clone(), status.clone(), live.clone());
+        let (cfg, store, status, live, notify) = (
+            cfg.clone(),
+            store.clone(),
+            status.clone(),
+            live.clone(),
+            notify.clone(),
+        );
         thread::Builder::new().name("node".into()).spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -329,10 +365,18 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                 let net = match &cfg.internet {
                     None => None,
                     Some(ic) => {
-                        let (store, gate_live, me, key_call) =
-                            (store.clone(), live.clone(), cfg.me, cfg.key.call);
+                        let (store, gate_live, me, key_call, gate_notify) =
+                            (store.clone(), live.clone(), cfg.me, cfg.key.call, notify.clone());
                         let gate: hm_net::Accept = Arc::new(move |via, obj| {
-                            accept(&store, &gate_live.get().trust, me, key_call, via, &obj)
+                            accept(
+                                &store,
+                                &gate_notify,
+                                &gate_live.get().trust,
+                                me,
+                                key_call,
+                                via,
+                                &obj,
+                            )
                         });
                         let nc = NetConfig {
                             me: cfg.me,
@@ -359,6 +403,7 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                     cfg: cfg.clone(),
                     status: status.clone(),
                     live: live.clone(),
+                    notify: notify.clone(),
                 });
                 let http_listener = tokio::net::TcpListener::from_std(listener).expect("listener");
                 let mut http_shutdown = shutdown_rx.clone();
@@ -377,6 +422,7 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                     radio_evt_rx,
                     &status,
                     &live,
+                    &notify,
                     shutdown_rx,
                 )
                 .await;
@@ -421,6 +467,7 @@ async fn coordinator(
     mut radio_evt: tokio::sync::mpsc::UnboundedReceiver<RadioEvt>,
     status: &Mutex<Status>,
     live: &LiveConfig,
+    notify: &Notify,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut live_version = live.version();
@@ -479,6 +526,7 @@ async fn coordinator(
                 }
             }
         }
+        notify.send("message");
     };
 
     loop {
@@ -499,7 +547,8 @@ async fn coordinator(
                 RadioEvt::Down(why) => {
                     radio_up = false;
                     // Retries fail the same way every few seconds: say it once.
-                    if last_down.as_deref() != Some(why.as_str()) {
+                    // A radio switched off is not news.
+                    if radio_via.is_some() && last_down.as_deref() != Some(why.as_str()) {
                         log(format!("radio down: {why}"));
                         last_down = Some(why);
                     }
@@ -512,10 +561,11 @@ async fn coordinator(
                     }
                 }
                 RadioEvt::Received { from, object } => {
-                    accept(store, &live.get().trust, cfg.me, cfg.key.call, from, &object);
+                    accept(store, notify, &live.get().trust, cfg.me, cfg.key.call, from, &object);
                 }
                 RadioEvt::Heard(list) => {
                     status.lock().expect("lock").heard = list;
+                    notify.send("status");
                 }
                 RadioEvt::Delivered { xfer_id, receipt } => {
                     if let Some(id) = radio_ids.remove(&xfer_id) {
@@ -550,6 +600,7 @@ async fn coordinator(
                 }
                 if live.version() != live_version {
                     live_version = live.version();
+                    notify.send("settings");
                     let live = live.get();
                     chooser.set_costs(live.costs);
                     if let Some(n) = &net {
@@ -595,9 +646,14 @@ async fn coordinator(
                     }
                 }
                 let mut st = status.lock().expect("lock");
-                st.radio = radio_via.as_ref().map(|_| radio_up);
+                let links = net.as_ref().map(|n| n.connected()).unwrap_or_default();
+                let radio = radio_via.as_ref().map(|_| radio_up);
+                if (st.radio, &st.radio_via, &st.internet_peers) != (radio, &radio_via, &links) {
+                    notify.send("status");
+                }
+                st.radio = radio;
                 st.radio_via = radio_via.clone();
-                st.internet_peers = net.as_ref().map(|n| n.connected()).unwrap_or_default();
+                st.internet_peers = links;
                 st.estimates = chooser
                     .peers()
                     .into_iter()
