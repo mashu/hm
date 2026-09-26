@@ -99,6 +99,12 @@ fn beta(rng: &mut DetRng, a: f64, b: f64) -> f64 {
 }
 
 impl Chooser {
+    /// Use `costs` for choices from now on; what was learned about each
+    /// bearer's reliability is kept.
+    pub fn set_costs(&mut self, costs: Costs) {
+        self.costs = costs;
+    }
+
     pub fn new(costs: Costs, half_life_secs: u64, rng: DetRng) -> Chooser {
         Chooser {
             costs,

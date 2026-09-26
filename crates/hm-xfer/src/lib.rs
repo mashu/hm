@@ -415,7 +415,7 @@ impl Xfer {
         self.keys.insert(call, key);
     }
 
-    /// Replace every trusted key, for example after the trust file changed.
+    /// Replace every trusted key, for example after the trusted stations changed.
     pub fn set_trust(&mut self, keys: impl IntoIterator<Item = (Callsign, PublicKey)>) {
         self.keys = keys.into_iter().collect();
     }

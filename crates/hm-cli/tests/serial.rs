@@ -136,39 +136,38 @@ fn hm_binary_over_serial_tncs() {
     let hm = env!("CARGO_BIN_EXE_hm");
     let dir = std::env::temp_dir().join(format!("hm-serial-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let run = |args: &[&str]| Command::new(hm).args(args).output().unwrap();
-    let (a_key, b_key) = (dir.join("a.key"), dir.join("b.key"));
-    assert!(
-        run(&["keygen", "--call", "SA0KAM", "--out", a_key.to_str().unwrap()])
-            .status
-            .success()
-    );
-    assert!(
-        run(&["keygen", "--call", "SO5KM", "--out", b_key.to_str().unwrap()])
-            .status
-            .success()
-    );
-    let a_trust = dir.join("a-trusted.txt");
-    std::fs::write(
-        &a_trust,
-        run(&["whoami", "--key", b_key.to_str().unwrap()]).stdout,
-    )
-    .unwrap();
-    let b_trust = dir.join("b-trusted.txt");
-    std::fs::write(
-        &b_trust,
-        run(&["whoami", "--key", a_key.to_str().unwrap()]).stdout,
-    )
-    .unwrap();
+    let (a_cfg, b_cfg) = (dir.join("a/station.toml"), dir.join("b/station.toml"));
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    std::fs::create_dir_all(dir.join("b")).unwrap();
+    let run = |cfg: &std::path::Path, args: &[&str]| {
+        Command::new(hm)
+            .arg("--config")
+            .arg(cfg)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert!(run(&a_cfg, &["keygen", "--call", "SA0KAM"]).status.success());
+    assert!(run(&b_cfg, &["keygen", "--call", "SO5KM"]).status.success());
+    let line = |cfg| {
+        String::from_utf8(run(cfg, &["whoami"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    let (a_line, b_line) = (line(&a_cfg), line(&b_cfg));
+    assert!(run(&b_cfg, &["trust", "add", &a_line]).status.success());
+    assert!(run(&a_cfg, &["trust", "add", &b_line]).status.success());
 
     let ((tnc_a, dev_a), (tnc_b, dev_b)) = (pty(), pty());
     channel(tnc_a, tnc_b);
     let fast = ["--bitrate", "9600", "--txdelay", "50", "--guard", "300"];
 
     let mut listener = Command::new(hm)
-        .args(["listen", "--key", b_key.to_str().unwrap(), "--ssid", "1"])
+        .arg("--config")
+        .arg(&b_cfg)
+        .args(["listen", "--ssid", "1"])
         .args(["--kiss", &format!("serial:{dev_b}:115200")])
-        .args(["--trust", b_trust.to_str().unwrap()])
         .args(fast)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -176,9 +175,11 @@ fn hm_binary_over_serial_tncs() {
         .unwrap();
     thread::sleep(Duration::from_millis(500));
     let send = Command::new(hm)
-        .args(["send", "--key", a_key.to_str().unwrap(), "--kiss", &dev_a])
+        .arg("--config")
+        .arg(&a_cfg)
+        .args(["send", "--kiss", &dev_a])
         .args(["--to", "SO5KM-1", "--text", "over a serial TNC"])
-        .args(["--timeout", "60", "--trust", a_trust.to_str().unwrap()])
+        .args(["--timeout", "60"])
         .args(fast)
         .output()
         .unwrap();

@@ -25,7 +25,7 @@ use hm_store::{Direction, Record, Store};
 use hm_wire::{Callsign, ObjectId};
 use serde::{Deserialize, Serialize};
 
-use super::trust::SharedTrust;
+use super::live::{Change, LiveConfig};
 use super::{NodeConfig, Status};
 use crate::files::Trust;
 use crate::station::{build_bundle, unix_now};
@@ -35,7 +35,7 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub cfg: Arc<NodeConfig>,
     pub status: Arc<Mutex<Status>>,
-    pub trust: Arc<SharedTrust>,
+    pub live: Arc<LiveConfig>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -45,6 +45,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/send", post(send))
         .route("/api/read/{id}", post(mark_read))
         .route("/api/trust", get(list_trust).post(add_trust))
+        .route("/api/settings", get(get_settings).patch(change_settings))
         .route("/api/trust/{station}", delete(remove_trust))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new().route("/", get(index)).merge(api).with_state(state)
@@ -127,7 +128,7 @@ struct HeardView {
     station: String,
     /// Seconds since any frame from it was heard.
     ago: u64,
-    /// "trusted", "unknown" or "mismatch": its beacon's key against the trust file.
+    /// "trusted", "unknown" or "mismatch": its beacon's key against the trusted one.
     key: Option<&'static str>,
     offers: Option<Vec<&'static str>>,
     beacon_ago: Option<u64>,
@@ -327,37 +328,42 @@ async fn mark_read(State(s): State<AppState>, Path(id): Path<String>) -> Result<
 struct TrustedView {
     station: String,
     key: String,
+    note: Option<String>,
 }
 
 #[derive(Serialize)]
 struct TrustList {
-    /// The trust file changes are saved to; `null` when the node has none, and
-    /// changes last until it restarts.
+    /// The settings file changes are saved to; `null` when the node has none,
+    /// and changes last until it restarts.
     file: Option<String>,
     stations: Vec<TrustedView>,
 }
 
 async fn list_trust(State(s): State<AppState>) -> Json<TrustList> {
+    let live = s.live.get();
     Json(TrustList {
-        file: s.trust.file().map(|p| p.display().to_string()),
-        stations: s
+        file: s.live.file().map(|p| p.display().to_string()),
+        stations: live
             .trust
-            .get()
             .iter()
             .map(|(c, k)| TrustedView {
                 station: c.to_string(),
                 key: crate::hex::encode(&k.0),
+                note: live.note(c).map(str::to_string),
             })
             .collect(),
     })
 }
 
-/// A line as `hm whoami` prints it (`CALL KEY`), or the two parts apart.
+/// A line as `hm whoami` prints it (`CALL KEY`), or the two parts apart, and
+/// an optional note.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TrustRequest {
     line: Option<String>,
     station: Option<String>,
     key: Option<String>,
+    note: Option<String>,
 }
 
 async fn add_trust(
@@ -372,13 +378,15 @@ async fn add_trust(
     let (call, key) = Trust::parse_line(&line)
         .map_err(bad)?
         .ok_or_else(|| bad("empty line"))?;
-    s.trust.add(call, key).map_err(internal)?;
+    let note = req.note.as_deref().map(str::trim).filter(|n| !n.is_empty());
+    s.live.add_trust(call, key, note).map_err(internal)?;
     super::log(format!("trusted {call} (through the API)"));
     Ok((
         StatusCode::CREATED,
         Json(TrustedView {
             station: call.to_string(),
             key: crate::hex::encode(&key.0),
+            note: s.live.get().note(call).map(str::to_string),
         }),
     ))
 }
@@ -388,14 +396,126 @@ async fn remove_trust(
     Path(station): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let call = Callsign::parse(&station).map_err(|e| bad(format!("station: {e}")))?;
-    match s.trust.remove(call).map_err(internal)? {
+    match s.live.remove_trust(call).map_err(internal)? {
         true => {
             super::log(format!("no longer trusting {call} (through the API)"));
             Ok(StatusCode::NO_CONTENT)
         }
         false => Err(ApiError(
             StatusCode::NOT_FOUND,
-            format!("{call} has no line of its own in the trust list"),
+            format!("{call} has no entry of its own among the trusted stations"),
         )),
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PeerView {
+    station: String,
+    address: String,
+}
+
+/// Settings that apply at once; `PATCH` takes any of them.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct LiveView {
+    beacon_minutes: Option<u64>,
+    radio_cost: Option<f64>,
+    internet_cost: Option<f64>,
+    retry_first_secs: Option<u64>,
+    retry_max_secs: Option<u64>,
+    retry_attempts: Option<u32>,
+    peers: Option<Vec<PeerView>>,
+}
+
+/// Settings read at start-up; changing them in the file takes a restart.
+#[derive(Serialize)]
+struct FixedView {
+    radio: Option<String>,
+    internet_listen: Option<String>,
+    http: String,
+    store: String,
+}
+
+#[derive(Serialize)]
+struct SettingsView {
+    file: Option<String>,
+    live: LiveView,
+    restart_to_change: FixedView,
+}
+
+fn settings_view(s: &AppState) -> SettingsView {
+    let l = s.live.get();
+    SettingsView {
+        file: s.live.file().map(|p| p.display().to_string()),
+        live: LiveView {
+            beacon_minutes: Some(l.beacon_secs / 60),
+            radio_cost: Some(l.costs.radio),
+            internet_cost: Some(l.costs.internet),
+            retry_first_secs: Some(l.retry.first_delay_secs),
+            retry_max_secs: Some(l.retry.max_delay_secs),
+            retry_attempts: Some(l.retry.max_attempts),
+            peers: Some(
+                l.peers
+                    .iter()
+                    .map(|(c, a)| PeerView {
+                        station: c.to_string(),
+                        address: a.clone(),
+                    })
+                    .collect(),
+            ),
+        },
+        restart_to_change: FixedView {
+            radio: s.cfg.radio.as_ref().map(|r| r.describe()),
+            internet_listen: s
+                .status
+                .lock()
+                .expect("lock")
+                .internet_listen
+                .map(|a| a.to_string()),
+            http: s.cfg.http.to_string(),
+            store: s.cfg.store.display().to_string(),
+        },
+    }
+}
+
+async fn get_settings(State(s): State<AppState>) -> Json<SettingsView> {
+    Json(settings_view(&s))
+}
+
+async fn change_settings(
+    State(s): State<AppState>,
+    Json(req): Json<LiveView>,
+) -> Result<Json<SettingsView>, ApiError> {
+    let peers = match req.peers {
+        None => None,
+        Some(list) => Some(
+            list.into_iter()
+                .map(|p| {
+                    let call = Callsign::parse(p.station.trim())
+                        .map_err(|e| bad(format!("peer {}: {e}", p.station)))?;
+                    let address = p.address.trim().to_string();
+                    if !address.contains(':') {
+                        return Err(bad(format!("peer {call}: address {address:?} needs a port")));
+                    }
+                    Ok((call, address))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+    };
+    s.live
+        .change(Change {
+            beacon_minutes: req.beacon_minutes,
+            radio_cost: req.radio_cost,
+            internet_cost: req.internet_cost,
+            retry_first_secs: req.retry_first_secs,
+            retry_max_secs: req.retry_max_secs,
+            retry_attempts: req.retry_attempts,
+            peers,
+        })
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::InvalidInput => bad(e.to_string()),
+            _ => internal(e),
+        })?;
+    super::log("settings changed (through the API)");
+    Ok(Json(settings_view(&s)))
 }

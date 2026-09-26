@@ -41,7 +41,7 @@ fn cfg(me: &str, s: u8, trust: &[(&str, u8)], dial: Vec<(Callsign, SocketAddr)>)
             .map(|(c, k)| (call(c), Identity::from_secret(secret(*k)).public()))
             .collect(),
         listen: any_port(),
-        dial,
+        dial: dial.into_iter().map(|(c, a)| (c, a.to_string())).collect(),
     }
 }
 
@@ -303,4 +303,19 @@ async fn trust_changes_apply_while_running() {
     // It keeps redialling, and keeps being refused.
     tokio::time::sleep(Duration::from_secs(4)).await;
     assert!(!hub.is_connected(call("SA0KAM")) && !a.is_connected(call("SO5KM")));
+}
+
+/// The dial list changes while running, and addresses are names looked up at
+/// every dial.
+#[tokio::test]
+async fn dial_list_changes_while_running() {
+    let (hub_accept, _) = recorder(Verdict::Stored);
+    let hub = Net::start(cfg("SO5KM", 2, &[("SA0KAM", 1)], vec![]), hub_accept).unwrap();
+    let port = hub.local_addr().unwrap().port();
+    let (a_accept, _) = recorder(Verdict::Stored);
+    let a = Net::start(cfg("SA0KAM", 1, &[("SO5KM", 2)], vec![]), a_accept).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!a.is_connected(call("SO5KM")), "nothing to dial yet");
+    a.set_dial(vec![(call("SO5KM"), format!("localhost:{port}"))]);
+    assert!(wait_connected(&a, "SO5KM").await, "dials the new peer by name");
 }

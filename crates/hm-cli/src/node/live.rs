@@ -1,0 +1,349 @@
+//! The parts of `station.toml` a running node applies without a restart:
+//! trusted stations, delivery costs and retries, the beacon interval, and the
+//! internet peers to keep a link to. They change through the API (and are
+//! saved to the file) or by editing the file, which is read again on change.
+
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, RwLock};
+use std::time::SystemTime;
+
+use hm_ident::PublicKey;
+use hm_store::RetryPolicy;
+use hm_wire::Callsign;
+
+use super::choose::Costs;
+use crate::config::{self, Config};
+use crate::files::Trust;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Live {
+    pub trust: Trust,
+    /// Notes beside trusted stations, by station.
+    pub notes: Vec<(Callsign, String)>,
+    pub costs: Costs,
+    pub retry: RetryPolicy,
+    /// Seconds between beacons; 0 sends none. (Minutes in station.toml.)
+    pub beacon_secs: u64,
+    pub peers: Vec<(Callsign, String)>,
+}
+
+impl Live {
+    pub fn from_config(c: &Config) -> Result<Live, String> {
+        let notes = c
+            .trust
+            .iter()
+            .filter_map(|e| Some((Callsign::parse(&e.station).ok()?, e.note.clone()?)))
+            .collect();
+        Ok(Live {
+            trust: c.trust()?,
+            notes,
+            costs: Costs {
+                radio: c.delivery.radio_cost,
+                internet: c.delivery.internet_cost,
+            },
+            retry: RetryPolicy {
+                first_delay_secs: c.delivery.retry_first_secs,
+                max_delay_secs: c.delivery.retry_max_secs,
+                max_attempts: c.delivery.retry_attempts,
+            },
+            beacon_secs: c.radio.beacon_minutes.saturating_mul(60),
+            peers: c.peers()?,
+        })
+    }
+
+    pub fn note(&self, call: Callsign) -> Option<&str> {
+        self.notes
+            .iter()
+            .find(|(c, _)| *c == call)
+            .map(|(_, n)| n.as_str())
+    }
+}
+
+/// A change to the live settings; `None` leaves a setting as it is.
+#[derive(Clone, Debug, Default)]
+pub struct Change {
+    pub beacon_minutes: Option<u64>,
+    pub radio_cost: Option<f64>,
+    pub internet_cost: Option<f64>,
+    pub retry_first_secs: Option<u64>,
+    pub retry_max_secs: Option<u64>,
+    pub retry_attempts: Option<u32>,
+    pub peers: Option<Vec<(Callsign, String)>>,
+}
+
+pub struct LiveConfig {
+    /// The settings in use and a version bumped on every change.
+    current: RwLock<(Live, u64)>,
+    file: Option<PathBuf>,
+    /// The file's modification time and size when last read (the size too,
+    /// because some file systems keep times to the second only). Also held
+    /// while editing, so two edits cannot lose each other's change.
+    seen: Mutex<Option<(SystemTime, u64)>>,
+}
+
+fn fingerprint(path: &Path) -> Option<(SystemTime, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
+fn invalid(e: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e)
+}
+
+impl LiveConfig {
+    /// Start from `live`, as read from `file` (if the node has one).
+    pub fn new(live: Live, file: Option<PathBuf>) -> LiveConfig {
+        let seen = file.as_deref().and_then(fingerprint);
+        LiveConfig {
+            current: RwLock::new((live, 0)),
+            file,
+            seen: Mutex::new(seen),
+        }
+    }
+
+    pub fn get(&self) -> Live {
+        self.current.read().expect("lock").0.clone()
+    }
+
+    pub fn version(&self) -> u64 {
+        self.current.read().expect("lock").1
+    }
+
+    pub fn file(&self) -> Option<&Path> {
+        self.file.as_deref()
+    }
+
+    /// Use `live` from now on; true if it differs from what was in use.
+    fn replace(&self, live: Live) -> bool {
+        let mut cur = self.current.write().expect("lock");
+        if cur.0 == live {
+            return false;
+        }
+        cur.0 = live;
+        cur.1 += 1;
+        true
+    }
+
+    fn read_file(path: &Path) -> Result<Live, String> {
+        let c = Config::load(path).map_err(|e| e.to_string())?;
+        Live::from_config(&c).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Read the file again if it changed on disk since last read. `None` when
+    /// nothing changed; `Some(Ok(()))` after a reload that changed something;
+    /// `Some(Err)` when the file is not valid, and what is in use stays.
+    pub fn reload_if_changed(&self) -> Option<Result<(), String>> {
+        let path = self.file.as_deref()?;
+        let now = fingerprint(path);
+        {
+            let mut seen = self.seen.lock().expect("lock");
+            if now == *seen {
+                return None;
+            }
+            *seen = now;
+        }
+        match LiveConfig::read_file(path) {
+            Ok(live) => self.replace(live).then_some(Ok(())),
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// Edit the file with `edit` (then take everything from it), or without a
+    /// file change the settings in memory with `apply`.
+    fn edit(
+        &self,
+        edit: impl FnOnce(&Path) -> io::Result<()>,
+        apply: impl FnOnce(&mut Live),
+    ) -> io::Result<()> {
+        let mut seen = self.seen.lock().expect("lock");
+        match &self.file {
+            Some(path) => {
+                edit(path)?;
+                *seen = fingerprint(path);
+                self.replace(LiveConfig::read_file(path).map_err(invalid)?);
+            }
+            None => {
+                let mut live = self.get();
+                apply(&mut live);
+                self.replace(live);
+            }
+        }
+        Ok(())
+    }
+
+    /// Trust `key` for exactly `call`.
+    pub fn add_trust(&self, call: Callsign, key: PublicKey, note: Option<&str>) -> io::Result<()> {
+        self.edit(
+            |p| config::set_trust(p, call, &key, note),
+            |l| {
+                l.trust.insert(call, key);
+                if let Some(n) = note {
+                    l.notes.retain(|(c, _)| *c != call);
+                    l.notes.push((call, n.to_string()));
+                }
+            },
+        )
+    }
+
+    /// Stop trusting exactly `call`; false if it had no entry of its own.
+    pub fn remove_trust(&self, call: Callsign) -> io::Result<bool> {
+        if !self.get().trust.iter().any(|(c, _)| c == call) {
+            return Ok(false);
+        }
+        self.edit(
+            |p| config::remove_trust(p, call).map(|_| ()),
+            |l| {
+                l.trust.remove(call);
+                l.notes.retain(|(c, _)| *c != call);
+            },
+        )?;
+        Ok(true)
+    }
+
+    /// Apply `c`, checking it first; nothing changes if any part is invalid.
+    pub fn change(&self, c: Change) -> io::Result<()> {
+        let bad = |m: &str| Err(io::Error::new(io::ErrorKind::InvalidInput, m.to_string()));
+        for cost in [c.radio_cost, c.internet_cost].into_iter().flatten() {
+            if !(cost.is_finite() && cost > 0.0) {
+                return bad("costs must be positive numbers");
+            }
+        }
+        if c.retry_attempts == Some(0) || c.retry_first_secs == Some(0) {
+            return bad("retries need at least one attempt and a delay of at least a second");
+        }
+        let edit = |p: &Path| -> io::Result<()> {
+            if let Some(v) = c.beacon_minutes {
+                config::set_value(p, "radio", "beacon_minutes", v as i64)?;
+            }
+            for (k, v) in [("radio_cost", c.radio_cost), ("internet_cost", c.internet_cost)] {
+                if let Some(v) = v {
+                    config::set_value(p, "delivery", k, v)?;
+                }
+            }
+            for (k, v) in [
+                ("retry_first_secs", c.retry_first_secs),
+                ("retry_max_secs", c.retry_max_secs),
+                ("retry_attempts", c.retry_attempts.map(u64::from)),
+            ] {
+                if let Some(v) = v {
+                    config::set_value(p, "delivery", k, v as i64)?;
+                }
+            }
+            if let Some(peers) = &c.peers {
+                config::set_peers(p, peers)?;
+            }
+            Ok(())
+        };
+        let c2 = c.clone();
+        self.edit(edit, move |l| {
+            if let Some(v) = c2.beacon_minutes {
+                l.beacon_secs = v.saturating_mul(60);
+            }
+            if let Some(v) = c2.radio_cost {
+                l.costs.radio = v;
+            }
+            if let Some(v) = c2.internet_cost {
+                l.costs.internet = v;
+            }
+            if let Some(v) = c2.retry_first_secs {
+                l.retry.first_delay_secs = v;
+            }
+            if let Some(v) = c2.retry_max_secs {
+                l.retry.max_delay_secs = v;
+            }
+            if let Some(v) = c2.retry_attempts {
+                l.retry.max_attempts = v;
+            }
+            if let Some(p) = c2.peers {
+                l.peers = p;
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(s: &str) -> Callsign {
+        Callsign::parse(s).unwrap()
+    }
+
+    #[test]
+    fn edits_are_saved_and_outside_edits_are_picked_up() {
+        let path = std::env::temp_dir().join(format!("hm-live-{}.toml", std::process::id()));
+        std::fs::write(&path, "# my station\n[radio]\nbeacon_minutes = 10 # every ten\n").unwrap();
+        let live = LiveConfig::new(LiveConfig::read_file(&path).unwrap(), Some(path.clone()));
+        assert_eq!((live.get().trust.len(), live.version()), (0, 0));
+
+        live.add_trust(call("SO5KM-1"), PublicKey([1; 32]), Some("Jan"))
+            .unwrap();
+        live.change(Change {
+            beacon_minutes: Some(3),
+            internet_cost: Some(0.5),
+            peers: Some(vec![(call("SO5KM"), "hub.example.org:4433".into())]),
+            ..Change::default()
+        })
+        .unwrap();
+        let l = live.get();
+        assert_eq!(l.trust.key_for(call("SO5KM-1")), Some(PublicKey([1; 32])));
+        assert_eq!(l.note(call("SO5KM-1")), Some("Jan"));
+        assert_eq!((l.beacon_secs, l.costs.internet), (180, 0.5));
+        assert_eq!(l.peers.len(), 1);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with("# my station\n[radio]\nbeacon_minutes = 3 # every ten\n"),
+            "{text}"
+        );
+        assert_eq!(live.reload_if_changed(), None, "our own writes are not changes");
+
+        // Refused changes change nothing.
+        assert!(live
+            .change(Change {
+                radio_cost: Some(-1.0),
+                ..Change::default()
+            })
+            .is_err());
+        assert!(live
+            .change(Change {
+                retry_attempts: Some(0),
+                ..Change::default()
+            })
+            .is_err());
+        assert_eq!(live.get(), l);
+
+        // Someone edits the file by hand: picked up on the next check.
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(&format!(
+            "\n[[trust]]\nstation = \"SP5AAA\"\nkey = \"{}\"\n",
+            "02".repeat(32)
+        ));
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(live.reload_if_changed(), Some(Ok(())));
+        assert_eq!(live.get().trust.len(), 2);
+
+        // A broken file is reported and what is in use stays.
+        std::fs::write(&path, "[radio]\nbeacon_minutes = \"soon\"\n").unwrap();
+        assert!(matches!(live.reload_if_changed(), Some(Err(_))));
+        assert_eq!(live.get().trust.len(), 2);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn without_a_file_changes_last_in_memory() {
+        let live = LiveConfig::new(Live::from_config(&Config::default()).unwrap(), None);
+        live.add_trust(call("SO5KM"), PublicKey([1; 32]), None).unwrap();
+        live.change(Change {
+            beacon_minutes: Some(0),
+            ..Change::default()
+        })
+        .unwrap();
+        assert_eq!(
+            (live.get().trust.len(), live.get().beacon_secs, live.version()),
+            (1, 0, 2)
+        );
+        assert!(live.remove_trust(call("SO5KM")).unwrap());
+        assert_eq!(live.reload_if_changed(), None);
+    }
+}

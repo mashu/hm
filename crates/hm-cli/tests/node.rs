@@ -8,10 +8,12 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use hm_cli::config::Config;
 use hm_cli::files::{KeyFile, Trust};
 use hm_cli::kiss_link::{KissTarget, TncParams};
 use hm_cli::node::choose::Costs;
-use hm_cli::node::{self, InternetConfig, NodeConfig, NodeHandle, RadioConfig, RadioLink};
+use hm_cli::node::live::Live;
+use hm_cli::node::{self, NodeConfig, NodeHandle, RadioConfig, RadioLink};
 use hm_cli::station::LinkTiming;
 use hm_store::RetryPolicy;
 use hm_wire::Callsign;
@@ -109,6 +111,12 @@ fn keys() -> (KeyFile, KeyFile) {
     )
 }
 
+/// A node's internet side: where it listens, and whom it keeps a link to.
+struct InternetConfig {
+    listen: SocketAddr,
+    peers: Vec<(Callsign, SocketAddr)>,
+}
+
 struct Setup<'a> {
     key: &'a KeyFile,
     me: &'a str,
@@ -120,8 +128,8 @@ struct Setup<'a> {
     store: &'a Tmp,
     retry: RetryPolicy,
     beacon_every: Option<Duration>,
-    /// Trust exactly what this file lists (instead of `peer` and `also`), and
-    /// keep it as the node's trust file.
+    /// Trust exactly what this station.toml lists (instead of `peer` and
+    /// `also`), and keep it as the node's settings file.
     trust_file: Option<PathBuf>,
 }
 
@@ -132,12 +140,22 @@ fn start(s: Setup) -> NodeHandle {
         trust.insert(k.call, k.identity.public());
     }
     if let Some(f) = &s.trust_file {
-        trust = Trust::load(f).unwrap();
+        trust = Config::load(f).unwrap().trust().unwrap();
     }
+    let peers = s.internet.as_ref().map_or(vec![], |i| {
+        i.peers.iter().map(|(c, a)| (*c, a.to_string())).collect()
+    });
     node::start(NodeConfig {
         key: KeyFile::parse(&s.key.to_text()).unwrap(),
-        trust,
-        trust_file: s.trust_file,
+        live: Live {
+            trust,
+            notes: vec![],
+            costs: Costs::default(),
+            retry: s.retry,
+            beacon_secs: s.beacon_every.map_or(0, |d| d.as_secs()),
+            peers,
+        },
+        config_file: s.trust_file,
         me: call(s.me),
         radio: s.tnc.map(|t| RadioConfig {
             link: RadioLink::Kiss {
@@ -146,13 +164,10 @@ fn start(s: Setup) -> NodeHandle {
                 params: TncParams::default(),
             },
             timing: FAST,
-            beacon_every: s.beacon_every,
         }),
-        internet: s.internet,
-        costs: Costs::default(),
+        internet: s.internet.map(|i| node::InternetConfig { listen: i.listen }),
         store: s.store.0.clone(),
         http: "127.0.0.1:0".parse().unwrap(),
-        retry: s.retry,
         token: TOKEN.into(),
         seed: Some(1),
     })
@@ -537,13 +552,13 @@ fn two_ssids_are_two_stations_with_their_own_keys() {
     }
 }
 
-/// Trust changes without a restart: through the API (saved to the trust
-/// file) and by editing the trust file by hand.
+/// Trust and settings change without a restart: through the API (saved to
+/// the settings file) and by editing that file by hand.
 #[test]
 fn trusted_stations_change_while_the_node_runs() {
     let (alice, bob) = keys();
     let (a_db, h_db) = (Tmp::new("trust-a"), Tmp::new("trust-h"));
-    let trust_file = std::env::temp_dir().join(format!("hm-node-trust-{}.txt", std::process::id()));
+    let trust_file = std::env::temp_dir().join(format!("hm-node-trust-{}.toml", std::process::id()));
     std::fs::write(&trust_file, "# stations this hub trusts\n").unwrap();
     let hub = start(Setup {
         key: &bob,
@@ -596,9 +611,37 @@ fn trusted_stations_change_while_the_node_runs() {
     assert_eq!(status, 201, "{body}");
     let list = get(hub.http_addr, "/api/trust");
     assert_eq!(list["stations"][0]["station"], "SA0KAM");
-    assert!(std::fs::read_to_string(&trust_file)
-        .unwrap()
-        .starts_with("# stations this hub trusts\nSA0KAM "));
+    let saved = std::fs::read_to_string(&trust_file).unwrap();
+    assert!(saved.starts_with("# stations this hub trusts\n"), "{saved}");
+    assert_eq!(Config::load(&trust_file).unwrap().trust[0].station, "SA0KAM");
+
+    // Settings change through the API too: in use at once, and saved.
+    let (status, body) = http(
+        hub.http_addr,
+        "PATCH",
+        "/api/settings",
+        Some(&json!({"internet_cost": 0.5, "retry_attempts": 7})),
+        Some(TOKEN),
+    );
+    assert_eq!(status, 200, "{body}");
+    let now = get(hub.http_addr, "/api/settings");
+    assert_eq!(
+        (
+            now["live"]["internet_cost"].as_f64(),
+            now["live"]["retry_attempts"].as_u64()
+        ),
+        (Some(0.5), Some(7))
+    );
+    let c = Config::load(&trust_file).unwrap();
+    assert_eq!((c.delivery.internet_cost, c.delivery.retry_attempts), (0.5, 7));
+    let (status, _) = http(
+        hub.http_addr,
+        "PATCH",
+        "/api/settings",
+        Some(&json!({"radio_cost": -1})),
+        Some(TOKEN),
+    );
+    assert_eq!(status, 400);
     delivered(a.http_addr, 1, "delivery once trusted");
     assert_eq!(inbox(hub.http_addr)[0]["verified"], true);
 
@@ -618,7 +661,14 @@ fn trusted_stations_change_while_the_node_runs() {
 
     // Trusted again by editing the file by hand.
     let mut text = std::fs::read_to_string(&trust_file).unwrap();
-    text.push_str(&format!("{}\n", alice.trust_line()));
+    let (c, k) = alice
+        .trust_line()
+        .split_once(' ')
+        .map(|(c, k)| (c.to_string(), k.to_string()))
+        .unwrap();
+    text.push_str(&format!(
+        "\n[[trust]]\nstation = \"{c}\"\nkey = \"{k}\"\nnote = \"added by hand\"\n"
+    ));
     std::fs::write(&trust_file, text).unwrap();
     wait_for(Duration::from_secs(30), "the second message", || {
         (inbox(hub.http_addr).len() == 2).then_some(())

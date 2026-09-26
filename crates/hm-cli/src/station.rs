@@ -2,7 +2,7 @@
 //!
 //! Used by `hm send` / `hm listen` and by the node. The transfer engine is the
 //! same sans-IO machine the simulator drives; this module only supplies the clock,
-//! the station key and the trust file.
+//! the station key and the trusted stations.
 
 use std::io;
 use std::sync::atomic::AtomicBool;
@@ -51,7 +51,7 @@ pub enum SendOutcome {
     TimedOut,
 }
 
-/// What the trust file could say about a received bundle's signature.
+/// What the trusted keys could say about a received bundle's signature.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Verification {
     /// Signed by the key listed for the sender.
@@ -80,7 +80,7 @@ impl Message {
 }
 
 impl Station<'_> {
-    /// Transfer engine for this station, trusting every key in the trust file.
+    /// Transfer engine for this station, trusting every trusted key.
     pub fn engine(&self) -> io::Result<Xfer> {
         let mut cfg = Config::vhf_1200(self.me);
         cfg.bitrate_bps = self.timing.bitrate_bps;
