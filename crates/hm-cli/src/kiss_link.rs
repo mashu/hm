@@ -173,10 +173,7 @@ impl KissLink {
         params: TncParams,
     ) -> io::Result<KissLink> {
         check_source(me)?;
-        let port = serialport::new(device, baud)
-            .timeout(SERIAL_POLL)
-            .open()
-            .map_err(|e| io::Error::other(format!("{device}: {e}")))?;
+        let port = open_serial(device, baud).map_err(|e| io::Error::other(format!("{device}: {e}")))?;
         let reader = port
             .try_clone()
             .map_err(|e| io::Error::other(format!("{device}: {e}")))?;
@@ -233,6 +230,20 @@ impl KissLink {
             close,
         })
     }
+}
+
+/// Open a serial port raw, with the given line speed.
+fn open_serial(device: &str, baud: u32) -> serialport::Result<Box<dyn serialport::SerialPort>> {
+    let first = serialport::new(device, baud).timeout(SERIAL_POLL).open();
+    // On macOS a pseudo-terminal (Direwolf's KISS pty, socat, a test harness)
+    // refuses the line-speed ioctl with ENOTTY; speed 0 skips it and leaves
+    // the port raw, which is all a pseudo-terminal needs.
+    if cfg!(any(target_os = "macos", target_os = "ios")) && first.is_err() {
+        if let Ok(port) = serialport::new(device, 0).timeout(SERIAL_POLL).open() {
+            return Ok(port);
+        }
+    }
+    first
 }
 
 impl Drop for KissLink {
