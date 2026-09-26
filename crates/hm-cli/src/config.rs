@@ -43,6 +43,7 @@ pub struct Config {
     pub station: StationSettings,
     pub radio: RadioSettings,
     pub internet: InternetSettings,
+    pub modem: ModemSettings,
     pub delivery: DeliverySettings,
     pub trust: Vec<TrustEntry>,
 }
@@ -181,12 +182,54 @@ pub struct PeerEntry {
     pub address: String,
 }
 
+/// An ARQ modem program (VARA, Mercury, ARDOP) as a bearer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModemSettings {
+    pub enabled: bool,
+    /// "vara" (also for Mercury, which speaks VARA's interface) or "ardop".
+    pub kind: String,
+    pub host: String,
+    /// Command port; data is on the next port. VARA 8300, ARDOP 8515.
+    pub port: u16,
+    /// Bandwidth to ask for, Hz; 0 leaves the modem's own setting.
+    pub bandwidth: u32,
+    /// "none" when the modem keys the radio itself; otherwise how to key it
+    /// when the modem asks (the same forms as `radio.ptt`).
+    pub ptt: String,
+}
+
+impl Default for ModemSettings {
+    fn default() -> Self {
+        ModemSettings {
+            enabled: false,
+            kind: "vara".into(),
+            host: "127.0.0.1".into(),
+            port: 8300,
+            bandwidth: 0,
+            ptt: "none".into(),
+        }
+    }
+}
+
+impl ModemSettings {
+    pub fn check(&self) -> Result<(), String> {
+        crate::node::arq::Kind::parse(&self.kind).map_err(|e| format!("modem.{e}"))?;
+        if self.port == 0 || self.port == u16::MAX {
+            return Err("modem.port must be 1 to 65534 (data is on the next port)".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DeliverySettings {
-    /// Relative cost of a delivery attempt by radio and over the internet.
+    /// Relative cost of a delivery attempt by radio, over the internet and
+    /// through an ARQ modem.
     pub radio_cost: f64,
     pub internet_cost: f64,
+    pub modem_cost: f64,
     /// Retries: the first after this many seconds, doubling up to `retry_max_secs`.
     pub retry_first_secs: u64,
     pub retry_max_secs: u64,
@@ -199,6 +242,7 @@ impl Default for DeliverySettings {
         DeliverySettings {
             radio_cost: 1.0,
             internet_cost: 2.0,
+            modem_cost: 1.5,
             retry_first_secs: 60,
             retry_max_secs: 3600,
             retry_attempts: 12,
@@ -237,6 +281,7 @@ impl Config {
         c.peers()?;
         c.locator()?;
         c.radio.check()?;
+        c.modem.check()?;
         Ok(c)
     }
 
@@ -557,11 +602,20 @@ beacon_minutes = 10         # 0 turns the beacon off
 #   address = "hm.example.org:4433"
 [internet]
 
+# An ARQ modem program as another way to reach stations (Mercury speaks
+# VARA's interface; ARDOP uses port 8515):
+#   [modem]
+#   enabled = true
+#   kind = "vara"
+#   port = 8300
+#   ptt = "none"            or how to key the radio when the modem asks
+
 # The cheaper way that reaches a station is tried first; a failed delivery
 # is retried after first_secs, doubling up to max_secs, attempts times.
 [delivery]
 radio_cost = 1.0
 internet_cost = 2.0
+modem_cost = 1.5
 retry_first_secs = 60
 retry_max_secs = 3600
 retry_attempts = 12

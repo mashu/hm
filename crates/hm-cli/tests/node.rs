@@ -179,6 +179,7 @@ fn start(s: Setup) -> NodeHandle {
         }),
         radio_builder: Some(Arc::new(node::radio_config)),
         internet: s.internet.map(|i| node::InternetConfig { listen: i.listen }),
+        modem: None,
         store: s.store.0.clone(),
         http: "127.0.0.1:0".parse().unwrap(),
         token: TOKEN.into(),

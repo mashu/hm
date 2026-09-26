@@ -362,6 +362,15 @@ A receiver accepts only bundles addressed to its callsign whose signatures do
 not fail against its trust file. Delivery therefore means the same on every
 link: the receiver signed for exactly these bytes.
 
+**Over ARQ modems.** A connection made by an ARQ modem (VARA, Mercury, ARDOP)
+is a reliable byte stream between two stations named by the modem. It carries
+the same exchange, one bundle after another on the same stream: `"HMD0"`,
+length, object from the sender; `0x00` and the receipt, or `0x01`, length and
+reason, from the receiver. Either station may send on a connection, whoever
+called; the first byte tells a bundle (`H`) from an answer (`0x00`, `0x01`).
+The caller hangs up when it has nothing more to send. There is no TLS on this
+path: the bundles' signatures and the receipt carry the authentication.
+
 ## 11. Forward compatibility
 
 - Unknown map keys are ignored when decoding.

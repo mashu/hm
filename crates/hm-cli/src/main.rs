@@ -533,6 +533,28 @@ fn api_token(store: &Path) -> Result<String, String> {
     Ok(token)
 }
 
+/// The ARQ modem `[modem]` describes, if enabled.
+fn modem_config(c: &Config) -> Result<Option<hm_cli::node::arq::ArqConfig>, String> {
+    let m = &c.modem;
+    if !m.enabled {
+        return Ok(None);
+    }
+    let ptt: Option<hm_cli::sound_link::PttFactory> = match m.ptt.as_str() {
+        "none" | "" => None,
+        spec => {
+            let spec = spec.to_string();
+            Some(std::sync::Arc::new(move || hm_rig::ptt::open(&spec)))
+        }
+    };
+    Ok(Some(hm_cli::node::arq::ArqConfig {
+        kind: hm_cli::node::arq::Kind::parse(&m.kind)?,
+        host: m.host.clone(),
+        port: m.port,
+        bandwidth: m.bandwidth,
+        ptt,
+    }))
+}
+
 fn node(
     config_path: &Path,
     c: &Config,
@@ -547,9 +569,10 @@ fn node(
         listen: listen.unwrap_or_else(|| "0.0.0.0:0".parse().expect("valid")),
     });
     let radio = hm_cli::node::radio_config(&c.radio)?;
-    if radio.is_none() && internet.is_none() {
+    let modem = modem_config(c)?;
+    if radio.is_none() && internet.is_none() && modem.is_none() {
         return Err(
-            "no way to reach other stations: with the radio off, set internet.listen or add [[internet.peers]]"
+            "no way to reach other stations: with the radio off, set internet.listen, add [[internet.peers]] or enable [modem]"
                 .into(),
         );
     }
@@ -565,6 +588,7 @@ fn node(
         radio,
         radio_builder: Some(std::sync::Arc::new(hm_cli::node::radio_config)),
         internet,
+        modem,
         store: store.clone(),
         http: c.http()?,
         token: token.clone(),

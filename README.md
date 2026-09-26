@@ -21,12 +21,10 @@ clear, identities signed.
 | `hm-net` | Internet links: QUIC with mutual TLS 1.3 on Ed25519 station keys (only trusted stations connect), automatic redial, one stream per bundle with a signed receipt |
 | `hm-modem-afsk` | Our own AFSK 1200 modem (Bell 202), pure Rust and `no_std`: HDLC framing and CRC, multi-slicer demodulator with per-tone AGC and PLL clock recovery, carrier detect |
 | `hm-rig` | Radio hardware: sound cards through `cpal` (ALSA, CoreAudio, WASAPI); PTT by rigctld (Hamlib CAT), serial RTS/DTR, CM108 GPIO (AIOC, Digirig) or VOX; a virtual radio channel for tests |
-| `hm-cli` | The `hm` command: `node` (the station daemon: radio and/or internet links, web interface, JSON API with access token, settings applied live), `keygen`, `whoami`, `trust`, `send`, `listen`, all set up by one `station.toml`; KISS links over TCP or a serial port, and a real-time driver |
+| `hm-cli` | The `hm` command: `node` (the station daemon: radio, ARQ modems (VARA, Mercury, ARDOP) and/or internet links, web interface, JSON API with access token, settings applied live), `keygen`, `whoami`, `trust`, `send`, `listen`, all set up by one `station.toml`; KISS links over TCP or a serial port, and a real-time driver |
 
-Phase 1 still to do: the on-air test ([plan](docs/on-air-test-plan.md)), IL2P framing and better decoding deep in noise for
-the built-in modem, stream modems (Mercury, ARDOP, VARA) as radio bearers,
-and the Dioxus interface with a setup wizard. Relaying mail through
-other nodes is Phase 2.
+Phase 1 still to do: the on-air test ([plan](docs/on-air-test-plan.md)) and the Dioxus
+interface with a setup wizard. Relaying mail through other nodes is Phase 2.
 
 ## Run a station
 
@@ -272,6 +270,32 @@ hm listen --kiss COM3                              # Windows
 A hardware TNC keys the radio and waits for a clear channel itself, so on opening the port
 `hm` sends it the key-up delay, persistence and slot time (`txdelay_ms`, `persist`,
 `slottime_ms`) as KISS parameters. The TNC must already be in KISS mode.
+
+## HF and FM through VARA, Mercury or ARDOP
+
+An ARQ modem program is a third way to reach stations, next to the radio and the internet:
+VARA HF or FM, Mercury (which speaks VARA's host interface) or ARDOP. The modem does its
+own error correction and retries, and hm uses the connection it makes the way it uses an
+internet link: each bundle goes over it whole, and the receiver answers with a receipt
+signed by its key, so "delivered" means the same on every bearer.
+
+```toml
+[modem]
+enabled = true
+kind = "vara"        # or "ardop" (port 8515); Mercury: "vara" with its ports
+host = "127.0.0.1"
+port = 8300          # command port; data is on the next one
+bandwidth = 2300     # VARA HF 500, 2300 or 2750; ARDOP 200 to 2000; 0 leaves it
+ptt = "none"         # the modem keys the radio; or "rts:/dev/ttyUSB0", "cm108:…", "rigctld"
+```
+
+The node registers its callsign with the modem and listens. To deliver, it calls the
+station, sends every bundle waiting for it and hangs up; calls from other stations are
+answered. The modem carries one connection at a time, so deliveries to other stations wait
+their turn. How mail is shared between radio, internet and modem follows the costs
+(`modem_cost = 1.5` by default, between radio and internet) and how well each has been
+delivering lately. The status line shows whether the modem program is reachable and whom
+it is connected to. Changing `[modem]` takes a restart.
 
 ## Measured (simulator, 1200 bd, 300 ms TXDELAY)
 

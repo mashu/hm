@@ -187,6 +187,7 @@
       <span class="chip plain" id="chip-grid" hidden></span>
       <span class="chip" id="chip-radio">Radio</span>
       <span class="chip" id="chip-net" hidden>Internet</span>
+      <span class="chip" id="chip-modem" hidden>Modem</span>
       <span class="chip" id="chip-live" title="Updates arrive as they happen">Connecting…</span>
     </div>
   </div>
@@ -325,6 +326,7 @@
         <div class="pair">
           <div><label for="radio_cost">Radio cost</label><input id="radio_cost" type="number" min="0.01" step="0.01" required></div>
           <div><label for="internet_cost">Internet cost</label><input id="internet_cost" type="number" min="0.01" step="0.01" required></div>
+          <div><label for="modem_cost">Modem cost <span class="hint">(VARA, ARDOP)</span></label><input id="modem_cost" type="number" min="0.01" step="0.01" required></div>
         </div>
         <p class="hint">The cheaper way that reaches a station is tried first.</p>
         <div class="pair">
@@ -705,7 +707,7 @@ $("trust-form").addEventListener("submit", async (ev) => {
 // ---- Settings ----------------------------------------------------------
 const radioText = ["kiss", "audio", "ptt", "framing"];
 const radioNumbers = ["txdelay_ms", "tnc_port", "persist", "slottime_ms", "bitrate", "guard_ms"];
-const liveFields = ["beacon_minutes", "radio_cost", "internet_cost", "retry_first_secs", "retry_max_secs", "retry_attempts"];
+const liveFields = ["beacon_minutes", "radio_cost", "internet_cost", "modem_cost", "retry_first_secs", "retry_max_secs", "retry_attempts"];
 let settingsFile = null;
 
 function peerRow(p) {
@@ -742,6 +744,7 @@ function showSettings(v, force) {
   $("peers").replaceChildren(...v.live.peers.map(peerRow));
   const fixed = v.restart_to_change;
   const rows = [["Internet", fixed.internet_listen ? "listening on " + fixed.internet_listen : "not listening"],
+    ["Modem", fixed.modem || "none"],
     ["Web page", fixed.http], ["Store", fixed.store], ["Saved to", v.file || "nowhere: changes last until restart"]];
   if (v.overridden.length) {
     rows.push(["For this run", "set on the command line: " + v.overridden.join(", ") + " (changes to these are saved, and used once the node runs without them)"]);
@@ -801,6 +804,11 @@ async function loadStatus() {
     $("chip-radio").title = s.radio_via || "";
     $("chip-net").hidden = !s.internet_listen && s.internet_peers.length === 0;
     chip("chip-net", s.internet_peers.length ? "Internet: " + s.internet_peers.join(", ") : "Internet: no links", s.internet_peers.length ? "ok" : "warn");
+    $("chip-modem").hidden = s.modem === null;
+    if (s.modem !== null) {
+      chip("chip-modem", !s.modem ? "Modem down" : s.modem_peer ? "Modem: " + s.modem_peer : "Modem ready", s.modem ? "ok" : "bad");
+      $("chip-modem").title = s.modem_via || "";
+    }
     $("heard-section").hidden = s.radio === null && s.heard.length === 0;
     $("my-line").textContent = s.trust_line;
     renderHeard(s.heard);
