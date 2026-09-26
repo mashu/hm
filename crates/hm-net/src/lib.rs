@@ -477,23 +477,32 @@ async fn dial_loop(net: std::sync::Weak<Net>) {
             if net.is_connected(*call) {
                 continue;
             }
-            let Ok(Ok(mut addrs)) =
+            let Ok(Ok(addrs)) =
                 tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(address)).await
             else {
                 continue;
             };
-            let Some(addr) = addrs.next() else { continue };
-            if let Ok(connecting) = net.endpoint.connect(addr, "hm-net") {
-                if let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(5), connecting).await {
-                    let named = net.peer_of(&conn);
-                    if named != Some(*call) && named != Some(call.base()) {
-                        conn.close(1u32.into(), b"unexpected station");
-                    } else if confirmed(&conn).await {
-                        net.register(conn);
-                    } else {
-                        conn.close(1u32.into(), b"not accepted");
-                    }
+            // A name can resolve to IPv6 and IPv4 addresses (localhost to ::1
+            // and 127.0.0.1): try each, those our socket can reach first.
+            let mut addrs: Vec<SocketAddr> = addrs.collect();
+            let v4 = net.endpoint.local_addr().is_ok_and(|a| a.is_ipv4());
+            addrs.sort_by_key(|a| a.is_ipv4() != v4);
+            for addr in addrs {
+                let Ok(connecting) = net.endpoint.connect(addr, "hm-net") else {
+                    continue;
+                };
+                let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(5), connecting).await else {
+                    continue;
+                };
+                let named = net.peer_of(&conn);
+                if named != Some(*call) && named != Some(call.base()) {
+                    conn.close(1u32.into(), b"unexpected station");
+                } else if confirmed(&conn).await {
+                    net.register(conn);
+                } else {
+                    conn.close(1u32.into(), b"not accepted");
                 }
+                break;
             }
         }
         drop(net);
