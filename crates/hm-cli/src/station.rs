@@ -355,8 +355,8 @@ mod tests {
     #[test]
     fn bulletin_addresses_a_group_without_a_station() {
         let alice = KeyFile::generate(call("SA0KAM")).unwrap();
-        let sealed = build_bulletin(&alice, call("SA0KAM"), "SK-EMCOMM", "net open", Some("check-in"))
-            .unwrap();
+        let sealed =
+            build_bulletin(&alice, call("SA0KAM"), "SK-EMCOMM", "net open", Some("check-in")).unwrap();
         assert_eq!(sealed.bundle().kind, Kind::Bulletin);
         assert_eq!(sealed.bundle().to, vec![Address::Group("SK-EMCOMM".into())]);
         assert!(sealed.to_vec().len() <= MAX_BULLETIN_BYTES);

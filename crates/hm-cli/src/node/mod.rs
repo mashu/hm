@@ -664,14 +664,15 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                 let (net_control_tx, net_control_rx) = tokio::sync::mpsc::unbounded_channel();
                 let mut net = match &cfg.internet {
                     None => None,
-                    Some(ic) => match start_net(&cfg, &store, &live, &notify, ic.listen, net_control_tx.clone())
-                    {
-                        Ok(n) => Some(n),
-                        Err(e) => {
-                            let _ = addr_tx.send(Err(e));
-                            return;
+                    Some(ic) => {
+                        match start_net(&cfg, &store, &live, &notify, ic.listen, net_control_tx.clone()) {
+                            Ok(n) => Some(n),
+                            Err(e) => {
+                                let _ = addr_tx.send(Err(e));
+                                return;
+                            }
                         }
-                    },
+                    }
                 };
                 let modem = cfg.modem.clone().map(|mc| {
                     let (store, gate_live, me, key_call, gate_identity, gate_notify, gate_relay) = (
@@ -1025,6 +1026,7 @@ fn ensure_internet(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn coordinator(
     cfg: &NodeConfig,
     store: &Arc<Store>,
@@ -2247,10 +2249,7 @@ fn radio_session(
                 ),
                 RadioCmd::Broadcast { object, precedence } => x.handle(
                     now(),
-                    Input::Command(Command::Broadcast {
-                        object,
-                        precedence,
-                    }),
+                    Input::Command(Command::Broadcast { object, precedence }),
                     &mut out,
                 ),
                 RadioCmd::Accept {
@@ -2491,21 +2490,13 @@ mod tests {
     fn unverified_final_delivery_stores_without_a_receipt() {
         let sender = KeyFile::generate(call("SA0KAM")).unwrap();
         let me = KeyFile::generate(call("SO5KM-1")).unwrap();
-        let path =
-            std::env::temp_dir().join(format!("hm-unverified-receipt-{}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!("hm-unverified-receipt-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = Store::open(&path).unwrap();
         let notify = Notify::new();
-        let bundle = build_bundle(
-            &sender,
-            sender.call,
-            me.call,
-            "hello",
-            None,
-            Precedence::Routine,
-        )
-        .unwrap()
-        .to_vec();
+        let bundle = build_bundle(&sender, sender.call, me.call, "hello", None, Precedence::Routine)
+            .unwrap()
+            .to_vec();
         let trust = Trust::default();
         let accepted = accept(
             AcceptanceGate {
@@ -2535,15 +2526,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = Store::open(&path).unwrap();
         let notify = Notify::new();
-        let bundle = crate::station::build_bulletin(
-            &sender,
-            sender.call,
-            "SK-EMCOMM",
-            "net open",
-            Some("check-in"),
-        )
-        .unwrap()
-        .to_vec();
+        let bundle =
+            crate::station::build_bulletin(&sender, sender.call, "SK-EMCOMM", "net open", Some("check-in"))
+                .unwrap()
+                .to_vec();
         let mut trust = Trust::default();
         trust.insert(sender.call, sender.identity.public());
         let accepted = accept(

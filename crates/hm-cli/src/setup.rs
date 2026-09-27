@@ -373,9 +373,7 @@ fn run_with_io<R: BufRead, W: Write>(
 
     if connection == Connection::CoreNode {
         wizard.say("\nA core node is a meeting point on the internet for stations you trust.")?;
-        wizard.say(
-            "Run it on a computer with a public address (a small rented cloud server works well).",
-        )?;
+        wizard.say("Run it on a computer with a public address (a small rented cloud server works well).")?;
         wizard.say("Allow UDP port 4433 through the firewall so home stations can dial in.")?;
         let Some(address) = wizard.listen_address()? else {
             return Ok(SetupOutcome::Cancelled);
@@ -408,8 +406,7 @@ fn run_with_io<R: BufRead, W: Write>(
         };
         config.relay.enabled = relay;
 
-        let Some(mailbox) =
-            wizard.yes_no("Hold mailbox traffic for offline trusted stations?", false)?
+        let Some(mailbox) = wizard.yes_no("Hold mailbox traffic for offline trusted stations?", false)?
         else {
             return Ok(SetupOutcome::Cancelled);
         };
@@ -593,7 +590,10 @@ mod tests {
         assert_eq!(config.internet.listen.as_deref(), Some("0.0.0.0:4433"));
         assert!(config.relay.enabled);
         assert!(config.relay.mailbox);
-        assert!(output.contains("cloud server") || output.contains("core node"), "{output}");
+        assert!(
+            output.contains("cloud server") || output.contains("core node"),
+            "{output}"
+        );
         assert!(output.contains("hm trust add"), "{output}");
         assert!(output.contains("[[internet.peers]]"), "{output}");
     }
@@ -643,7 +643,10 @@ mod tests {
         let text = String::from_utf8(output).unwrap();
         assert_eq!(outcome.unwrap(), SetupOutcome::Complete, "{text}");
 
-        assert_eq!(fs::read_to_string(dir.0.join("station.key")).unwrap(), "home station key\n");
+        assert_eq!(
+            fs::read_to_string(dir.0.join("station.key")).unwrap(),
+            "home station key\n"
+        );
         assert!(dir.0.join("core.key").exists(), "{text}");
         let written = Config::load(&config).unwrap();
         assert_eq!(written.station.key, PathBuf::from("core.key"));

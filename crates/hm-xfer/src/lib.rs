@@ -267,10 +267,7 @@ pub enum Command {
     /// that reconstruct it emit [`Event::Received`] and do not ACK. Completes
     /// locally as [`Event::Delivered`] to [`broadcast_peer`] with
     /// [`Receipt::Unverified`].
-    Broadcast {
-        object: Vec<u8>,
-        precedence: u8,
-    },
+    Broadcast { object: Vec<u8>, precedence: u8 },
     /// Application durably stored (or refused) a just-received object.
     Accept {
         from: Callsign,
@@ -781,8 +778,7 @@ impl Xfer {
         if o.offer_next {
             fixed += self.cfg.air(1, HEADER_LEN + hm_wire::OFFER_LEN);
         }
-        let open = !o.broadcast
-            && ((o.offer_next && o.open_next) || self.open_replies.contains(&o.to));
+        let open = !o.broadcast && ((o.offer_next && o.open_next) || self.open_replies.contains(&o.to));
         if open {
             fixed += self.open_air();
         }
@@ -1014,6 +1010,7 @@ impl Xfer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn slot(
         &mut self,
         now: Millis,
@@ -1068,8 +1065,7 @@ impl Xfer {
             return;
         };
         let id = ObjectId(offer.hash);
-        if !self.incoming.contains_key(&key) && !self.seen.contains_key(&id) && self.busy_for(now, from)
-        {
+        if !self.incoming.contains_key(&key) && !self.seen.contains_key(&id) && self.busy_for(now, from) {
             if !broadcast {
                 let close = Close {
                     reason: CloseReason::Busy,
@@ -1112,6 +1108,7 @@ impl Xfer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn on_data(
         &mut self,
         now: Millis,
@@ -1138,9 +1135,7 @@ impl Xfer {
         }
         // Symbols for a transfer we are turning away, or would have to make
         // room for by dropping others' work, are not collected.
-        if self.closes.contains_key(&key)
-            || (!self.incoming.contains_key(&key) && self.busy_for(now, from))
-        {
+        if self.closes.contains_key(&key) || (!self.incoming.contains_key(&key) && self.busy_for(now, from)) {
             return;
         }
         if !self.slot(now, key, pre.object_len, t, k, false, broadcast) {

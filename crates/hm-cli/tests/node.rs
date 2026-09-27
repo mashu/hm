@@ -1037,20 +1037,13 @@ fn internet_peer_added_while_radio_only_node_runs() {
     let tnc = fake_tnc(0);
     let (alice, bob) = keys();
     let (a_db, h_db) = (Tmp::new("dial-later-a"), Tmp::new("dial-later-h"));
-    let settings = std::env::temp_dir().join(format!(
-        "hm-node-dial-later-{}.toml",
-        std::process::id()
-    ));
+    let settings = std::env::temp_dir().join(format!("hm-node-dial-later-{}.toml", std::process::id()));
     std::fs::write(
         &settings,
-        format!(
-            "[[trust]]\nstation = {:?}\nkey = {:?}\n",
-            bob.call.to_string(),
-            {
-                let line = bob.trust_line();
-                line.split_once(' ').unwrap().1.to_string()
-            }
-        ),
+        format!("[[trust]]\nstation = {:?}\nkey = {:?}\n", bob.call.to_string(), {
+            let line = bob.trust_line();
+            line.split_once(' ').unwrap().1.to_string()
+        }),
     )
     .unwrap();
     let hub = start(Setup {

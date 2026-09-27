@@ -1108,10 +1108,7 @@ fn broadcast_reaches_listeners_without_acks() {
     };
     let b_out = deliver(&mut b, Millis(20_000), &burst);
     assert_eq!(events(&b_out), vec![want.clone()]);
-    assert!(
-        frames(&b_out).is_empty(),
-        "broadcast listeners must not ACK"
-    );
+    assert!(frames(&b_out).is_empty(), "broadcast listeners must not ACK");
     let c_out = deliver(&mut c, Millis(20_000), &burst);
     assert_eq!(events(&c_out), vec![want]);
     assert!(frames(&c_out).is_empty());

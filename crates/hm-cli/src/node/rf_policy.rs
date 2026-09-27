@@ -18,12 +18,7 @@ use hm_wire::Callsign;
 ///
 /// An Internet peer being linked does **not** by itself authorize RF for every
 /// bundle that peer forwards.
-pub fn may_transmit_rf(
-    origin: Callsign,
-    me: Callsign,
-    key_call: Callsign,
-    trust: &Trust,
-) -> bool {
+pub fn may_transmit_rf(origin: Callsign, me: Callsign, key_call: Callsign, trust: &Trust) -> bool {
     origin == me || origin == key_call || trust.key_for(origin).is_some()
 }
 

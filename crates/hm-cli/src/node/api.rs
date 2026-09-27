@@ -34,9 +34,7 @@ use super::live::{Change, LiveConfig};
 use super::{NodeConfig, Notify, Status};
 use crate::config::RadioSettings;
 use crate::files::Trust;
-use crate::station::{
-    build_bulletin, build_bundle, unix_now, MAX_BULLETINS_PER_HOUR, MAX_BULLETIN_BYTES,
-};
+use crate::station::{build_bulletin, build_bundle, unix_now, MAX_BULLETINS_PER_HOUR, MAX_BULLETIN_BYTES};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -361,11 +359,7 @@ async fn messages(
         Some("chat") => Some("Chat"),
         Some("mail") => Some("Mail"),
         Some("bulletin") => Some("Bulletin"),
-        Some(other) => {
-            return Err(bad(format!(
-                "kind must be chat, mail or bulletin, not {other:?}"
-            )))
-        }
+        Some(other) => return Err(bad(format!("kind must be chat, mail or bulletin, not {other:?}"))),
     };
     let group = q
         .group
