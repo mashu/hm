@@ -329,6 +329,8 @@ fn run_with_io<R: BufRead, W: Write>(
     let mut config = Config::default();
     config.station.key = key_setting;
     config.station.store = store_setting;
+    // Defaults include the public core hub; do not dial/trust ourselves.
+    config::public_hub::omit_self(&mut config, call);
     let connection_detail = match connection {
         Connection::Kiss => {
             let Some(endpoint) = wizard.kiss_endpoint()? else {
@@ -442,6 +444,19 @@ fn run_with_io<R: BufRead, W: Write>(
     ))?;
     wizard.say(format!("  Private key: {}", key_path.display()))?;
     wizard.say(format!("  Configuration: {}", config_path.display()))?;
+    if connection != Connection::CoreNode
+        && config
+            .internet
+            .peers
+            .iter()
+            .any(|p| p.station == config::public_hub::CALL)
+    {
+        wizard.say(format!(
+            "  Default hub: {} at {}",
+            config::public_hub::CALL,
+            config::public_hub::ADDRESS
+        ))?;
+    }
 
     let Some(confirm) = wizard.yes_no("\nWrite these files?", true)? else {
         return Ok(SetupOutcome::Cancelled);
@@ -574,6 +589,8 @@ mod tests {
         assert_eq!(config.internet.listen.as_deref(), Some("0.0.0.0:4433"));
         assert!(!config.relay.enabled);
         assert!(!config.relay.mailbox);
+        assert_eq!(config.internet.peers, vec![config::public_hub::peer()]);
+        assert_eq!(config.trust, vec![config::public_hub::trust()]);
     }
 
     #[test]
@@ -590,12 +607,25 @@ mod tests {
         assert_eq!(config.internet.listen.as_deref(), Some("0.0.0.0:4433"));
         assert!(config.relay.enabled);
         assert!(config.relay.mailbox);
+        assert_eq!(config.internet.peers, vec![config::public_hub::peer()]);
+        assert_eq!(config.trust, vec![config::public_hub::trust()]);
         assert!(
             output.contains("cloud server") || output.contains("core node"),
             "{output}"
         );
         assert!(output.contains("hm trust add"), "{output}");
         assert!(output.contains("[[internet.peers]]"), "{output}");
+    }
+
+    #[test]
+    fn setup_as_public_hub_does_not_dial_itself() {
+        let dir = TestDir::new("self-hub");
+        let script = format!("{}\n4\n\n\n\n", config::public_hub::CALL);
+        let (outcome, output) = run_script(&dir, &script, AudioDevices::default());
+        assert_eq!(outcome.unwrap(), SetupOutcome::Complete, "{output}");
+        let config = Config::load(&dir.config()).unwrap();
+        assert!(config.internet.peers.is_empty(), "{:?}", config.internet.peers);
+        assert!(config.trust.is_empty(), "{:?}", config.trust);
     }
 
     #[test]

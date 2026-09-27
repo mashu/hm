@@ -64,6 +64,11 @@ matching names (`hm setup --config core.toml` writes `core.key` and `core.db`, l
 `station.key` alone). Type `q` at any prompt to leave without changing files. For
 scripted provisioning, `hm keygen --call SA0KAM-1` remains available.
 
+New stations trust and dial the public core hub **SA0KAM-0** at `34.51.161.47:4433` by
+default. Remove or replace that `[[trust]]` / `[[internet.peers]]` entry if you do not
+want it. The hub must still trust each home station (`hm trust add` on the server)
+before the link comes up.
+
 ### station.toml
 
 Everything a station needs to know lives in one TOML file in the station's folder:
@@ -329,8 +334,9 @@ address = "node.example.net:4433"
 ```
 
 QUIC is bidirectional once either side connects. If a home node cannot accept inbound UDP,
-let it dial a public core node; no automatic NAT traversal or public peer directory exists yet.
-Do not put UDP 4433 through an HTTP reverse proxy.
+it can dial the default public core (`SA0KAM-0` / `34.51.161.47:4433`); no automatic NAT
+traversal or public peer directory exists yet. Do not put UDP 4433 through an HTTP reverse
+proxy.
 
 For remote web access, keep port 8080 private and terminate HTTPS separately. For example,
 Caddy can add a second authentication layer in front of the node:

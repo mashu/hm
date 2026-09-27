@@ -38,7 +38,42 @@ use crate::station::LinkTiming;
 
 pub const DEFAULT_PATH: &str = "station.toml";
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+/// Public core hub shipped with hm. Home stations trust and dial it by default.
+pub mod public_hub {
+    use super::{PeerEntry, TrustEntry};
+
+    pub const CALL: &str = "SA0KAM-0";
+    pub const KEY_HEX: &str = "3893d7fd50f143c9489552363ce63714c80ea00eff96763896f09af34b53b9af";
+    pub const ADDRESS: &str = "34.51.161.47:4433";
+
+    pub fn peer() -> PeerEntry {
+        PeerEntry {
+            station: CALL.into(),
+            address: ADDRESS.into(),
+        }
+    }
+
+    pub fn trust() -> TrustEntry {
+        TrustEntry {
+            station: CALL.into(),
+            key: KEY_HEX.into(),
+            note: Some("public core hub".into()),
+        }
+    }
+
+    pub fn trust_line() -> String {
+        format!("{CALL} {KEY_HEX}")
+    }
+
+    /// Drop dial/trust entries for `call` so a station does not peer with itself.
+    pub fn omit_self(config: &mut super::Config, call: hm_wire::Callsign) {
+        let name = call.to_string();
+        config.internet.peers.retain(|p| p.station != name);
+        config.trust.retain(|t| t.station != name);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub station: StationSettings,
@@ -49,6 +84,21 @@ pub struct Config {
     pub relay: RelaySettings,
     pub contact: Vec<ContactEntry>,
     pub trust: Vec<TrustEntry>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            station: StationSettings::default(),
+            radio: RadioSettings::default(),
+            internet: InternetSettings::default(),
+            modem: ModemSettings::default(),
+            delivery: DeliverySettings::default(),
+            relay: RelaySettings::default(),
+            contact: Vec::new(),
+            trust: vec![public_hub::trust()],
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -168,13 +218,22 @@ impl RadioSettings {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct InternetSettings {
     /// Accept links from trusted stations here, e.g. `0.0.0.0:4433`.
     pub listen: Option<String>,
     /// Stations to keep a link to.
     pub peers: Vec<PeerEntry>,
+}
+
+impl Default for InternetSettings {
+    fn default() -> Self {
+        InternetSettings {
+            listen: None,
+            peers: vec![public_hub::peer()],
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -731,11 +790,12 @@ key = {key:?}
 beacon_minutes = 10         # 0 turns the beacon off
 
 # listen = "0.0.0.0:4433"   accept links from other stations over the internet
-# Stations this node dials, one entry each:
-#   [[internet.peers]]
-#   station = "SO5KM"
-#   address = "hm.example.org:4433"
+# Stations this node dials, one entry each. The public core hub is included by default.
 [internet]
+
+[[internet.peers]]
+station = "{hub_call}"
+address = "{hub_addr}"
 
 # An ARQ modem program as another way to reach stations (Mercury speaks
 # VARA's interface; ARDOP uses port 8515):
@@ -761,11 +821,17 @@ retry_attempts = 12
 enabled = false
 mailbox = false
 
-# Stations whose messages you can verify. Add one with
-#   hm trust add "SO5KM-1 8a1e…"   (the line `hm whoami` prints on their side)
-# or on the web page.
+# Stations whose messages you can verify. The public core hub is trusted by
+# default. Add others with `hm trust add "CALL KEY"` or on the web page.
+[[trust]]
+station = "{hub_call}"
+key = "{hub_key}"
+note = "public core hub"
 "#,
-        key = key.display().to_string()
+        key = key.display().to_string(),
+        hub_call = public_hub::CALL,
+        hub_addr = public_hub::ADDRESS,
+        hub_key = public_hub::KEY_HEX,
     )
 }
 
@@ -815,7 +881,8 @@ mod tests {
         let text = starter(call("SA0KAM-1"), Path::new("station.key"));
         let c = Config::parse(&text).unwrap();
         assert_eq!(c.station.key, PathBuf::from("station.key"));
-        assert!(c.trust.is_empty());
+        assert_eq!(c.trust, vec![public_hub::trust()]);
+        assert_eq!(c.internet.peers, vec![public_hub::peer()]);
     }
 
     #[test]
@@ -877,28 +944,35 @@ mod tests {
             text.contains("beacon_minutes = 5         # 0 turns the beacon off"),
             "{text}"
         );
-        let (intro, peer, delivery, trust) = (
+        let (intro, peer, delivery, hub) = (
             text.find("[internet]").unwrap(),
             text.find("[[internet.peers]]\nstation = \"SO5KM\"").unwrap(),
             text.find("[delivery]").unwrap(),
-            text.find("# Stations whose messages").unwrap(),
+            text.find(&format!("station = \"{}\"", public_hub::CALL)).unwrap(),
         );
-        assert!(intro < peer && peer < delivery && delivery < trust, "{text}");
-        assert!(text.find("station = \"SO5KM-1\"").unwrap() > trust, "{text}");
-        assert!(text.find("station = \"SP5AAA\"").unwrap() > trust, "{text}");
+        assert!(intro < peer && peer < delivery && delivery < hub, "{text}");
+        assert!(text.contains("station = \"SO5KM-1\""), "{text}");
+        assert!(text.contains("station = \"SP5AAA\""), "{text}");
 
-        // Removing every entry leaves the comment in place for the next one.
         assert!(remove_trust(&path, call("SO5KM-1")).unwrap());
         assert!(remove_trust(&path, call("SP5AAA")).unwrap());
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("# Stations whose messages"), "{text}");
+        assert!(text.contains(public_hub::CALL), "{text}");
         set_trust(&path, call("SP5AAA"), &PublicKey([2; 32]), None).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert_eq!(text.matches("# Stations whose messages").count(), 1, "{text}");
-        assert!(
-            text.find("station = \"SP5AAA\"").unwrap() > text.find("# Stations whose").unwrap(),
-            "{text}"
-        );
+        assert!(text.contains("station = \"SP5AAA\""), "{text}");
         fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn public_hub_is_in_the_defaults() {
+        let c = Config::default();
+        assert_eq!(c.internet.peers, vec![public_hub::peer()]);
+        assert_eq!(c.trust, vec![public_hub::trust()]);
+        assert_eq!(Config::parse("").unwrap(), c);
+        let mut self_hub = c;
+        public_hub::omit_self(&mut self_hub, call(public_hub::CALL));
+        assert!(self_hub.internet.peers.is_empty());
+        assert!(self_hub.trust.is_empty());
     }
 }

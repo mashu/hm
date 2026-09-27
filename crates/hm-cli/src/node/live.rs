@@ -337,7 +337,7 @@ mod tests {
             Live::from_config(&Config::load(&path).unwrap()).unwrap(),
             Some(path.clone()),
         );
-        assert_eq!((live.get().trust.len(), live.version()), (0, 0));
+        assert_eq!((live.get().trust.len(), live.version()), (1, 0)); // public hub default
 
         live.add_trust(call("SO5KM-1"), PublicKey([1; 32]), Some("Jan"))
             .unwrap();
@@ -383,6 +383,7 @@ mod tests {
         ));
         std::fs::write(&path, text).unwrap();
         assert_eq!(live.reload_if_changed(), Some(Ok(())));
+        // File trusts only (defaults apply when the [[trust]] table is absent).
         assert_eq!(live.get().trust.len(), 2);
 
         // A broken file is reported and what is in use stays.
@@ -403,7 +404,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             (live.get().trust.len(), live.get().beacon_secs, live.version()),
-            (1, 0, 2)
+            (2, 0, 2)
         );
         assert!(live.remove_trust(call("SO5KM")).unwrap());
         assert_eq!(live.reload_if_changed(), None);
