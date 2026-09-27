@@ -17,7 +17,7 @@
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -54,7 +54,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/settings", get(get_settings).patch(change_settings))
         .route("/api/trust/{station}", delete(remove_trust))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
-    Router::new().route("/", get(index)).merge(api).with_state(state)
+    Router::new()
+        .route("/", get(index))
+        .merge(api)
+        .layer(middleware::from_fn(security_headers))
+        .with_state(state)
 }
 
 /// Compare in time independent of where the inputs differ.
@@ -74,6 +78,43 @@ async fn require_token(State(s): State<AppState>, req: Request, next: Next) -> R
     } else {
         ApiError(StatusCode::UNAUTHORIZED, "missing or wrong access token".into()).into_response()
     }
+}
+
+async fn security_headers(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(
+            "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; \
+             form-action 'self'; connect-src 'self'; script-src 'self' 'unsafe-inline' \
+             https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; \
+             img-src 'self' data: https://cdn.jsdelivr.net https://*.tile.openstreetmap.org",
+        ),
+    );
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("geolocation=(self), camera=(), microphone=()"),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-robots-tag"),
+        HeaderValue::from_static("noindex, nofollow"),
+    );
+    response
 }
 
 struct ApiError(StatusCode, String);

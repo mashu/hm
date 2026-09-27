@@ -104,7 +104,7 @@
   .thread-head { display: flex; align-items: center; gap: 0.75rem; padding: 0.7rem 1rem; border-bottom: 1px solid var(--rule); flex-wrap: wrap; }
   .thread-head h2 { margin: 0; letter-spacing: 0.04em; }
   .thread-head .sub { color: var(--muted); font-size: 0.85rem; }
-  .back { display: none; }
+  .close-chat { margin-left: auto; }
   .lines { list-style: none; margin: 0; padding: 1rem; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 0.35rem; }
   .lines .day { align-self: center; color: var(--muted); font-size: 0.8rem; margin: 0.5rem 0; }
   .bubble {
@@ -126,7 +126,6 @@
     .chat { grid-template-columns: minmax(0, 1fr); height: calc(100vh - 10rem); }
     .chat.open .convos { display: none; }
     .chat:not(.open) .thread { display: none; }
-    .back { display: inline-block; }
   }
 
   /* Mail */
@@ -209,7 +208,7 @@
   </div>
   <form id="token-form" hidden>
     <label for="token">Access token <span class="hint">(printed by <code>hm node</code> at start-up, and kept in <code>station.token</code>)</span></label>
-    <input id="token" autocomplete="off" spellcheck="false">
+    <input id="token" type="password" autocomplete="off" spellcheck="false">
     <button class="btn" type="submit">Use token</button>
   </form>
   <nav class="tabs" aria-label="Views">
@@ -231,9 +230,9 @@
       </div>
       <div class="card thread">
         <div class="thread-head" id="thread-head" hidden>
-          <a class="btn quiet small back" href="#chat">Back</a>
           <h2 id="thread-call"></h2>
           <span class="sub" id="thread-sub"></span>
+          <a class="btn quiet small close-chat" href="#chat">Close chat</a>
         </div>
         <ol class="lines" id="lines" aria-live="polite"></ol>
         <form class="composer" id="composer" autocomplete="off" hidden>
@@ -516,8 +515,9 @@ function describeLine(m) {
 }
 
 function dropButton(id) {
-  const b = el("button", "btn danger small drop", "Drop queued");
+  const b = el("button", "btn danger small drop", "Drop message");
   b.type = "button";
+  b.setAttribute("aria-label", "Drop this queued message");
   b.addEventListener("click", async () => {
     b.disabled = true;
     b.textContent = "Dropping…";
@@ -530,7 +530,7 @@ function dropButton(id) {
       await Promise.all([loadChats(), loadMail()]);
     } catch (e) {
       b.disabled = false;
-      b.textContent = "Drop queued";
+      b.textContent = "Drop message";
       alert("Could not drop message: " + e.message);
     }
   });
@@ -836,9 +836,13 @@ function loadLeaflet() {
     const css = document.createElement("link");
     css.rel = "stylesheet";
     css.href = "https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css";
+    css.integrity = "sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=";
+    css.crossOrigin = "anonymous";
     document.head.append(css);
     const script = document.createElement("script");
     script.src = "https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js";
+    script.integrity = "sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=";
+    script.crossOrigin = "anonymous";
     script.onload = () => resolve(window.L);
     script.onerror = () => {
       leafletPromise = null;
@@ -1173,6 +1177,7 @@ async function listen() {
 $("token-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
   localStorage.setItem("hm-token", $("token").value.trim());
+  $("token").value = "";
   onChange.all();
 });
 

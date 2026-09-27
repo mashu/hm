@@ -41,14 +41,8 @@ fn call(s: &str) -> Callsign {
     Callsign::parse(s).unwrap()
 }
 
-/// Minimal HTTP/1.1 client: returns status and body.
-fn http(
-    addr: SocketAddr,
-    method: &str,
-    path: &str,
-    body: Option<&Value>,
-    token: Option<&str>,
-) -> (u16, String) {
+/// Minimal HTTP/1.1 client.
+fn raw_http(addr: SocketAddr, method: &str, path: &str, body: Option<&Value>, token: Option<&str>) -> String {
     let mut s = TcpStream::connect(addr).unwrap();
     let body = body.map(|b| b.to_string()).unwrap_or_default();
     let auth = token
@@ -62,6 +56,17 @@ fn http(
     .unwrap();
     let mut resp = String::new();
     s.read_to_string(&mut resp).unwrap();
+    resp
+}
+
+fn http(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    token: Option<&str>,
+) -> (u16, String) {
+    let resp = raw_http(addr, method, path, body, token);
     let status = resp[9..12].parse().unwrap();
     let body = resp
         .split_once("\r\n\r\n")
@@ -444,6 +449,12 @@ fn radio_nodes_exchange_mail_and_survive_a_restart() {
     // The page is public; the API wants the token.
     let (status, page) = http(a.http_addr, "GET", "/", None, None);
     assert!(status == 200 && page.contains("Queue message"));
+    assert!(page.contains("Close chat") && page.contains("Drop message"));
+    let headers = raw_http(a.http_addr, "GET", "/", None, None).to_ascii_lowercase();
+    assert!(headers.contains("content-security-policy:"));
+    assert!(headers.contains("permissions-policy:"));
+    assert!(headers.contains("x-frame-options: deny"));
+    assert!(headers.contains("cache-control: no-store"));
     assert_eq!(http(a.http_addr, "GET", "/api/status", None, None).0, 401);
     assert_eq!(
         http(a.http_addr, "GET", "/api/status", None, Some("wrong")).0,

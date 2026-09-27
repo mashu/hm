@@ -31,6 +31,20 @@ multi-hop relaying, mailbox custody, congestion-bounded control traffic, compres
 message bodies and destination-signed end-to-end delivery receipts. It has deterministic
 simulation and localhost integration coverage; real RF deployment testing is still needed.
 
+### What remains
+
+The core protocol and daemon are implemented, but the project is not yet field-complete:
+
+- Run the first multi-hop on-air trials and tune contact probabilities, airtime limits,
+  modem decoding and relay admission from real RF measurements.
+- Test long-running mixed radio/Internet networks and interoperability between independently
+  deployed nodes before freezing wire version 0.
+- Add the remaining Phase 1 stream-modem bearers and the setup wizard.
+- Add discovery or rendezvous if it proves necessary. Today Internet peers use explicit
+  DNS names or addresses; two nodes behind restrictive NAT need a publicly reachable relay.
+- The built-in web server intentionally does not terminate TLS or provide multi-user
+  accounts. Remote administration therefore needs an HTTPS reverse proxy, VPN or SSH tunnel.
+
 ## Run a station
 
 ```sh
@@ -105,8 +119,9 @@ The page has four views:
 
 - **Chat**: conversations by station, like a messenger. Type a callsign to start one;
   Enter sends. Each line shows whether it was delivered, by radio or internet, and whether
-  its signature or receipt verified. A queued line can be dropped before delivery. Lines
-  from other stations appear as they arrive.
+  its signature or receipt verified. A queued line can be dropped before delivery, and
+  **Close chat** returns to the conversation list. Lines from other stations appear as
+  they arrive.
 - **Mail**: messages with a subject and precedence, with an inbox and a sent log.
 - **Stations**: stations heard on the radio (with their beacons, locators, distance and
   bearing) and the trusted stations, which you can add and remove.
@@ -223,6 +238,84 @@ It prints delivery, latency, payload/control airtime, storage, copy count, failu
 fairness and probability calibration. Epidemic routing is intentionally retained as an
 upper-bound baseline: it can deliver more in some partitions, but at substantially
 greater airtime and storage cost.
+
+### Host a protected Internet-only node
+
+The web/API listener and station-to-station listener are separate:
+
+- The web/API is HTTP with a random 192-bit bearer token. Keep it on loopback and expose it
+  only through HTTPS, a VPN or an SSH tunnel.
+- Station links are QUIC over UDP with mutual authentication by station identity keys.
+  The listener rejects stations not present in `[[trust]]`.
+
+A public node can use:
+
+```toml
+[station]
+key = "station.key"
+store = "station.db"
+http = "127.0.0.1:8080"
+
+[radio]
+enabled = false
+beacon_minutes = 0
+
+[internet]
+listen = "0.0.0.0:4433"
+
+# Optional: a node this server dials. Accepted connections are bidirectional,
+# so a public listener does not need a peer entry for every client.
+[[internet.peers]]
+station = "OTHER-1"
+address = "other.example.net:4433"
+
+[relay]
+enabled = true
+mailbox = true
+```
+
+Exchange `hm whoami` output over a channel you trust, then add the other identity on both
+nodes with `hm trust add "CALL KEY"`. Point an A/AAAA DNS record at the public server and
+allow **UDP 4433** through its firewall and NAT. A peer connects with:
+
+```toml
+[[internet.peers]]
+station = "HUB-1"
+address = "node.example.net:4433"
+```
+
+QUIC is bidirectional once either side connects. If a home node cannot accept inbound UDP,
+let it dial a public relay; no automatic NAT traversal or public peer directory exists yet.
+Do not put UDP 4433 through an HTTP reverse proxy.
+
+For remote web access, keep port 8080 private and terminate HTTPS separately. For example,
+Caddy can add a second authentication layer in front of the node:
+
+```caddyfile
+node.example.net {
+    basic_auth {
+        operator {$HM_WEB_PASSWORD_HASH}
+    }
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+Generate the password hash with `caddy hash-password`, set `HM_WEB_PASSWORD_HASH` for
+Caddy, and expose only Caddy's TCP 443 (and TCP 80 if used for certificate issuance).
+The node's bearer token is still required after Basic authentication. The token file is
+owner-only on Unix; the node now refuses a weak or group/world-readable token file.
+To revoke browser access, stop the node, remove `station.token`, and restart it to generate
+a new token.
+
+An SSH tunnel avoids exposing the web service at all:
+
+```sh
+ssh -L 8080:127.0.0.1:8080 user@node.example.net
+```
+
+Then open the token-bearing URL at `http://127.0.0.1:8080`. Station messages remain
+cleartext inside their signed bundles, as stated at the top of this README: QUIC protects
+the link, but trusted relays and anyone with filesystem access to the store can read them.
 
 ### Four relaying stations on one laptop
 

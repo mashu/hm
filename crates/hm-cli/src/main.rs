@@ -514,8 +514,34 @@ fn listen(c: &Config) -> Result<(), String> {
 /// The API token beside the store, created on first start (owner-only on Unix).
 fn api_token(store: &Path) -> Result<String, String> {
     let path = store.with_extension("token");
-    if let Ok(t) = std::fs::read_to_string(&path) {
-        return Ok(t.trim().to_string());
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            let token = contents.trim();
+            if token.len() != 48 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "{}: invalid access token; remove the file to generate a new one",
+                    path.display()
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(&path)
+                    .map_err(|error| format!("{}: {error}", path.display()))?
+                    .permissions()
+                    .mode();
+                if mode & 0o077 != 0 {
+                    return Err(format!(
+                        "{}: access token is readable by other users; run `chmod 600 {}`",
+                        path.display(),
+                        path.display()
+                    ));
+                }
+            }
+            return Ok(token.to_string());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("{}: {error}", path.display())),
     }
     let mut raw = [0u8; 24];
     getrandom::fill(&mut raw).map_err(|e| format!("no system randomness: {e}"))?;
@@ -648,5 +674,36 @@ fn main() -> ExitCode {
             eprintln!("hm: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_token_is_strong_stable_and_private() {
+        let store = std::env::temp_dir().join(format!(
+            "hm-api-token-{}-{}.db",
+            std::process::id(),
+            getrandom::u64().unwrap()
+        ));
+        let path = store.with_extension("token");
+        let token = api_token(&store).unwrap();
+        assert_eq!(token.len(), 48);
+        assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(api_token(&store).unwrap(), token);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(api_token(&store).unwrap_err().contains("chmod 600"));
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        std::fs::write(&path, "weak\n").unwrap();
+        assert!(api_token(&store).unwrap_err().contains("invalid access token"));
+        std::fs::remove_file(path).unwrap();
     }
 }

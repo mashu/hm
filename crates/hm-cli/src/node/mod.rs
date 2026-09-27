@@ -526,7 +526,7 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
     let http_addr = listener.local_addr()?;
     if !http_addr.ip().is_loopback() {
         log(format!(
-            "API on {http_addr} is reachable from the network; it requires the access token"
+            "API on {http_addr} is reachable over plain HTTP; keep it private or put it behind an HTTPS reverse proxy"
         ));
     }
     let stop = Arc::new(AtomicBool::new(false));
