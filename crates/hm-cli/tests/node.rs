@@ -518,8 +518,8 @@ fn radio_nodes_exchange_mail_and_survive_a_restart() {
     assert!(
         page.contains("Archive")
             && page.contains("Clear history")
-            && page.contains("Details / raw")
-            && page.contains("Drop message")
+            && page.contains("View message details and raw signed object")
+            && page.contains("Drop this queued message")
     );
     let headers = raw_http(a.http_addr, "GET", "/", None, None).to_ascii_lowercase();
     assert!(headers.contains("content-security-policy:"));

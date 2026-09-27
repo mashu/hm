@@ -543,6 +543,10 @@ A relay answers busy/refuses custody when its configured holdings count, queue
 bytes or airtime budget is exhausted. Contact residual volume is reserved while
 a handoff is active and consumed on custody acceptance.
 
+A relay MUST accept custody only when its local trust list contains keys for
+both the signed bundle origin and the single final station destination. It MUST
+not forward an existing holding after that destination is removed from trust.
+
 An operator may cancel a locally queued outbound bundle. Cancellation removes
 it from the local delivery queue and ignores late hop acknowledgements. It
 cannot recall a copy whose custody was already accepted downstream.

@@ -408,6 +408,9 @@ fn accept(gate: AcceptanceGate<'_>, via: Callsign, object: &[u8]) -> Acceptance 
         if destinations.next().is_some() {
             return Acceptance::Rejected("multi-recipient relay is not supported".into());
         }
+        if trust.key_for(destination).is_none() {
+            return Acceptance::Rejected(format!("relay destination {destination} is not trusted"));
+        }
         let max_hops = bundle.max_hops().min(relay.max_hops);
         if hop_count >= max_hops || visited.contains(&me) {
             return Acceptance::Rejected("hop limit or routing loop".into());
@@ -1459,6 +1462,12 @@ async fn coordinator(
                         continue;
                     }
                     let destination = r.final_destination();
+                    if r.direction == Direction::Relay && live.get().trust.key_for(destination).is_none() {
+                        let reason = format!("relay destination {destination} is no longer trusted");
+                        let _ = store.abandon(r.id, &reason);
+                        log(format!("stopped relaying {}: {reason}", short(&r.id)));
+                        continue;
+                    }
                     let requested_peer = control.target_for(r.id, now);
                     let route_destination = requested_peer.unwrap_or(destination);
                     let visited = r.visited.as_deref().unwrap_or(&[]);
@@ -2028,7 +2037,12 @@ fn hear(table: &mut heard::HeardTable, trust: &Trust, me: Callsign, frame: &[u8]
 
 #[cfg(test)]
 mod tests {
-    use super::addressed_to_us;
+    use super::{accept, addressed_to_us, Acceptance, AcceptanceGate, Notify};
+    use crate::config::RelaySettings;
+    use crate::files::{KeyFile, Trust};
+    use crate::station::build_bundle;
+    use hm_bundle::Precedence;
+    use hm_store::{Direction, Store};
     use hm_wire::Callsign;
 
     fn call(s: &str) -> Callsign {
@@ -2048,5 +2062,71 @@ mod tests {
         assert!(addressed_to_us(call("SA0KAM-1"), me, key));
         assert!(addressed_to_us(call("SA0KAM"), me, key));
         assert!(!addressed_to_us(call("SA0KAM-2"), me, key));
+    }
+
+    #[test]
+    fn relay_requires_the_final_destination_to_be_trusted() {
+        let sender = KeyFile::generate(call("SA0KAM")).unwrap();
+        let relay = KeyFile::generate(call("SM0R1")).unwrap();
+        let destination = KeyFile::generate(call("SO5KM-1")).unwrap();
+        let path = std::env::temp_dir().join(format!("hm-relay-trust-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        let notify = Notify::new();
+        let settings = RelaySettings {
+            enabled: true,
+            ..RelaySettings::default()
+        };
+        let bundle = build_bundle(
+            &sender,
+            sender.call,
+            destination.call,
+            "relay policy",
+            None,
+            Precedence::Routine,
+        )
+        .unwrap()
+        .to_vec();
+        let mut trust = Trust::default();
+        trust.insert(sender.call, sender.identity.public());
+
+        let rejected = accept(
+            AcceptanceGate {
+                store: &store,
+                notify: &notify,
+                trust: &trust,
+                me: relay.call,
+                key_call: relay.call,
+                identity: &relay.identity,
+                relay: &settings,
+            },
+            sender.call,
+            &bundle,
+        );
+        assert!(matches!(
+            rejected,
+            Acceptance::Rejected(reason) if reason == "relay destination SO5KM-1 is not trusted"
+        ));
+        assert!(store.list(Direction::Relay, 10).unwrap().is_empty());
+
+        trust.insert(destination.call, destination.identity.public());
+        let accepted = accept(
+            AcceptanceGate {
+                store: &store,
+                notify: &notify,
+                trust: &trust,
+                me: relay.call,
+                key_call: relay.call,
+                identity: &relay.identity,
+                relay: &settings,
+            },
+            sender.call,
+            &bundle,
+        );
+        assert!(matches!(accepted, Acceptance::Stored));
+        assert_eq!(store.list(Direction::Relay, 10).unwrap().len(), 1);
+
+        drop(store);
+        std::fs::remove_file(path).unwrap();
     }
 }

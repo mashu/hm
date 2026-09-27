@@ -224,6 +224,11 @@ urgent_min_gain = 0.05
 control_airtime_fraction = 0.02
 ```
 
+Relay custody is allowlisted at both ends: the relay must trust both the bundle's
+origin and its final station destination. Removing the destination from the trust list
+also stops any queued relay holding from being forwarded. This does not change direct
+delivery to the local station, where an unknown sender is still shown as unverified.
+
 Signed contact deltas use Trickle suppression. Pairwise FILTER → OFFER → WANT exchanges
 reconcile holdings without broadcasting payload, and radio control traffic is capped at
 2% of the exact rolling airtime window by default. An authenticated custody receipt means
