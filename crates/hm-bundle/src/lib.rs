@@ -9,7 +9,7 @@
 //! (recipients, precedence, expiry) without a key; [`Opened::verify`] needs
 //! the sender's key from their binding record.
 
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 
@@ -22,7 +22,10 @@ use hm_ident::{Envelope, IdentError, Identity, PublicKey, BUNDLE};
 use hm_wire::{Callsign, ObjectId};
 use minicbor::{Decode, Encode};
 
-pub use types::{Address, Body, Codec, Kind, PartRef, Precedence};
+pub use types::{
+    Address, Body, Codec, Kind, PartRef, Precedence, MAX_DECOMPRESSED_BODY, ZSTD_DICTIONARY,
+    ZSTD_DICTIONARY_BLAKE3,
+};
 
 /// Current bundle format version.
 pub const BUNDLE_VERSION: u8 = 0;
@@ -34,6 +37,10 @@ pub const MAX_SUBJECT: usize = 128;
 pub const MAX_NAME: usize = 32;
 /// Longest email address in bytes.
 pub const MAX_EMAIL: usize = 254;
+/// Default route hop limit when key 11 is absent.
+pub const DEFAULT_MAX_HOPS: u8 = 8;
+/// Protocol-wide route hop limit.
+pub const MAX_HOPS: u8 = 16;
 
 /// Errors from building, sealing or opening bundles.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,6 +112,9 @@ pub struct Bundle {
     pub parts: Option<Vec<PartRef>>,
     #[n(10)]
     pub reply_to: Option<ObjectId>,
+    /// Absent means [`DEFAULT_MAX_HOPS`].
+    #[n(11)]
+    pub max_hops: Option<u8>,
 }
 
 impl Bundle {
@@ -121,6 +131,7 @@ impl Bundle {
             body: None,
             parts: None,
             reply_to: None,
+            max_hops: None,
         }
     }
 
@@ -167,6 +178,15 @@ impl Bundle {
         self
     }
 
+    pub fn with_max_hops(mut self, max_hops: u8) -> Bundle {
+        self.max_hops = (max_hops != DEFAULT_MAX_HOPS).then_some(max_hops);
+        self
+    }
+
+    pub fn max_hops(&self) -> u8 {
+        self.max_hops.unwrap_or(DEFAULT_MAX_HOPS)
+    }
+
     pub fn precedence(&self) -> Precedence {
         self.prec.unwrap_or(Precedence::Routine)
     }
@@ -207,8 +227,32 @@ impl Bundle {
         if self.prec == Some(Precedence::Routine) {
             return Err(BundleError::Invalid("routine precedence must be omitted"));
         }
-        if self.kind == Kind::Receipt && self.reply_to.is_none() {
+        if self.max_hops == Some(DEFAULT_MAX_HOPS) {
+            return Err(BundleError::Invalid("default max_hops must be omitted"));
+        }
+        if !(1..=MAX_HOPS).contains(&self.max_hops()) {
+            return Err(BundleError::Invalid("max_hops out of range"));
+        }
+        if self.kind == Kind::Receipt {
+            self.validate_receipt()?;
+        }
+        Ok(())
+    }
+
+    pub fn validate_receipt(&self) -> Result<(), BundleError> {
+        if self.kind != Kind::Receipt {
+            return Err(BundleError::Invalid("not a receipt"));
+        }
+        if self.reply_to.is_none() {
             return Err(BundleError::Invalid("a receipt must name the bundle it confirms"));
+        }
+        if self.to.len() != 1 || !matches!(self.to.first(), Some(Address::Station(_))) {
+            return Err(BundleError::Invalid(
+                "a receipt must have exactly one station recipient",
+            ));
+        }
+        if self.subject.is_some() || self.body.is_some() || self.parts.is_some() {
+            return Err(BundleError::Invalid("a receipt must not carry content"));
         }
         Ok(())
     }

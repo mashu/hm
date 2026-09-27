@@ -1,3 +1,4 @@
+use alloc::borrow::Cow;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -78,8 +79,14 @@ u8_enum!(
     Codec {
         /// UTF-8 text.
         Plain = 0,
+        /// Zstandard frame using [`ZSTD_DICTIONARY`].
+        Zstd = 1,
     }
 );
+
+pub const ZSTD_DICTIONARY: &[u8] = include_bytes!("hm-net-v0.dict");
+pub const ZSTD_DICTIONARY_BLAKE3: &str = "4b09accfcc88e3a776ce40e97a841debebf4fd4b1d7b574089fbc18d512905de";
+pub const MAX_DECOMPRESSED_BODY: usize = 1024 * 1024;
 
 impl Precedence {
     /// Queue rank: higher goes first. Unknown values rank as routine.
@@ -104,18 +111,56 @@ pub struct Body {
 
 impl Body {
     pub fn text(s: &str) -> Body {
+        #[cfg(feature = "std")]
+        if let Ok(data) = compress_text(s.as_bytes()) {
+            if data.len() < s.len() {
+                return Body {
+                    codec: Codec::Zstd,
+                    data,
+                };
+            }
+        }
         Body {
             codec: Codec::Plain,
             data: s.as_bytes().to_vec(),
         }
     }
 
-    pub fn as_text(&self) -> Result<&str, BundleError> {
+    pub fn as_text(&self) -> Result<Cow<'_, str>, BundleError> {
         match self.codec {
-            Codec::Plain => core::str::from_utf8(&self.data).map_err(|_| BundleError::NotText),
+            Codec::Plain => core::str::from_utf8(&self.data)
+                .map(Cow::Borrowed)
+                .map_err(|_| BundleError::NotText),
+            Codec::Zstd => decode_zstd(&self.data),
             Codec::Other(c) => Err(BundleError::UnsupportedCodec(c)),
         }
     }
+}
+
+#[cfg(feature = "std")]
+fn compress_text(plain: &[u8]) -> Result<Vec<u8>, BundleError> {
+    let mut compressor = zstd::bulk::Compressor::with_dictionary(3, ZSTD_DICTIONARY)
+        .map_err(|error| BundleError::Decode(error.to_string()))?;
+    compressor
+        .compress(plain)
+        .map_err(|error| BundleError::Decode(error.to_string()))
+}
+
+#[cfg(feature = "std")]
+fn decode_zstd(data: &[u8]) -> Result<Cow<'_, str>, BundleError> {
+    let mut decompressor = zstd::bulk::Decompressor::with_dictionary(ZSTD_DICTIONARY)
+        .map_err(|error| BundleError::Decode(error.to_string()))?;
+    let plain = decompressor
+        .decompress(data, MAX_DECOMPRESSED_BODY)
+        .map_err(|error| BundleError::Decode(error.to_string()))?;
+    String::from_utf8(plain)
+        .map(Cow::Owned)
+        .map_err(|_| BundleError::NotText)
+}
+
+#[cfg(not(feature = "std"))]
+fn decode_zstd(_: &[u8]) -> Result<Cow<'_, str>, BundleError> {
+    Err(BundleError::UnsupportedCodec(Codec::Zstd.to_u8()))
 }
 
 /// An attachment, sent as a separate content-addressed object that the

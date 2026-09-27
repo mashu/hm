@@ -18,6 +18,10 @@
 //! sender   -> "HMD0" | length u32 BE | object bytes
 //! receiver -> 0x00 | receipt (64 B)             stored or already held
 //!           | 0x01 | reason length u16 | reason  rejected
+//!
+//! Authenticated pairwise control messages use the same streams:
+//! sender   -> "HMC0" | length u32 BE | control bytes
+//! receiver -> 0x00
 //! ```
 //!
 //! The receipt is the same statement as on radio (see `hm-xfer`), with base
@@ -42,13 +46,15 @@ use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 
 /// Application protocol name negotiated in the TLS handshake.
 pub const ALPN: &[u8] = b"hm-net/1";
-const MAGIC: &[u8; 4] = b"HMD0";
+const OBJECT_MAGIC: &[u8; 4] = b"HMD0";
+const CONTROL_MAGIC: &[u8; 4] = b"HMC0";
 /// The listener's confirmation that it accepted the dialer.
 const ACCEPTED: &[u8; 4] = b"HMOK";
 /// How long a dialer waits for the listener to confirm it.
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest object accepted over the internet.
 pub const MAX_OBJECT: usize = 1024 * 1024;
+pub const MAX_CONTROL: usize = 4096;
 const REDIAL_EVERY: Duration = Duration::from_secs(3);
 const DELIVER_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -58,16 +64,24 @@ pub enum Verdict {
     Stored,
     /// Already held; still acknowledged with a receipt.
     Duplicate,
+    /// Capacity is temporarily exhausted.
+    Busy {
+        retry_after: u16,
+        reason: String,
+    },
     Rejected(String),
 }
 
 /// Called for every object that arrives: `(sender's base callsign, object)`.
 pub type Accept = Arc<dyn Fn(Callsign, Vec<u8>) -> Verdict + Send + Sync>;
+/// Called for authenticated pairwise control data.
+pub type Control = Arc<dyn Fn(Callsign, Vec<u8>) + Send + Sync>;
 
 #[derive(Debug)]
 pub enum NetError {
     NotConnected,
     Io(String),
+    Busy { retry_after: u16, reason: String },
     Rejected(String),
     BadReceipt,
     Timeout,
@@ -78,6 +92,9 @@ impl std::fmt::Display for NetError {
         match self {
             NetError::NotConnected => f.write_str("no internet connection to that station"),
             NetError::Io(e) => write!(f, "internet link: {e}"),
+            NetError::Busy { retry_after, reason } => {
+                write!(f, "receiver busy for {retry_after} s: {reason}")
+            }
             NetError::Rejected(r) => write!(f, "rejected by the receiver: {r}"),
             NetError::BadReceipt => f.write_str("receipt did not verify"),
             NetError::Timeout => f.write_str("no answer in time"),
@@ -281,12 +298,18 @@ pub struct Net {
     /// Stations to keep a link to.
     dial: Mutex<Vec<(Callsign, String)>>,
     accept: Accept,
+    control: Control,
 }
 
 impl Net {
     /// Bind, start accepting connections, and keep dialling `cfg.dial`.
     /// Must be called inside a Tokio runtime.
     pub fn start(cfg: NetConfig, accept: Accept) -> io::Result<Arc<Net>> {
+        Self::start_with_control(cfg, accept, Arc::new(|_, _| {}))
+    }
+
+    /// Start with a handler for authenticated control-plane messages.
+    pub fn start_with_control(cfg: NetConfig, accept: Accept, control: Control) -> io::Result<Arc<Net>> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let trust = Arc::new(RwLock::new(TrustTable::new(&cfg.trust)));
         let verifier = Arc::new(TrustVerifier {
@@ -331,6 +354,7 @@ impl Net {
             conns: Mutex::new(BTreeMap::new()),
             dial: Mutex::new(Vec::new()),
             accept,
+            control,
         });
         tokio::spawn(accept_loop(net.clone()));
         *net.dial.lock().expect("lock") = cfg.dial;
@@ -377,7 +401,7 @@ impl Net {
         let exchange = async {
             let (mut send, mut recv) = conn.open_bi().await.map_err(|e| NetError::Io(e.to_string()))?;
             let mut msg = Vec::with_capacity(8 + object.len());
-            msg.extend_from_slice(MAGIC);
+            msg.extend_from_slice(OBJECT_MAGIC);
             msg.extend_from_slice(&(object.len() as u32).to_be_bytes());
             msg.extend_from_slice(object);
             send.write_all(&msg)
@@ -399,7 +423,54 @@ impl Net {
                     let reason = String::from_utf8_lossy(rest.get(2..2 + n).unwrap_or(&[])).into_owned();
                     Err(NetError::Rejected(reason))
                 }
+                Some((2, rest)) if rest.len() >= 4 => {
+                    let retry_after = u16::from_be_bytes([rest[0], rest[1]]);
+                    let n = u16::from_be_bytes([rest[2], rest[3]]) as usize;
+                    let reason = String::from_utf8_lossy(rest.get(4..4 + n).unwrap_or(&[])).into_owned();
+                    Err(NetError::Busy { retry_after, reason })
+                }
                 _ => Err(NetError::Io("malformed reply".into())),
+            }
+        };
+        tokio::time::timeout(DELIVER_TIMEOUT, exchange)
+            .await
+            .map_err(|_| NetError::Timeout)?
+    }
+
+    /// Send one authenticated pairwise control message.
+    pub async fn send_control(&self, to: Callsign, payload: &[u8]) -> Result<(), NetError> {
+        if payload.len() > MAX_CONTROL {
+            return Err(NetError::Io(format!(
+                "control message of {} bytes exceeds {MAX_CONTROL}",
+                payload.len()
+            )));
+        }
+        let conn = self.conn_for(to).ok_or(NetError::NotConnected)?;
+        let exchange = async {
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
+                .map_err(|error| NetError::Io(error.to_string()))?;
+            let mut message = Vec::with_capacity(8 + payload.len());
+            message.extend_from_slice(CONTROL_MAGIC);
+            message.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            message.extend_from_slice(payload);
+            send.write_all(&message)
+                .await
+                .map_err(|error| NetError::Io(error.to_string()))?;
+            send.finish().map_err(|error| NetError::Io(error.to_string()))?;
+            let reply = recv
+                .read_to_end(512)
+                .await
+                .map_err(|error| NetError::Io(error.to_string()))?;
+            match reply.as_slice() {
+                [0] => Ok(()),
+                [1, rest @ ..] if rest.len() >= 2 => {
+                    let length = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+                    let reason = String::from_utf8_lossy(rest.get(2..2 + length).unwrap_or(&[])).into_owned();
+                    Err(NetError::Rejected(reason))
+                }
+                _ => Err(NetError::Io("malformed control reply".into())),
             }
         };
         tokio::time::timeout(DELIVER_TIMEOUT, exchange)
@@ -534,8 +605,8 @@ async fn serve_connection(net: Arc<Net>, peer: Callsign, conn: Connection) {
     while let Ok((mut send, mut recv)) = conn.accept_bi().await {
         let net = net.clone();
         tokio::spawn(async move {
-            let reply = match read_object(&mut recv).await {
-                Ok(object) => {
+            let reply = match read_message(&mut recv).await {
+                Ok(Incoming::Object(object)) => {
                     let id = object_id(&object);
                     let accept = net.accept.clone();
                     let verdict = tokio::task::spawn_blocking(move || accept(peer, object))
@@ -548,8 +619,13 @@ async fn serve_connection(net: Arc<Net>, peer: Callsign, conn: Connection) {
                             r.extend_from_slice(&sig);
                             r
                         }
+                        Verdict::Busy { retry_after, reason } => busy(retry_after, &reason),
                         Verdict::Rejected(reason) => rejection(&reason),
                     }
+                }
+                Ok(Incoming::Control(payload)) => {
+                    (net.control)(peer, payload);
+                    vec![0]
                 }
                 Err(reason) => rejection(&reason),
             };
@@ -575,17 +651,38 @@ fn rejection(reason: &str) -> Vec<u8> {
     r
 }
 
-async fn read_object(recv: &mut quinn::RecvStream) -> Result<Vec<u8>, String> {
+fn busy(retry_after: u16, reason: &str) -> Vec<u8> {
+    let bytes = reason.as_bytes();
+    let n = bytes.len().min(512);
+    let mut reply = vec![2_u8];
+    reply.extend_from_slice(&retry_after.to_be_bytes());
+    reply.extend_from_slice(&(n as u16).to_be_bytes());
+    reply.extend_from_slice(&bytes[..n]);
+    reply
+}
+
+enum Incoming {
+    Object(Vec<u8>),
+    Control(Vec<u8>),
+}
+
+async fn read_message(recv: &mut quinn::RecvStream) -> Result<Incoming, String> {
     let mut head = [0u8; 8];
     recv.read_exact(&mut head).await.map_err(|e| e.to_string())?;
-    if &head[..4] != MAGIC {
-        return Err("unknown message type".into());
-    }
     let len = u32::from_be_bytes([head[4], head[5], head[6], head[7]]) as usize;
-    if len > MAX_OBJECT {
-        return Err(format!("object of {len} bytes exceeds {MAX_OBJECT}"));
+    let (limit, control) = match &head[..4] {
+        magic if magic == OBJECT_MAGIC => (MAX_OBJECT, false),
+        magic if magic == CONTROL_MAGIC => (MAX_CONTROL, true),
+        _ => return Err("unknown message type".into()),
+    };
+    if len > limit {
+        return Err(format!("message of {len} bytes exceeds {limit}"));
     }
-    let mut object = vec![0u8; len];
-    recv.read_exact(&mut object).await.map_err(|e| e.to_string())?;
-    Ok(object)
+    let mut payload = vec![0u8; len];
+    recv.read_exact(&mut payload).await.map_err(|e| e.to_string())?;
+    Ok(if control {
+        Incoming::Control(payload)
+    } else {
+        Incoming::Object(payload)
+    })
 }

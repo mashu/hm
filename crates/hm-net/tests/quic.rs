@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hm_ident::Identity;
-use hm_net::{ed25519_key_in_cert, station_certificate, Accept, Net, NetConfig, NetError, Verdict};
+use hm_net::{
+    ed25519_key_in_cert, station_certificate, Accept, Control, Net, NetConfig, NetError, Verdict, MAX_CONTROL,
+};
 use hm_wire::Callsign;
 
 fn call(s: &str) -> Callsign {
@@ -85,6 +87,38 @@ async fn delivery_with_verified_receipt() {
     );
     // The connection is symmetric: B can deliver to A on it.
     b.deliver(call("SA0KAM"), b"reply").await.unwrap();
+}
+
+#[tokio::test]
+async fn authenticated_control_messages_share_the_link() {
+    let (b_accept, _) = recorder(Verdict::Stored);
+    let control_log: Log = Arc::default();
+    let captured = control_log.clone();
+    let control: Control = Arc::new(move |from, payload| {
+        captured.lock().unwrap().push((from, payload));
+    });
+    let b = Net::start_with_control(cfg("SO5KM", 2, &[("SA0KAM", 1)], vec![]), b_accept, control).unwrap();
+    let (a_accept, _) = recorder(Verdict::Stored);
+    let a = Net::start(
+        cfg(
+            "SA0KAM",
+            1,
+            &[("SO5KM", 2)],
+            vec![(call("SO5KM"), b.local_addr().unwrap())],
+        ),
+        a_accept,
+    )
+    .unwrap();
+    assert!(wait_connected(&a, "SO5KM").await);
+    a.send_control(call("SO5KM"), b"filter").await.unwrap();
+    assert_eq!(
+        control_log.lock().unwrap().as_slice(),
+        &[(call("SA0KAM"), b"filter".to_vec())]
+    );
+    assert!(a
+        .send_control(call("SO5KM"), &vec![0; MAX_CONTROL + 1])
+        .await
+        .is_err());
 }
 
 #[tokio::test]

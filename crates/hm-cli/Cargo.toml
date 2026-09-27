@@ -18,6 +18,7 @@ hm-bundle = { path = "../hm-bundle" }
 hm-bearer = { path = "../hm-bearer" }
 hm-xfer = { path = "../hm-xfer" }
 hm-store = { path = "../hm-store" }
+hm-route = { path = "../hm-route" }
 hm-net = { path = "../hm-net" }
 hm-rig = { path = "../hm-rig" }
 hm-modem-afsk = { path = "../hm-modem-afsk" }
@@ -30,4 +31,5 @@ toml = "0.9"
 toml_edit = "0.23"
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.4"
+blake3.workspace = true
 serialport = { version = "4", default-features = false }

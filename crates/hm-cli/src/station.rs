@@ -4,6 +4,7 @@
 //! same sans-IO machine the simulator drives; this module only supplies the clock,
 //! the station key and the trusted stations.
 
+use std::borrow::Cow;
 use std::io;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -74,7 +75,7 @@ pub struct Message {
 
 impl Message {
     /// UTF-8 body, when the bundle has one this build understands.
-    pub fn text(&self) -> Option<&str> {
+    pub fn text(&self) -> Option<Cow<'_, str>> {
         self.bundle.as_ref()?.body.as_ref()?.as_text().ok()
     }
 }
@@ -304,7 +305,7 @@ mod tests {
         let wire = chat.to_vec();
         let unknown = open_message(call("SA0KAM"), &wire, &Trust::default());
         assert_eq!(unknown.verification, Verification::Unverified);
-        assert_eq!(unknown.text(), Some("73"));
+        assert_eq!(unknown.text().as_deref(), Some("73"));
 
         let mut trust = Trust::default();
         trust.insert(alice.call, alice.identity.public());

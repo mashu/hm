@@ -493,12 +493,13 @@ fn listen(c: &Config) -> Result<(), String> {
                     .as_deref()
                     .map(|s| format!(" [{s}]"))
                     .unwrap_or_default();
+                let text = m.text();
                 println!(
                     "{when} {} via {} ({check}) {:?}{subject}: {}",
                     b.from,
                     m.via,
                     b.kind,
-                    m.text().unwrap_or("<no text>")
+                    text.as_deref().unwrap_or("<no text>")
                 );
             }
             (None, Some(e)) => println!("{when} object from {} is not a bundle: {e}", m.via),
@@ -565,6 +566,8 @@ fn node(
         radio,
         radio_builder: Some(std::sync::Arc::new(hm_cli::node::radio_config)),
         internet,
+        relay: c.relay.clone(),
+        schedules: c.contacts()?,
         store: store.clone(),
         http: c.http()?,
         token: token.clone(),

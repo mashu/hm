@@ -11,6 +11,7 @@
 //! | GET | `/api/messages?direction=in\|out\|all&peer=CALL&kind=chat\|mail&limit=n` | newest first |
 //! | GET | `/api/events` | server-sent events naming what changed: `message`, `status`, `settings` |
 //! | POST | `/api/send` | `{"to", "text", "subject"?, "precedence"?}` → `{"id"}` |
+//! | DELETE | `/api/messages/{id}` | drop a locally queued outbound message |
 //! | POST | `/api/read/{id}` | mark an inbound message read |
 
 use std::sync::{Arc, Mutex};
@@ -45,6 +46,7 @@ pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/api/status", get(status))
         .route("/api/messages", get(messages))
+        .route("/api/messages/{id}", delete(cancel_message))
         .route("/api/events", get(events))
         .route("/api/send", post(send))
         .route("/api/read/{id}", post(mark_read))
@@ -265,7 +267,7 @@ fn view(r: Record, object: Option<Vec<u8>>) -> MessageView {
         subject: bundle.as_ref().and_then(|b| b.subject.clone()),
         text: bundle
             .as_ref()
-            .and_then(|b| b.body.as_ref()?.as_text().ok().map(str::to_string)),
+            .and_then(|b| b.body.as_ref()?.as_text().ok().map(|text| text.into_owned())),
     }
 }
 
@@ -397,6 +399,30 @@ async fn mark_read(State(s): State<AppState>, Path(id): Path<String>) -> Result<
         }
         Err(hm_store::Error::NotFound) => Err(ApiError(StatusCode::NOT_FOUND, "no such message".into())),
         Err(e) => Err(internal(e)),
+    }
+}
+
+async fn cancel_message(State(s): State<AppState>, Path(id): Path<String>) -> Result<StatusCode, ApiError> {
+    let id = ObjectId(crate::hex::decode_32(&id).map_err(bad)?);
+    let store = s.store.clone();
+    let outcome = tokio::task::spawn_blocking(move || match store.cancel(id) {
+        Ok(cancelled) => Ok(Some(cancelled)),
+        Err(hm_store::Error::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    })
+    .await
+    .map_err(internal)?
+    .map_err(internal)?;
+    match outcome {
+        Some(true) => {
+            s.notify.send("message");
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Some(false) => Err(ApiError(
+            StatusCode::CONFLICT,
+            "only a queued outbound message can be dropped".into(),
+        )),
+        None => Err(ApiError(StatusCode::NOT_FOUND, "no such message".into())),
     }
 }
 

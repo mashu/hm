@@ -6,27 +6,30 @@ clear, identities signed.
 
 `hm` is a working prefix until the project has a name.
 
-## Status: Phase 0 complete, Phase 1 in progress
+## Status: Phase 0 complete; Phase 1 hardware validation open; Phase 2 relay software implemented
 
 | Crate | What it does |
 | --- | --- |
 | `hm-core` | `Millis`, the sans-IO `Machine` trait, station `Input`/`Output` with radio ports, deterministic RNG |
-| `hm-wire` | Base-40 callsigns, 18-byte frame header, ACK payload, object ids |
+| `hm-wire` | Base-40 callsigns, 18-byte frame header, ACK payload, object ids, signed contact deltas and pairwise holdings-reconciliation messages |
 | `hm-ident` | Ed25519 identities, signed envelopes, callsign binding records, attestations |
-| `hm-bundle` | Messages: build, seal, open, verify; receipts; attachment references |
-| `hm-sim` | Discrete-event simulator: multiple channels and radios per station, airtime with keyed-PTT bursts and AX.25/HDLC framing checked against the modulator, half-duplex, p-persistent CSMA with a measured carrier-detect delay, hidden-terminal collisions, Bernoulli / Gilbert–Elliott / hourly HF loss or the built-in modem's measured loss by SNR and frame length, outages, partitions, clock drift, corrupted frames, airtime split by purpose, delivery and latency metrics |
+| `hm-bundle` | Messages: build, seal, open, verify; end-to-end receipts; attachment references; bounded zstd body compression with a versioned shared dictionary |
+| `hm-route` | Bayesian contact graph from schedules, beacons, live links and delivery evidence; capacity-, deadline-, airtime- and storage-aware route selection with sequential failover and bounded urgent replication |
+| `hm-sim` | Discrete-event simulator: multiple channels and radios per station, airtime with keyed-PTT bursts and AX.25/HDLC framing checked against the modulator, half-duplex, p-persistent CSMA with a measured carrier-detect delay, hidden-terminal collisions, Bernoulli / Gilbert–Elliott / hourly HF loss or the built-in modem's measured loss by SNR and frame length, outages, partitions, clock drift, corrupted frames, airtime split by purpose, delivery and latency metrics; deterministic routing comparisons against epidemic, Spray-and-Wait, PRoPHET-like and MEED baselines |
 | `hm-bearer` | KISS framing (streaming decoder) and AX.25 UI encapsulation for Direwolf and hardware TNCs |
 | `hm-xfer` | Fountain-coded (RaptorQ) transfer engine: OFFER + symbol bursts, ACKs with the missing count, hash-verified delivery, signed delivery receipts, duplicate suppression, per-sender resource limits, sessions (OPEN with feature bits and limits, CLOSE for busy, refused or too large), loss-adaptive burst sizing, random exponential backoff, airtime budget |
-| `hm-store` | Persistent store on `redb` (pure Rust, crash-safe): content-addressed messages, inbox, outbox ordered by precedence, retries with exponential backoff, exactly-once across restarts |
+| `hm-store` | Persistent store on `redb` (pure Rust, crash-safe): content-addressed messages, inbox, outbox and relay holdings, custody records, cancellations, retries with exponential backoff, exactly-once across restarts |
 | `hm-net` | Internet links: QUIC with mutual TLS 1.3 on Ed25519 station keys (only trusted stations connect), automatic redial, one stream per bundle with a signed receipt |
 | `hm-modem-afsk` | Our own AFSK 1200 modem (Bell 202), pure Rust and `no_std`: HDLC framing and CRC, multi-slicer demodulator with per-tone AGC and PLL clock recovery, carrier detect |
 | `hm-rig` | Radio hardware: sound cards through `cpal` (ALSA, CoreAudio, WASAPI); PTT by rigctld (Hamlib CAT), serial RTS/DTR, CM108 GPIO (AIOC, Digirig) or VOX; a virtual radio channel for tests |
-| `hm-cli` | The `hm` command: `node` (the station daemon: radio and/or internet links, web interface, JSON API with access token, settings applied live), `keygen`, `whoami`, `trust`, `send`, `listen`, all set up by one `station.toml`; KISS links over TCP or a serial port, and a real-time driver |
+| `hm-cli` | The `hm` command: `node` (the station daemon: radio and/or internet links, relay/mailbox, web interface, JSON API with access token, settings applied live), `keygen`, `whoami`, `trust`, `send`, `listen`, all set up by one `station.toml`; KISS links over TCP or a serial port, and a real-time driver |
 
 Phase 1 still to do: the on-air test ([plan](docs/on-air-test-plan.md)), IL2P framing and better decoding deep in noise for
 the built-in modem, stream modems (Mercury, ARDOP, VARA) as radio bearers,
-and the Dioxus interface with a setup wizard. Relaying mail through
-other nodes is Phase 2.
+and the Dioxus interface with a setup wizard. Phase 2 now provides opt-in
+multi-hop relaying, mailbox custody, congestion-bounded control traffic, compressed
+message bodies and destination-signed end-to-end delivery receipts. It has deterministic
+simulation and localhost integration coverage; real RF deployment testing is still needed.
 
 ## Run a station
 
@@ -102,7 +105,8 @@ The page has four views:
 
 - **Chat**: conversations by station, like a messenger. Type a callsign to start one;
   Enter sends. Each line shows whether it was delivered, by radio or internet, and whether
-  its signature or receipt verified. Lines from other stations appear as they arrive.
+  its signature or receipt verified. A queued line can be dropped before delivery. Lines
+  from other stations appear as they arrive.
 - **Mail**: messages with a subject and precedence, with an inbox and a sent log.
 - **Stations**: stations heard on the radio (with their beacons, locators, distance and
   bearing) and the trusted stations, which you can add and remove.
@@ -178,12 +182,128 @@ Internet links are QUIC connections authenticated with the station keys themselv
 only trusted stations can connect, and each link is bound to a callsign.
 There is no certificate authority and no central server; any node can listen, dial, or both.
 
-For each message the node picks the link with the lowest expected cost: the link's
-cost (`radio_cost = 1`, `internet_cost = 2` by default) divided by how reliably it has
-delivered to that station lately. So mail goes by radio while radio delivers; if radio
-keeps failing, the internet carries it until radio works again. The sent log shows which
-link delivered each message. Mail to a station you have no working link to waits in
-the queue; passing mail on through other nodes comes in Phase 2.
+For direct neighbours, recent delivery evidence still determines whether radio or
+internet is tried first. For a farther destination, the node builds a Bayesian contact
+graph from configured schedules, signed beacons, live links and delivery evidence. It
+chooses the route with the best modeled chance of meeting the deadline while respecting
+contact capacity, airtime, storage and `relay.max_hops`.
+
+Payload is not flooded. Routine traffic has one active custody next hop and tries
+alternatives sequentially. Urgent traffic may use a second edge-disjoint route only when
+the modeled probability gain exceeds `relay.urgent_min_gain`; it never has more than two
+active copies. Relays are opt-in:
+
+```toml
+[relay]
+enabled = true       # accept custody and forward toward another station
+mailbox = true       # retain traffic for an intermittently connected recipient
+max_holdings = 256
+max_bytes = 16777216
+max_hops = 8
+airtime_budget_secs = 300
+urgent_min_gain = 0.05
+control_airtime_fraction = 0.02
+```
+
+Signed contact deltas use Trickle suppression. Pairwise FILTER → OFFER → WANT exchanges
+reconcile holdings without broadcasting payload, and radio control traffic is capped at
+2% of the exact rolling airtime window by default. An authenticated custody receipt means
+only that the next relay now holds the bundle. The origin marks it **Delivered** only
+after a signed kind-5 receipt from the final destination returns, normally over the
+reverse route. Message bodies can use codec 1, a bounded zstd stream with the pinned
+shared dictionary in `hm-bundle`.
+
+Run the deterministic comparison against bounded-copy and flood baselines with:
+
+```sh
+cargo run -q -p hm-sim --example routing_compare
+```
+
+It prints delivery, latency, payload/control airtime, storage, copy count, failures,
+fairness and probability calibration. Epidemic routing is intentionally retained as an
+upper-bound baseline: it can deliver more in some partitions, but at substantially
+greater airtime and storage cost.
+
+### Four relaying stations on one laptop
+
+This creates an internet-only chain `SA0KAM → SM0R1 → SM0R2 → SO5KM-1`. QUIC has the
+same authenticated bundle and control behavior as a radio link, so this is the quickest
+way to exercise multi-hop routing and end-to-end receipts. It does not simulate RF loss;
+use `hm-sim` or the integration tests for that.
+
+Build the binary, make four independent station directories, and exchange all four
+identities:
+
+```sh
+cargo build -p hm-cli
+HM=target/debug/hm
+mkdir -p lab/{a,r1,r2,b}
+$HM --config lab/a/station.toml  keygen --call SA0KAM
+$HM --config lab/r1/station.toml keygen --call SM0R1
+$HM --config lab/r2/station.toml keygen --call SM0R2
+$HM --config lab/b/station.toml  keygen --call SO5KM-1
+
+A="$($HM --config lab/a/station.toml whoami)"
+R1="$($HM --config lab/r1/station.toml whoami)"
+R2="$($HM --config lab/r2/station.toml whoami)"
+B="$($HM --config lab/b/station.toml whoami)"
+for pair in \
+  "lab/a/station.toml|SA0KAM" \
+  "lab/r1/station.toml|SM0R1" \
+  "lab/r2/station.toml|SM0R2" \
+  "lab/b/station.toml|SO5KM-1"
+do
+  cfg=${pair%%|*}; self=${pair#*|}
+  for identity in "$A" "$R1" "$R2" "$B"; do
+    [ "${identity%% *}" = "$self" ] ||
+      $HM --config "$cfg" trust add "$identity"
+  done
+done
+```
+
+In both `lab/r1/station.toml` and `lab/r2/station.toml`, change the existing relay
+section to:
+
+```toml
+[relay]
+enabled = true
+mailbox = true
+```
+
+Start these in four terminals, in the shown order:
+
+```sh
+# B
+target/debug/hm --config lab/b/station.toml node --no-radio \
+  --http 127.0.0.1:8104 --listen 127.0.0.1:4204 --beacon-minutes 0
+
+# R2
+target/debug/hm --config lab/r2/station.toml node --no-radio \
+  --http 127.0.0.1:8103 --listen 127.0.0.1:4203 \
+  --peer SO5KM-1=127.0.0.1:4204 --beacon-minutes 0
+
+# R1
+target/debug/hm --config lab/r1/station.toml node --no-radio \
+  --http 127.0.0.1:8102 --listen 127.0.0.1:4202 \
+  --peer SM0R2=127.0.0.1:4203 --beacon-minutes 0
+
+# A
+target/debug/hm --config lab/a/station.toml node --no-radio \
+  --http 127.0.0.1:8101 --listen 127.0.0.1:4201 \
+  --peer SM0R1=127.0.0.1:4202 --beacon-minutes 0
+```
+
+Each process prints its token-bearing web URL. Open A's URL on port 8101 and B's on
+8104, wait until the three links appear under Stations, then send from A to `SO5KM-1`.
+A's line passes through **Queued/In transit** and becomes **Delivered** only after B's
+signed receipt traverses the chain back. Stop R2 before sending to observe queuing and
+sequential retry; restart it to complete delivery. “Drop queued” in Chat or Mail cancels
+a message that is still locally queued.
+
+For a three-node smoke test, use only `a`, `r1` and `b`: start B as above, start R1
+with `--peer SO5KM-1=127.0.0.1:4204`, then start A with
+`--peer SM0R1=127.0.0.1:4202`. Keep relaying enabled only on R1. The same delivery-state
+rule verifies that A received B's end-to-end receipt rather than only R1's custody receipt.
 
 ### Several stations under one callsign
 
@@ -211,6 +331,7 @@ with a radio.
 | GET | `/api/messages?direction=in\|out\|all&peer=CALL&kind=chat\|mail&limit=n` | newest first, with delivery state and link; `peer` gives one conversation |
 | GET | `/api/events` | server-sent events, one `data:` line naming what changed: `message`, `status` or `settings` |
 | POST | `/api/send` | `{"to", "text", "subject"?, "precedence"?}` → `201 {"id"}`; without a subject it is a chat line |
+| DELETE | `/api/messages/{id}` | cancel a locally queued outbound message → `204`; delivered and inbound messages cannot be cancelled |
 | POST | `/api/read/{id}` | mark an inbound message read |
 | GET | `/api/trust` | trusted stations with their notes, and the file they are saved to |
 | POST | `/api/trust` | `{"line": "SO5KM-1 8a1e…", "note"?}` (as `hm whoami` prints it) → `201` |

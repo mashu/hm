@@ -123,9 +123,27 @@ One message, sealed in an envelope (domain: bundle). CBOR map:
 | 5 | created | uint, Unix seconds |
 | 6 | ttl | uint > 0, seconds after `created` when relays may drop it |
 | 7 | subject | optional text, 1–128 bytes |
-| 8 | body | optional `array(2) [codec uint, bstr data]`; codec 0 = UTF-8 text |
+| 8 | body | optional `array(2) [codec uint, bstr data]`; codecs below |
 | 9 | parts | optional array of part references |
 | 10 | reply_to | optional bstr(32), id of another bundle |
+| 11 | max_hops | optional uint 1–16; absent = 8 |
+
+Body codecs:
+
+- 0: UTF-8 text.
+- 1: one Zstandard frame containing UTF-8 text, using the hm-net v0 dictionary.
+  The dictionary's BLAKE3 hash is published with the test vectors. A sender uses
+  codec 1 only when it is smaller than codec 0. Relays keep unknown codecs
+  byte-for-byte.
+
+The pinned `hm-net v0` dictionary has BLAKE3
+`4b09accfcc88e3a776ce40e97a841debebf4fd4b1d7b574089fbc18d512905de`.
+For the UTF-8 text `Net control calling all stations. Check in with callsign,
+location, and traffic. Net control calling all stations. Please acknowledge
+receipt.`, codec 1 produces
+`28b52ffd208e750000082003000825042a9ceb60740501` (142 bytes before and
+23 bytes after compression). Decoders MUST reject decompressed bodies larger
+than 1 MiB.
 
 Address: `array(2) [tag, value]`: 0 station (callsign), 1 group (text ≤ 32 bytes),
 2 tactical (text ≤ 32 bytes), 3 email (text ≤ 254 bytes, must contain `@`).
@@ -133,8 +151,9 @@ Address: `array(2) [tag, value]`: 0 station (callsign), 1 group (text ≤ 32 byt
 Part reference (attachment, pulled on demand): map `0 hash bstr(32)`, `1 size uint`,
 `2 mime text`, `3 name text?`, `4 thumb bstr?`.
 
-A receipt (kind 5) must set `reply_to` to the bundle it confirms. Empty optional
-arrays and `prec = 0` must be omitted.
+A receipt (kind 5) must set `reply_to` to the bundle it confirms, name the
+original sender as its only recipient, and carry no subject, body or parts.
+Empty optional arrays, `prec = 0`, and `max_hops = 8` must be omitted.
 
 Receiving is two-step: decode for routing (recipients, precedence, expiry), then
 verify with the sender's key from their binding record before showing,
@@ -362,7 +381,163 @@ A receiver accepts only bundles addressed to its callsign whose signatures do
 not fail against its trust file. Delivery therefore means the same on every
 link: the receiver signed for exactly these bytes.
 
-## 11. Forward compatibility
+## 11. Phase 2 routing, custody and synchronization
+
+### 11.1 Contacts and route selection
+
+A contact is a directed opportunity to transfer bytes:
+
+`(origin, peer, seq, start, end, bearer, success, rate, capacity, flags)`.
+
+`start` and `end` are Unix seconds. `success` is a conservative probability in
+parts per 10,000, `rate` is effective bits/s, and `capacity` is residual bytes.
+Only `origin` may sign an outgoing contact claim. Claims expire at `end`.
+
+Every node keeps Beta evidence `(alpha, beta)` for each directed
+`(origin, peer, bearer, UTC-hour)` edge. A successful custody handoff increments
+`alpha`, a failed handoff increments `beta`, and old evidence decays. Routing
+uses a conservative posterior quantile `q`, not an RSSI value or a random draw.
+
+For a time-respecting route `r`, under the independent-edge approximation:
+
+`P_success(r) = product(q_e)` and `C_risk(r) = sum(-ln(q_e))`.
+
+A route is feasible only when every contact has residual volume for the object,
+projected arrival is before bundle expiry, no station repeats, and `max_hops`
+is not exceeded. Among feasible routes within the local airtime budget, choose
+the greatest `P_success`; break ties by earliest projected arrival, least
+airtime, then fewest hops. Keep up to three alternatives for sequential
+failover, but activate only one.
+
+Routine and priority bundles have one active custodian. Immediate and flash
+bundles may have two copies only on edge-disjoint feasible routes and only when
+both fit the airtime budget. There is no neighbourhood payload flood.
+
+### 11.2 Custody and end-to-end delivery
+
+The transfer receipt in section 7 means only that the next hop durably accepted
+custody. A custodian stores the exact signed bundle bytes before signing that
+receipt. After a verified custody receipt the previous custodian deactivates
+its queued copy; it may retain bytes for deduplication and audit.
+
+Each hop carries mutable routing metadata outside the signed bundle:
+
+| Field | Type |
+| --- | --- |
+| hop_count | uint 0–16 |
+| visited | array of callsigns, at most 16 |
+
+On a transfer the metadata is encoded as a routing wrapper:
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 4 | ASCII magic `HMR1` |
+| 4 | 1 | hop count |
+| 5 | 1 | visited count, equal to hop count |
+| 6 | 4 | inner signed-envelope length, big-endian |
+| 10 | 6n | visited callsigns |
+| 10+6n | variable | exact signed bundle envelope |
+
+The wrapper must end exactly after the declared inner envelope. Duplicate
+callsigns, unequal counts, an empty inner envelope, or more than 16 hops are
+invalid. A payload without `HMR1` is a legacy hop-zero signed envelope.
+
+A relay increments `hop_count`, appends itself, and rejects a wrapper that
+already names it or exceeds the bundle's `max_hops`. The inner signed envelope
+is never changed.
+
+Only the final recipient establishes end-to-end delivery. After storing a
+non-receipt bundle addressed to itself, it emits one signed kind-5 receipt
+bundle. The receipt is routed like any other bundle. The original sender marks
+the outbox delivered only after verifying that final recipient's signature and
+matching `reply_to`.
+
+### 11.3 SYNC payloads
+
+SYNC frame payload byte 0 selects a message. Headers name the immediate sender
+and receiver; contact signatures name their origin separately.
+
+**CONTACT (0x01), 101 bytes**
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 1 | subtype 0x01 |
+| 1 | 6 | origin callsign |
+| 7 | 4 | sequence |
+| 11 | 4 | contact start, Unix seconds |
+| 15 | 4 | contact end, Unix seconds |
+| 19 | 6 | peer callsign |
+| 25 | 1 | bearer: 0 radio, 1 internet |
+| 26 | 2 | success, parts per 10,000 |
+| 28 | 4 | effective bit rate |
+| 32 | 4 | residual capacity bytes |
+| 36 | 1 | origin flags: mailbox, relay, internet |
+| 37 | 64 | Ed25519 signature over `"hm/contact/v0"` and bytes 1–36 |
+
+**FILTER (0x02), 8 + ceil(m/8) bytes**
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 1 | subtype 0x02 |
+| 1 | 1 | scope: 0 mail held for receiver, 1 relayable holdings |
+| 2 | 1 | number of hashes `k`, 1–16 |
+| 3 | 1 | reserved 0 |
+| 4 | 4 | salt |
+| 8 | variable | Bloom bits, 8–2048 bits |
+
+For `n` expected ids, choose `m` and `k` for target false-positive probability
+`(1 - exp(-k*n/m))^k`. False positives delay reconciliation; they never cause
+wrong delivery.
+
+**WANT (0x03), 2 + 8n bytes**
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 1 | subtype 0x03 |
+| 1 | 1 | count `n`, 1–16 |
+| 2 | 8n | first 8 bytes of requested bundle ids |
+
+**OFFER (0x04), 4 + 8n bytes**
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 1 | subtype 0x04 |
+| 1 | 1 | scope, as in FILTER |
+| 2 | 1 | count `n`, 1–16 |
+| 3 | 1 | reserved 0 |
+| 4 | 8n | first 8 bytes of offered bundle ids |
+
+Filters, offers and wants are pairwise. A receiver first sends a FILTER of ids
+it already holds. The peer sends bounded OFFER pages only for eligible ids not
+present in that filter, and the receiver returns WANT for missing offers.
+Eight-byte prefixes MUST resolve unambiguously at the sender; otherwise that
+entry is not transferred. The explicit OFFER is necessary because a Bloom
+filter alone cannot enumerate ids known only to its sender.
+
+SYNC vectors (hex), using station secret `07` repeated 32 times for CONTACT:
+
+- CONTACT: `0100004f8af6fb000000076ab13b806ab14990001b97cbd86b00222e0000258000008000012748b2718a6e97fd88aab77bccf6918a6dddf9f1d5173c8739140c446d2fe20c1b2c0150717390e1506d7a225cd2f28520f5d54bbb151f7708d2b4e2ab96ff0c`
+- FILTER: `02000500123456780000080020001018`
+- OFFER: `04000100032a5159a9ca4717`
+- WANT: `0301032a5159a9ca4717`
+
+CONTACT dissemination uses the Trickle
+algorithm (RFC 6206): inconsistency resets the interval, consistent duplicates
+suppress transmission, and a stable network becomes quiet. Control traffic has
+a separate rolling radio budget, 2% by default. A beacon may carry a directory
+digest; peers request details only when state differs.
+
+### 11.4 Admission, expiry and cancellation
+
+A relay answers busy/refuses custody when its configured holdings count, queue
+bytes or airtime budget is exhausted. Contact residual volume is reserved while
+a handoff is active and consumed on custody acceptance.
+
+An operator may cancel a locally queued outbound bundle. Cancellation removes
+it from the local delivery queue and ignores late hop acknowledgements. It
+cannot recall a copy whose custody was already accepted downstream.
+
+## 12. Forward compatibility
 
 - Unknown map keys are ignored when decoding.
 - Unknown `kind`, `prec` and `codec` values decode as "other" and are kept.
@@ -370,7 +545,7 @@ link: the receiver signed for exactly these bytes.
 - Because ids and signatures cover raw bytes, older nodes route and verify bundles
   written by newer software.
 
-## 12. Test vectors
+## 13. Test vectors
 
 Generated with `cargo run -p hm-bundle --example vectors`, verified by
 `tools/check_vectors.py` (reference BLAKE3, libsodium, cbor2).
@@ -424,8 +599,3 @@ close 03001b97cbd86b00004f8af6fbbeef0000000301005a
 ## Beacon from SA0KAM-10 (secret 0x0b x 32, mailbox, JO89xi, heard SO5KM-1 3 min ago)
 beacon 04a53e713ef6fbffffffffffff00000000000166be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a6ab13b804a4f3839584901001b97cbd86b036310c680632414ca1c334f57df9df4b445475c36b99df19b143662928e5b8bdb1a2d9709298a363a5c9781d062ccba553c8b2b75e4a78d978bb209f6f2fac302
 ```
-
-## 13. Not yet specified
-
-SYNC reconciliation messages and the node directory (Phase 2); body compression
-dictionaries (codec 1, reserved).

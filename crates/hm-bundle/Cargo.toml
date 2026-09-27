@@ -6,10 +6,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["std"]
+std = ["dep:zstd"]
+
 [dependencies]
 hm-wire = { path = "../hm-wire" }
 hm-ident = { path = "../hm-ident" }
 minicbor.workspace = true
+blake3.workspace = true
+zstd = { version = "0.13", default-features = false, optional = true }
 
 [dev-dependencies]
 proptest.workspace = true

@@ -26,6 +26,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use hm_ident::PublicKey;
+use hm_route::{Bearer as RouteBearer, ScheduledContact};
 use hm_wire::{Callsign, Locator};
 use serde::{Deserialize, Serialize};
 use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
@@ -44,6 +45,8 @@ pub struct Config {
     pub radio: RadioSettings,
     pub internet: InternetSettings,
     pub delivery: DeliverySettings,
+    pub relay: RelaySettings,
+    pub contact: Vec<ContactEntry>,
     pub trust: Vec<TrustEntry>,
 }
 
@@ -182,6 +185,26 @@ pub struct PeerEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContactEntry {
+    pub from: String,
+    pub to: String,
+    /// `radio` or `internet`.
+    pub bearer: String,
+    /// Unix seconds.
+    pub start: u64,
+    /// Unix seconds.
+    pub end: u64,
+    pub rate_bps: u32,
+    pub capacity_bytes: u64,
+    /// Initial probability hint in `[0, 1]`.
+    #[serde(default)]
+    pub success: Option<f64>,
+    #[serde(default)]
+    pub flags: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DeliverySettings {
     /// Relative cost of a delivery attempt by radio and over the internet.
@@ -203,6 +226,61 @@ impl Default for DeliverySettings {
             retry_max_secs: 3600,
             retry_attempts: 12,
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RelaySettings {
+    /// Accept custody for traffic whose final recipient is another station.
+    pub enabled: bool,
+    /// Hold traffic until its final recipient contacts this node.
+    pub mailbox: bool,
+    pub max_holdings: usize,
+    pub max_bytes: u64,
+    pub max_hops: u8,
+    /// Per-bundle radio airtime ceiling.
+    pub airtime_budget_secs: u64,
+    /// Minimum modeled delivery-probability gain before making urgent copy two.
+    pub urgent_min_gain: f64,
+    /// Fraction of rolling radio airtime reserved for control.
+    pub control_airtime_fraction: f64,
+}
+
+impl Default for RelaySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mailbox: false,
+            max_holdings: 256,
+            max_bytes: 16 * 1024 * 1024,
+            max_hops: 8,
+            airtime_budget_secs: 300,
+            urgent_min_gain: 0.05,
+            control_airtime_fraction: 0.02,
+        }
+    }
+}
+
+impl RelaySettings {
+    fn check(&self) -> Result<(), String> {
+        if self.max_holdings == 0 || self.max_bytes == 0 {
+            return Err("relay max_holdings and max_bytes must be positive".into());
+        }
+        if !(1..=16).contains(&self.max_hops) {
+            return Err("relay.max_hops must be between 1 and 16".into());
+        }
+        if self.airtime_budget_secs == 0 {
+            return Err("relay.airtime_budget_secs must be positive".into());
+        }
+        if !self.urgent_min_gain.is_finite() || !(0.0..1.0).contains(&self.urgent_min_gain) {
+            return Err("relay.urgent_min_gain must be between 0 and 1".into());
+        }
+        if !self.control_airtime_fraction.is_finite() || !(0.0..=1.0).contains(&self.control_airtime_fraction)
+        {
+            return Err("relay.control_airtime_fraction must be between 0 and 1".into());
+        }
+        Ok(())
     }
 }
 
@@ -235,8 +313,10 @@ impl Config {
         let c: Config = toml::from_str(text).map_err(|e| e.to_string())?;
         c.trust()?;
         c.peers()?;
+        c.contacts()?;
         c.locator()?;
         c.radio.check()?;
+        c.relay.check()?;
         Ok(c)
     }
 
@@ -277,6 +357,47 @@ impl Config {
                     ));
                 }
                 Ok((call, p.address.clone()))
+            })
+            .collect()
+    }
+
+    pub fn contacts(&self) -> Result<Vec<ScheduledContact>, String> {
+        self.contact
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let at = |message: String| format!("contact entry {}: {message}", index + 1);
+                let from = Callsign::parse(&entry.from).map_err(|error| at(error.to_string()))?;
+                let to = Callsign::parse(&entry.to).map_err(|error| at(error.to_string()))?;
+                let bearer = match entry.bearer.as_str() {
+                    "radio" => RouteBearer::Radio,
+                    "internet" => RouteBearer::Internet,
+                    other => return Err(at(format!("unknown bearer {other:?}"))),
+                };
+                let success_permyriad = entry
+                    .success
+                    .map(|success| {
+                        if !success.is_finite() || !(0.0..=1.0).contains(&success) {
+                            return Err(at("success must be between 0 and 1".into()));
+                        }
+                        Ok((success * 10_000.0).round() as u16)
+                    })
+                    .transpose()?;
+                if from == to || entry.start >= entry.end || entry.rate_bps == 0 || entry.capacity_bytes == 0
+                {
+                    return Err(at("invalid endpoints, window, rate, or capacity".into()));
+                }
+                Ok(ScheduledContact {
+                    from,
+                    to,
+                    bearer,
+                    start: entry.start,
+                    end: entry.end,
+                    rate_bps: entry.rate_bps,
+                    capacity_bytes: entry.capacity_bytes,
+                    success_permyriad,
+                    flags: entry.flags,
+                })
             })
             .collect()
     }
@@ -566,6 +687,12 @@ retry_first_secs = 60
 retry_max_secs = 3600
 retry_attempts = 12
 
+# Relaying is opt-in. `mailbox` holds traffic for intermittently connected
+# stations; `enabled` may forward it through another relay.
+[relay]
+enabled = false
+mailbox = false
+
 # Stations whose messages you can verify. Add one with
 #   hm trust add "SO5KM-1 8a1e…"   (the line `hm whoami` prints on their side)
 # or on the web page.
@@ -598,6 +725,21 @@ mod tests {
         assert!(e.contains("becaon_minutes"), "{e}");
         assert!(Config::parse("[[trust]]\nstation = \"SO5KM\"\nkey = \"xyz\"\n").is_err());
         assert!(Config::parse("[[internet.peers]]\nstation = \"SO5KM\"\naddress = \"nohost\"\n").is_err());
+    }
+
+    #[test]
+    fn planned_contacts_are_checked_and_converted() {
+        let config = Config::parse(
+            "[[contact]]\nfrom = \"M0AAA\"\nto = \"M0BBB\"\nbearer = \"radio\"\nstart = 100\nend = 200\nrate_bps = 1200\ncapacity_bytes = 4096\nsuccess = 0.8\n",
+        )
+        .unwrap();
+        let contacts = config.contacts().unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].success_permyriad, Some(8_000));
+        assert!(Config::parse(
+            "[[contact]]\nfrom = \"M0AAA\"\nto = \"M0BBB\"\nbearer = \"radio\"\nstart = 200\nend = 100\nrate_bps = 1200\ncapacity_bytes = 4096\n",
+        )
+        .is_err());
     }
 
     #[test]

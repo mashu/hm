@@ -38,6 +38,7 @@ use hm_wire::{FrameHeader, FrameType, DATA_PREAMBLE_LEN, HEADER_LEN};
 pub mod afsk_1200;
 pub mod curve;
 pub mod metrics;
+pub mod routing;
 pub mod toy;
 
 pub use curve::LossCurve;
