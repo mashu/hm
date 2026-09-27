@@ -79,6 +79,7 @@
   .btn.quiet { background: none; color: var(--ink); border: 1px solid var(--rule); font-weight: 600; }
   .btn.danger { background: none; color: var(--bad); border: 1px solid currentColor; }
   .btn.small { margin: 0; padding: 0.15rem 0.6rem; font-size: 0.85rem; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
   #token-form { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; max-width: 40rem; margin: 0.5rem 0 0.75rem; }
   #token-form label { margin: 0; flex-basis: 100%; }
   #token-form input { flex: 1 1 16rem; width: auto; }
@@ -100,11 +101,12 @@
   .convos .time { color: var(--muted); font-size: 0.8rem; }
   .convos .last { grid-column: 1 / -1; color: var(--muted); font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .convos li.empty { padding: 1rem; }
+  .convos-footer { margin: 0.6rem; }
   .thread { display: flex; flex-direction: column; min-height: 0; padding: 0; overflow: hidden; }
   .thread-head { display: flex; align-items: center; gap: 0.75rem; padding: 0.7rem 1rem; border-bottom: 1px solid var(--rule); flex-wrap: wrap; }
   .thread-head h2 { margin: 0; letter-spacing: 0.04em; }
   .thread-head .sub { color: var(--muted); font-size: 0.85rem; }
-  .close-chat { margin-left: auto; }
+  .thread-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-left: auto; }
   .lines { list-style: none; margin: 0; padding: 1rem; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 0.35rem; }
   .lines .day { align-self: center; color: var(--muted); font-size: 0.8rem; margin: 0.5rem 0; }
   .bubble {
@@ -118,6 +120,16 @@
   .bubble.unverified .meta { color: var(--warn); opacity: 1; }
   .bubble.mine .btn.danger { color: var(--mine-ink); }
   .bubble .btn.drop { display: block; margin-top: 0.35rem; margin-left: auto; }
+  .message-status {
+    display: inline-block; width: fit-content; margin-top: 0.3rem; padding: 0.08rem 0.45rem;
+    border: 1px solid currentColor; border-radius: 999px; color: var(--muted);
+    font-size: 0.72rem; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase;
+  }
+  .message-status.ok { color: var(--ok); } .message-status.warn { color: var(--warn); } .message-status.bad { color: var(--bad); }
+  .bubble.mine .message-status { background: var(--sheet); color: var(--mine); border-color: transparent; }
+  .message-actions { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.4rem; white-space: normal; }
+  .bubble .message-actions { justify-content: flex-end; }
+  .bubble .message-actions .btn { color: inherit; border-color: currentColor; }
   .composer { display: flex; gap: 0.5rem; padding: 0.75rem; border-top: 1px solid var(--rule); align-items: end; }
   .composer textarea { min-height: 2.6rem; max-height: 10rem; resize: none; }
   .composer .btn { margin: 0; }
@@ -151,6 +163,21 @@
   .state { display: block; font-size: 0.9rem; margin-top: 0.2rem; color: var(--muted); }
   .state.ok { color: var(--ok); } .state.warn { color: var(--warn); } .state.bad { color: var(--bad); }
   #form-status { margin: 0.75rem 0 0; min-height: 1.5em; }
+
+  /* Message detail */
+  dialog {
+    width: min(52rem, calc(100vw - 2rem)); max-height: calc(100vh - 2rem); padding: 0;
+    color: var(--ink); background: var(--sheet); border: 1px solid var(--rule); border-radius: var(--radius);
+  }
+  dialog::backdrop { background: rgb(0 0 0 / 0.55); }
+  .message-detail { padding: 1rem; }
+  .dialog-head { display: flex; align-items: center; gap: 1rem; }
+  .dialog-head h2 { margin: 0; flex: 1; }
+  .message-detail pre {
+    max-height: 14rem; overflow: auto; padding: 0.75rem; border: 1px solid var(--rule);
+    border-radius: 6px; background: var(--raised); white-space: pre-wrap; overflow-wrap: anywhere;
+    font: 0.78rem/1.4 ui-monospace, "SFMono-Regular", Consolas, monospace;
+  }
 
   /* Stations */
   .stations { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1rem; align-items: start; }
@@ -228,12 +255,17 @@
           <button class="btn" type="submit">Chat</button>
         </form>
         <ul id="convos"></ul>
+        <button class="btn quiet small convos-footer" type="button" id="show-archived" hidden></button>
       </div>
       <div class="card thread">
         <div class="thread-head" id="thread-head" hidden>
           <h2 id="thread-call"></h2>
           <span class="sub" id="thread-sub"></span>
-          <a class="btn quiet small close-chat" href="#chat">Close chat</a>
+          <div class="thread-actions">
+            <button class="btn quiet small" type="button" id="archive-chat">Archive</button>
+            <button class="btn danger small" type="button" id="clear-chat">Clear history</button>
+            <a class="btn quiet small close-chat" href="#chat">Close</a>
+          </div>
         </div>
         <ol class="lines" id="lines" aria-live="polite"></ol>
         <form class="composer" id="composer" autocomplete="off" hidden>
@@ -381,6 +413,23 @@
     </form>
   </section>
 </main>
+<dialog id="message-detail">
+  <div class="message-detail">
+    <div class="dialog-head">
+      <h2 id="detail-title">Message details</h2>
+      <form method="dialog"><button class="btn quiet small" value="close">Close</button></form>
+    </div>
+    <p id="detail-status" class="state"></p>
+    <h3>Decoded metadata</h3>
+    <pre id="detail-decoded"></pre>
+    <h3>Raw signed object <span class="hint" id="detail-size"></span></h3>
+    <pre id="detail-raw"></pre>
+    <div class="message-actions">
+      <button class="btn quiet small" type="button" id="copy-raw">Copy raw hex</button>
+      <button class="btn danger small" type="button" id="detail-delete">Delete local copy</button>
+    </div>
+  </div>
+</dialog>
 <script>
 "use strict";
 // Every message field comes from the air: build DOM nodes and set textContent only.
@@ -446,8 +495,44 @@ window.addEventListener("hashchange", route);
 // ---- Chat --------------------------------------------------------------
 let current = null;       // callsign of the open conversation
 let chatList = [];        // chat messages, newest first
+let showArchived = false;
+let detailMessage = null;
+let archivedChats = {};
+try { archivedChats = JSON.parse(localStorage.getItem("hm-archived-chats") || "{}"); } catch (_) {}
 
 const partner = (m) => m.direction === "in" ? (m.from || m.peer) : m.peer;
+const isActiveMessage = (m) => m.direction === "out" && (m.state === "Queued" || m.state === "InTransit");
+const canDeleteMessage = (m) => !isActiveMessage(m);
+
+function messageState(m) {
+  if (m.direction === "in") {
+    if (m.state === "Unread") {
+      return ["New", m.verified ? "Received · unread · signature verified" : "Received · unread · signature not verified", m.verified ? "ok" : "warn"];
+    }
+    return ["Received", m.verified ? "Received · signature verified" : "Received · signature not verified", m.verified ? "ok" : "warn"];
+  }
+  if (m.state === "Delivered") {
+    const by = m.delivered_by ? " by " + m.delivered_by : "";
+    return ["Delivered", "Delivered" + by + (m.verified ? " · receipt verified" : " · destination receipt received"), "ok"];
+  }
+  if (m.state === "Failed") return ["Failed", "Not delivered: " + (m.note || "gave up"), "bad"];
+  if (m.state === "Cancelled") return ["Cancelled", "Dropped from the local queue", ""];
+  if (m.state === "InTransit") return ["In transit", "Next hop has custody · awaiting destination receipt", "warn"];
+  const next = m.next_attempt * 1000 > Date.now() ? " · next try " + hhmm(m.next_attempt) : "";
+  const tries = m.attempts ? " · " + m.attempts + " attempt" + (m.attempts === 1 ? "" : "s") : "";
+  return ["Pending", "Queued" + tries + next + (m.note ? " · " + m.note : ""), "warn"];
+}
+
+function statusBadge(m) {
+  const [label, detail, cls] = messageState(m);
+  const badge = el("span", "message-status " + cls, label);
+  badge.title = detail;
+  return badge;
+}
+
+function saveArchivedChats() {
+  localStorage.setItem("hm-archived-chats", JSON.stringify(archivedChats));
+}
 
 async function loadChats() {
   const r = await api("/api/messages?direction=all&kind=chat&limit=1000");
@@ -468,20 +553,33 @@ function renderConvos() {
   const ul = $("convos");
   ul.replaceChildren();
   let unread = 0;
+  let visible = 0;
+  let hiddenArchived = 0;
   for (const [p, c] of byPeer) {
     unread += c.unread;
+    const archivedAt = Number(archivedChats[p] || 0);
+    if (p !== current && !showArchived && archivedAt && (!c.last || c.last.seq <= archivedAt)) {
+      hiddenArchived++;
+      continue;
+    }
+    visible++;
     const a = el("a");
     a.href = "#chat/" + encodeURIComponent(p);
     if (p === current) a.setAttribute("aria-current", "true");
     const name = el("span", "name", p);
     if (c.unread) name.append(el("span", "badge", String(c.unread)));
     a.append(name, el("span", "time", c.last ? hhmm(c.last.at) : ""));
-    a.append(el("span", "last", c.last ? (c.last.direction === "out" ? "You: " : "") + (c.last.text || "") : "No lines yet"));
+    const state = c.last && c.last.direction === "out" ? messageState(c.last)[0] + " · " : "";
+    a.append(el("span", "last", c.last ? state + (c.last.direction === "out" ? "You: " : "") + (c.last.text || "") : "No lines yet"));
     const li = el("li");
     li.append(a);
     ul.append(li);
   }
-  if (byPeer.size === 0) ul.append(el("li", "empty", "No chats yet. Type a callsign above to start one."));
+  if (visible === 0) {
+    ul.append(el("li", "empty", hiddenArchived ? "All chats are archived." : "No chats yet. Type a callsign above to start one."));
+  }
+  $("show-archived").hidden = hiddenArchived === 0 && !showArchived;
+  $("show-archived").textContent = showArchived ? "Hide archived" : "Show archived (" + hiddenArchived + ")";
   $("badge-chat").hidden = unread === 0;
   $("badge-chat").textContent = String(unread);
 }
@@ -503,17 +601,9 @@ function openThread(call) {
 }
 
 function describeLine(m) {
-  if (m.direction === "in") {
-    return [hhmm(m.at) + (m.verified ? "" : " · signature not verified"), m.verified ? "" : "unverified"];
-  }
-  if (m.state === "Delivered") {
-    return [hhmm(m.at) + " · delivered" + (m.delivered_by ? " by " + m.delivered_by : "") + (m.verified ? " ✓" : ""), ""];
-  }
-  if (m.state === "Failed") return [hhmm(m.at) + " · not delivered: " + (m.note || "gave up"), "failed"];
-  if (m.state === "Cancelled") return [hhmm(m.at) + " · dropped from queue", "cancelled"];
-  if (m.state === "InTransit") return [hhmm(m.at) + " · relayed; awaiting destination receipt", ""];
-  const next = m.next_attempt * 1000 > Date.now() ? ", next try " + hhmm(m.next_attempt) : "";
-  return [hhmm(m.at) + " · waiting" + (m.attempts ? " (" + m.attempts + " tries" + next + ")" : ""), ""];
+  const [, detail] = messageState(m);
+  const cls = m.state === "Failed" ? "failed" : m.state === "Cancelled" ? "cancelled" : m.direction === "in" && !m.verified ? "unverified" : "";
+  return [hhmm(m.at) + " · " + detail, cls];
 }
 
 function dropButton(id) {
@@ -539,6 +629,82 @@ function dropButton(id) {
   return b;
 }
 
+async function deleteStoredMessage(m) {
+  if (!confirm("Delete this local copy permanently? This does not retract copies already delivered to other stations.")) return;
+  const r = await api("/api/messages/" + m.id, { method: "DELETE" });
+  if (!r.ok) {
+    const detail = await r.json().catch(() => ({}));
+    throw new Error(detail.error || r.statusText);
+  }
+  if ($("message-detail").open) $("message-detail").close();
+  await Promise.all([loadChats(), loadMail(), countMail()]);
+}
+
+function messageActions(m) {
+  const actions = el("span", "message-actions");
+  const detail = el("button", "btn quiet small", "Details / raw");
+  detail.type = "button";
+  detail.addEventListener("click", () => openMessageDetail(m).catch((e) => {
+    $("detail-status").textContent = "Could not load message: " + e.message;
+    $("detail-status").className = "state bad";
+  }));
+  actions.append(detail);
+  if (m.direction === "out" && m.state === "Queued") {
+    actions.append(dropButton(m.id));
+  } else if (canDeleteMessage(m)) {
+    const remove = el("button", "btn danger small", "Delete local");
+    remove.type = "button";
+    remove.addEventListener("click", () => deleteStoredMessage(m).catch((e) => alert("Could not delete message: " + e.message)));
+    actions.append(remove);
+  }
+  return actions;
+}
+
+async function openMessageDetail(m) {
+  detailMessage = m;
+  $("detail-title").textContent = "Message " + m.id.slice(0, 12);
+  $("detail-status").textContent = "Loading…";
+  $("detail-status").className = "state";
+  $("detail-decoded").textContent = "";
+  $("detail-raw").textContent = "";
+  $("detail-size").textContent = "";
+  $("detail-delete").hidden = !canDeleteMessage(m);
+  const dialog = $("message-detail");
+  if (!dialog.open) dialog.showModal();
+  const r = await api("/api/messages/" + m.id);
+  if (!r.ok) {
+    const error = await r.json().catch(() => ({}));
+    throw new Error(error.error || r.statusText);
+  }
+  const detail = await r.json();
+  const [, stateText, stateClass] = messageState(detail);
+  $("detail-status").textContent = stateText;
+  $("detail-status").className = "state " + stateClass;
+  $("detail-size").textContent = "(" + detail.raw_bytes + " bytes)";
+  $("detail-raw").textContent = detail.raw_hex;
+  const decoded = Object.assign({}, detail);
+  delete decoded.raw_hex;
+  $("detail-decoded").textContent = JSON.stringify(decoded, null, 2);
+}
+
+$("copy-raw").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText($("detail-raw").textContent);
+    $("copy-raw").textContent = "Copied";
+    setTimeout(() => { $("copy-raw").textContent = "Copy raw hex"; }, 1200);
+  } catch (e) {
+    alert("Could not copy raw object: " + e.message);
+  }
+});
+
+$("detail-delete").addEventListener("click", () => {
+  if (detailMessage) {
+    deleteStoredMessage(detailMessage).catch((e) => alert("Could not delete message: " + e.message));
+  }
+});
+
+$("message-detail").addEventListener("close", () => { detailMessage = null; });
+
 function renderThread() {
   const lines = chatList.filter((m) => partner(m) === current).reverse();
   const ol = $("lines");
@@ -549,8 +715,12 @@ function renderThread() {
     if (day(m.at) !== lastDay) { lastDay = day(m.at); ol.append(el("li", "day", lastDay)); }
     const [meta, cls] = describeLine(m);
     const li = el("li", "bubble " + (m.direction === "out" ? "mine " : "") + cls);
-    li.append(el("span", null, m.text !== null ? m.text : "(no text)"), el("span", "meta", meta));
-    if (m.direction === "out" && m.state === "Queued") li.append(dropButton(m.id));
+    li.append(
+      el("span", null, m.text !== null ? m.text : "(no text)"),
+      statusBadge(m),
+      el("span", "meta", meta),
+      messageActions(m)
+    );
     ol.append(li);
   }
   ol.scrollTop = ol.scrollHeight;
@@ -562,11 +732,48 @@ function renderThread() {
   if (h && h.locator) bits.push(h.locator + (h.distance_km !== null ? ", " + h.distance_km + " km " + compass(h.bearing) : ""));
   if (status && status.internet_peers.includes(current)) bits.push("linked over the internet");
   $("thread-sub").textContent = bits.join(" · ");
+  const hasActive = lines.some(isActiveMessage);
+  $("archive-chat").disabled = lines.length === 0 || hasActive;
+  $("archive-chat").title = hasActive ? "Wait for or drop pending messages before archiving" : "Hide this chat until a new message arrives";
+  $("clear-chat").disabled = lines.length === 0;
   // Seen: mark read while the page is in front.
   if (!document.hidden) {
     for (const m of lines) if (m.state === "Unread") quietly(api("/api/read/" + m.id, { method: "POST" }));
   }
 }
+
+$("show-archived").addEventListener("click", () => {
+  showArchived = !showArchived;
+  renderConvos();
+});
+
+$("archive-chat").addEventListener("click", () => {
+  if (!current) return;
+  const lines = chatList.filter((m) => partner(m) === current);
+  if (lines.some(isActiveMessage)) {
+    alert("This chat has a pending message. Wait for delivery or drop it before archiving.");
+    return;
+  }
+  archivedChats[current] = Math.max(0, ...lines.map((m) => m.seq));
+  saveArchivedChats();
+  location.hash = "#chat";
+});
+
+$("clear-chat").addEventListener("click", async () => {
+  if (!current || !confirm("Delete inactive local history with " + current + "? Pending and in-transit messages will be kept.")) return;
+  try {
+    const peer = current;
+    const r = await api("/api/conversations/" + encodeURIComponent(peer), { method: "DELETE" });
+    const result = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(result.error || r.statusText);
+    await loadChats();
+    if (result.active === 0) location.hash = "#chat";
+    alert("Deleted " + result.deleted + " local message" + (result.deleted === 1 ? "" : "s") +
+      (result.active ? "; kept " + result.active + " active" : "") + ".");
+  } catch (e) {
+    alert("Could not clear chat: " + e.message);
+  }
+});
 
 $("new-chat").addEventListener("submit", (ev) => {
   ev.preventDefault();
@@ -598,15 +805,8 @@ $("composer").addEventListener("submit", async (ev) => {
 let direction = "in";
 
 function describeOut(m) {
-  if (m.state === "Delivered") {
-    const by = m.delivered_by ? " by " + m.delivered_by : "";
-    return m.verified ? ["Delivered" + by + ", receipt verified", "ok"] : ["Delivered" + by + ", receipt not verified (no key for the receiver)", "warn"];
-  }
-  if (m.state === "Failed") return ["Not delivered: " + (m.note || "gave up"), "bad"];
-  if (m.state === "Cancelled") return ["Dropped from queue", ""];
-  if (m.state === "InTransit") return ["Relayed; awaiting destination receipt", "warn"];
-  const next = m.next_attempt * 1000 > Date.now() ? ", next try " + hhmm(m.next_attempt) : "";
-  return ["Queued" + (m.attempts ? " after " + m.attempts + " attempt" + (m.attempts > 1 ? "s" : "") : "") + next, "warn"];
+  const [, detail, cls] = messageState(m);
+  return [detail, cls];
 }
 
 async function loadMail() {
@@ -630,6 +830,7 @@ async function loadMail() {
     body.append(el("span", null, m.text !== null ? m.text : "(no text)"));
     if (direction === "in") {
       const via = m.from && m.from !== m.peer ? ", via " + m.peer : "";
+      body.append(statusBadge(m));
       body.append(el("span", "state " + (m.verified ? "ok" : "warn"),
         (m.verified ? "Signature verified" : "Signature not verified (sender not among your trusted stations)") + via));
       if (m.state === "Unread") {
@@ -640,9 +841,10 @@ async function loadMail() {
       }
     } else {
       const [text, cls] = describeOut(m);
+      body.append(statusBadge(m));
       body.append(el("span", "state " + cls, text));
-      if (m.state === "Queued") body.append(dropButton(m.id));
     }
+    body.append(messageActions(m));
     li.append(when, who, body);
     log.append(li);
   }

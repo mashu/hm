@@ -231,6 +231,50 @@ fn cancellation_ignores_late_receipt_and_e2e_requires_destination() {
 }
 
 #[test]
+fn deletion_cancels_first_and_never_removes_active_custody() {
+    let db = TempDb::new("delete");
+    let store = Store::open(&db.0).unwrap();
+    let destination = call("M0CCC");
+    let relay = call("M0BBB");
+
+    store.enqueue(id(1), b"queued", destination, 0, 10).unwrap();
+    assert_eq!(store.delete(id(1)).unwrap(), DeleteOutcome::Cancelled);
+    assert_eq!(store.record(id(1)).unwrap().unwrap().state, State::Cancelled);
+    assert_eq!(store.object(id(1)).unwrap().as_deref(), Some(&b"queued"[..]));
+    assert_eq!(store.delete(id(1)).unwrap(), DeleteOutcome::Deleted);
+    assert!(store.record(id(1)).unwrap().is_none());
+    assert!(store.object(id(1)).unwrap().is_none());
+
+    store.enqueue(id(2), b"active", destination, 0, 20).unwrap();
+    assert!(store.set_next_hop(id(2), relay).unwrap());
+    assert!(store
+        .custody_transferred(id(2), relay, true, "radio", 21)
+        .unwrap());
+    assert_eq!(store.delete(id(2)).unwrap(), DeleteOutcome::Active);
+    assert_eq!(store.record(id(2)).unwrap().unwrap().state, State::InTransit);
+}
+
+#[test]
+fn deletion_keeps_an_e2e_receipt_object_while_it_is_referenced() {
+    let db = TempDb::new("delete-references");
+    let store = Store::open(&db.0).unwrap();
+    let destination = call("M0CCC");
+    store
+        .put_received(id(9), b"receipt", destination, true, 20)
+        .unwrap();
+    store.enqueue(id(1), b"message", destination, 0, 10).unwrap();
+    assert!(store.e2e_delivered(id(1), id(9), destination, 21).unwrap());
+
+    assert_eq!(store.delete(id(9)).unwrap(), DeleteOutcome::Deleted);
+    assert!(store.record(id(9)).unwrap().is_none());
+    assert_eq!(store.object(id(9)).unwrap().as_deref(), Some(&b"receipt"[..]));
+
+    assert_eq!(store.delete(id(1)).unwrap(), DeleteOutcome::Deleted);
+    assert!(store.object(id(1)).unwrap().is_none());
+    assert!(store.object(id(9)).unwrap().is_none());
+}
+
+#[test]
 fn prefix_lookup_and_admission_are_bounded() {
     let db = TempDb::new("prefix-admission");
     let s = Store::open(&db.0).unwrap();

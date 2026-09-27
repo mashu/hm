@@ -9,9 +9,11 @@
 //! | GET | `/` | web page |
 //! | GET | `/api/status` | callsign, key, bearers and their estimated success per station |
 //! | GET | `/api/messages?direction=in\|out\|all&peer=CALL&kind=chat\|mail&limit=n` | newest first |
+//! | GET | `/api/messages/{id}` | decoded metadata plus the exact raw signed object as hex |
 //! | GET | `/api/events` | server-sent events naming what changed: `message`, `status`, `settings` |
 //! | POST | `/api/send` | `{"to", "text", "subject"?, "precedence"?}` → `{"id"}` |
-//! | DELETE | `/api/messages/{id}` | drop a locally queued outbound message |
+//! | DELETE | `/api/messages/{id}` | cancel queued outbound, otherwise delete inactive local history |
+//! | DELETE | `/api/conversations/{peer}` | delete inactive local chat history, preserving active delivery |
 //! | POST | `/api/read/{id}` | mark an inbound message read |
 
 use std::sync::{Arc, Mutex};
@@ -23,7 +25,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use hm_bundle::{Address, Opened, Precedence};
-use hm_store::{Direction, Record, Store};
+use hm_store::{Direction, Record, State as MessageState, Store};
 use hm_wire::{Callsign, Locator, ObjectId};
 use serde::{Deserialize, Serialize};
 
@@ -46,7 +48,8 @@ pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/api/status", get(status))
         .route("/api/messages", get(messages))
-        .route("/api/messages/{id}", delete(cancel_message))
+        .route("/api/messages/{id}", get(message).delete(delete_message))
+        .route("/api/conversations/{peer}", delete(delete_conversation))
         .route("/api/events", get(events))
         .route("/api/send", post(send))
         .route("/api/read/{id}", post(mark_read))
@@ -283,6 +286,14 @@ pub struct MessageView {
     text: Option<String>,
 }
 
+#[derive(Serialize, Debug)]
+struct MessageDetail {
+    #[serde(flatten)]
+    message: MessageView,
+    raw_bytes: usize,
+    raw_hex: String,
+}
+
 fn view(r: Record, object: Option<Vec<u8>>) -> MessageView {
     let bundle = object.and_then(|o| Opened::decode(&o).ok()).map(|o| o.bundle);
     MessageView {
@@ -375,6 +386,33 @@ async fn messages(
     .map(Json)
 }
 
+async fn message(State(s): State<AppState>, Path(id): Path<String>) -> Result<Json<MessageDetail>, ApiError> {
+    let id = ObjectId(crate::hex::decode_32(&id).map_err(bad)?);
+    let store = s.store.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        let Some(record) = store.record(id)? else {
+            return Ok(None);
+        };
+        let object = store
+            .object(id)?
+            .ok_or_else(|| hm_store::Error::Corrupt("message has no object".into()))?;
+        Ok::<_, hm_store::Error>(Some((record, object)))
+    })
+    .await
+    .map_err(internal)?
+    .map_err(internal)?;
+    let Some((record, object)) = found else {
+        return Err(ApiError(StatusCode::NOT_FOUND, "no such message".into()));
+    };
+    let raw_bytes = object.len();
+    let raw_hex = crate::hex::encode(&object);
+    Ok(Json(MessageDetail {
+        message: view(record, Some(object)),
+        raw_bytes,
+        raw_hex,
+    }))
+}
+
 /// Server-sent events: one `data:` line per change, naming what changed. A
 /// page fetches what it shows again when told. A comment line every 15 s
 /// keeps idle connections open.
@@ -452,28 +490,73 @@ async fn mark_read(State(s): State<AppState>, Path(id): Path<String>) -> Result<
     }
 }
 
-async fn cancel_message(State(s): State<AppState>, Path(id): Path<String>) -> Result<StatusCode, ApiError> {
+async fn delete_message(State(s): State<AppState>, Path(id): Path<String>) -> Result<StatusCode, ApiError> {
     let id = ObjectId(crate::hex::decode_32(&id).map_err(bad)?);
     let store = s.store.clone();
-    let outcome = tokio::task::spawn_blocking(move || match store.cancel(id) {
-        Ok(cancelled) => Ok(Some(cancelled)),
-        Err(hm_store::Error::NotFound) => Ok(None),
-        Err(error) => Err(error),
+    let outcome = tokio::task::spawn_blocking(move || store.delete(id))
+        .await
+        .map_err(internal)?;
+    match outcome {
+        Ok(hm_store::DeleteOutcome::Cancelled | hm_store::DeleteOutcome::Deleted) => {
+            s.notify.send("message");
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Ok(hm_store::DeleteOutcome::Active) => Err(ApiError(
+            StatusCode::CONFLICT,
+            "message is still active; cancel queued outbound messages before deleting history".into(),
+        )),
+        Err(hm_store::Error::NotFound) => Err(ApiError(StatusCode::NOT_FOUND, "no such message".into())),
+        Err(error) => Err(internal(error)),
+    }
+}
+
+#[derive(Serialize)]
+struct ConversationDelete {
+    deleted: usize,
+    active: usize,
+}
+
+async fn delete_conversation(
+    State(s): State<AppState>,
+    Path(peer): Path<String>,
+) -> Result<Json<ConversationDelete>, ApiError> {
+    let peer = Callsign::parse(peer.trim()).map_err(|error| bad(format!("peer: {error}")))?;
+    let store = s.store.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let peer = peer.to_string();
+        let mut deleted = 0;
+        let mut active = 0;
+        for direction in [Direction::In, Direction::Out] {
+            for record in store.list(direction, usize::MAX)? {
+                let id = record.id;
+                let state = record.state;
+                let object = store.object(id)?;
+                let message = view(record, object);
+                let with_peer = message.peer == peer
+                    || message.from.as_ref() == Some(&peer)
+                    || message.to.contains(&peer);
+                if !with_peer || message.kind.as_deref() != Some("Chat") {
+                    continue;
+                }
+                if matches!(state, MessageState::Queued | MessageState::InTransit) {
+                    active += 1;
+                    continue;
+                }
+                match store.delete(id)? {
+                    hm_store::DeleteOutcome::Deleted => deleted += 1,
+                    hm_store::DeleteOutcome::Cancelled | hm_store::DeleteOutcome::Active => active += 1,
+                }
+            }
+        }
+        Ok::<_, hm_store::Error>(ConversationDelete { deleted, active })
     })
     .await
     .map_err(internal)?
     .map_err(internal)?;
-    match outcome {
-        Some(true) => {
-            s.notify.send("message");
-            Ok(StatusCode::NO_CONTENT)
-        }
-        Some(false) => Err(ApiError(
-            StatusCode::CONFLICT,
-            "only a queued outbound message can be dropped".into(),
-        )),
-        None => Err(ApiError(StatusCode::NOT_FOUND, "no such message".into())),
+    if outcome.deleted > 0 {
+        s.notify.send("message");
     }
+    Ok(Json(outcome))
 }
 
 #[derive(Serialize)]

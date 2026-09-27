@@ -118,11 +118,13 @@ beside the store (`station.token`); the page asks for it if you open the plain a
 The page has four views:
 
 - **Chat**: conversations by station, like a messenger. Type a callsign to start one;
-  Enter sends. Each line shows whether it was delivered, by radio or internet, and whether
-  its signature or receipt verified. A queued line can be dropped before delivery, and
-  **Close chat** returns to the conversation list. Lines from other stations appear as
-  they arrive.
-- **Mail**: messages with a subject and precedence, with an inbox and a sent log.
+  Enter sends. Prominent badges distinguish pending, in-transit, delivered, failed,
+  cancelled and received lines. A queued line can be dropped before delivery. Chats can
+  be archived in the browser, or their inactive local history cleared; pending delivery
+  is never erased by either action.
+- **Mail**: messages with a subject and precedence, with an inbox and a sent log. Every
+  chat line and mail item has a details view containing decoded metadata and the exact raw
+  signed object, plus a control to delete an inactive local copy.
 - **Stations**: stations heard on the radio (with their beacons, locators, distance and
   bearing) and the trusted stations, which you can add and remove.
 - **Settings**: everything the node applies without a restart.
@@ -131,8 +133,10 @@ The page stays up to date by itself: the node tells it what changed over a serve
 event stream (`/api/events`). A chat line between two stations linked over the internet
 arrives within a second; by radio it takes as long as the channel does. Chat and mail are
 both stored and forwarded: a line to a station out of reach waits and goes out when a link
-comes up. The node keeps every message in `station.db` and retries undelivered ones with
-growing delays (1 minute doubling to an hour, 12 attempts, set in `[delivery]`).
+comes up. The node retries undelivered messages with growing delays (1 minute doubling to
+an hour, 12 attempts, set in `[delivery]`). History stays in `station.db` until you delete
+the local item or clear a chat; queued and in-transit messages are protected from history
+cleanup.
 
 Every 10 minutes (`beacon_minutes`, 0 for none) the node sends a signed beacon on the
 radio: its callsign and key, its grid locator (`locator = "JO89xi"` under `[station]`),
@@ -422,9 +426,11 @@ with a radio.
 | --- | --- | --- |
 | GET | `/api/status` | callsign, key, radio and internet state, estimated delivery rate per station and link, stations heard on the radio with their beacons |
 | GET | `/api/messages?direction=in\|out\|all&peer=CALL&kind=chat\|mail&limit=n` | newest first, with delivery state and link; `peer` gives one conversation |
+| GET | `/api/messages/{id}` | decoded metadata and the exact raw signed object as hex |
 | GET | `/api/events` | server-sent events, one `data:` line naming what changed: `message`, `status` or `settings` |
 | POST | `/api/send` | `{"to", "text", "subject"?, "precedence"?}` → `201 {"id"}`; without a subject it is a chat line |
-| DELETE | `/api/messages/{id}` | cancel a locally queued outbound message → `204`; delivered and inbound messages cannot be cancelled |
+| DELETE | `/api/messages/{id}` | cancel a queued outbound message; a second delete, or deleting inactive/received history, removes the local copy |
+| DELETE | `/api/conversations/{peer}` | delete inactive local chat history while preserving queued and in-transit messages |
 | POST | `/api/read/{id}` | mark an inbound message read |
 | GET | `/api/trust` | trusted stations with their notes, and the file they are saved to |
 | POST | `/api/trust` | `{"line": "SO5KM-1 8a1e…", "note"?}` (as `hm whoami` prints it) → `201` |

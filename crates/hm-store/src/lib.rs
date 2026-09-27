@@ -268,6 +268,17 @@ pub enum Retry {
     Inactive,
 }
 
+/// Result of an operator asking to remove one locally stored message.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// A queued outbound message was cancelled and kept for status/history.
+    Cancelled,
+    /// A terminal or received message and its unreferenced object were removed.
+    Deleted,
+    /// Relay custody or an end-to-end receipt is still outstanding.
+    Active,
+}
+
 pub struct Store {
     db: Database,
 }
@@ -834,6 +845,76 @@ impl Store {
             r.note = Some("cancelled by operator".into());
             true
         })
+    }
+
+    /// Cancel an outbound queue entry, or permanently remove inactive local
+    /// history. Active relay custody and in-transit messages are never deleted.
+    ///
+    /// Cancelling is deliberately a separate first step: a late click cannot
+    /// erase the operator's only indication that a queued message was stopped.
+    pub fn delete(&self, id: ObjectId) -> Result<DeleteOutcome> {
+        let tx = self.db.begin_write()?;
+        let record;
+        let outcome;
+        {
+            let mut messages = tx.open_table(MESSAGES)?;
+            record = match messages.get(id.0)? {
+                Some(bytes) => decode(bytes.value())?,
+                None => return Err(Error::NotFound),
+            };
+            if record.direction == Direction::Out && record.state == State::Queued {
+                let mut cancelled = record.clone();
+                cancelled.state = State::Cancelled;
+                cancelled.next_hop = None;
+                cancelled.next_hops = None;
+                cancelled.note = Some("cancelled by operator".into());
+                messages.insert(id.0, encode(&cancelled).as_slice())?;
+                outcome = DeleteOutcome::Cancelled;
+            } else if matches!(record.state, State::Queued | State::InTransit) {
+                return Ok(DeleteOutcome::Active);
+            } else {
+                messages.remove(id.0)?;
+                outcome = DeleteOutcome::Deleted;
+            }
+        }
+        match outcome {
+            DeleteOutcome::Cancelled => {
+                tx.open_table(QUEUE)?
+                    .remove((255 - record.precedence, record.seq, id.0))?;
+            }
+            DeleteOutcome::Deleted => {
+                tx.open_table(BY_TIME)?
+                    .remove((record.direction as u8, record.at, record.seq, id.0))?;
+                let mut candidates = vec![id];
+                if let Some(receipt) = record.e2e_receipt {
+                    candidates.push(receipt);
+                }
+                for candidate in candidates {
+                    let referenced = {
+                        let messages = tx.open_table(MESSAGES)?;
+                        if messages.get(candidate.0)?.is_some() {
+                            true
+                        } else {
+                            let mut found = false;
+                            for entry in messages.iter()? {
+                                let (_, bytes) = entry?;
+                                if decode(bytes.value())?.e2e_receipt == Some(candidate) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            found
+                        }
+                    };
+                    if !referenced {
+                        tx.open_table(OBJECTS)?.remove(candidate.0)?;
+                    }
+                }
+            }
+            DeleteOutcome::Active => unreachable!("returned before commit"),
+        }
+        tx.commit()?;
+        Ok(outcome)
     }
 
     pub fn mark_read(&self, id: ObjectId) -> Result<()> {
