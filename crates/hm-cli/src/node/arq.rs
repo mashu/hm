@@ -516,6 +516,17 @@ impl Task {
                     Kind::Ardop => true,
                 };
                 return Ok(match state {
+                    current @ State::Connected {
+                        peer: current_peer, ..
+                    } => {
+                        if current_peer != peer {
+                            super::log(format!(
+                                "modem: ignored a second connection to {peer} while connected to {current_peer}"
+                            ));
+                            self.set_status(true, Some(current_peer));
+                        }
+                        current
+                    }
                     State::Calling { req, .. } if req.to == peer && we_called => {
                         super::log(format!("modem: connected to {peer}"));
                         self.send_data(p, &bundle_message(&req.object)).await?;
