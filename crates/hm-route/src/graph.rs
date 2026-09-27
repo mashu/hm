@@ -8,6 +8,7 @@ use crate::beta;
 pub enum Bearer {
     Radio,
     Internet,
+    Modem,
 }
 
 impl From<ContactBearer> for Bearer {
@@ -15,6 +16,7 @@ impl From<ContactBearer> for Bearer {
         match value {
             ContactBearer::Radio => Self::Radio,
             ContactBearer::Internet => Self::Internet,
+            ContactBearer::Modem => Self::Modem,
         }
     }
 }
@@ -24,6 +26,7 @@ impl From<Bearer> for ContactBearer {
         match value {
             Bearer::Radio => Self::Radio,
             Bearer::Internet => Self::Internet,
+            Bearer::Modem => Self::Modem,
         }
     }
 }

@@ -259,7 +259,7 @@ fn find_candidates(
                 continue;
             }
             let edge_airtime = match contact.key.bearer {
-                Bearer::Radio => request
+                Bearer::Radio | Bearer::Modem => request
                     .object_bytes
                     .saturating_mul(8_000)
                     .div_ceil(u64::from(contact.rate_bps)),

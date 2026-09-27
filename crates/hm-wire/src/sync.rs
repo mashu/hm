@@ -23,6 +23,7 @@ const OFFER_HEADER_LEN: usize = 4;
 pub enum ContactBearer {
     Radio = 0,
     Internet = 1,
+    Modem = 2,
 }
 
 impl TryFrom<u8> for ContactBearer {
@@ -32,6 +33,7 @@ impl TryFrom<u8> for ContactBearer {
         match value {
             0 => Ok(Self::Radio),
             1 => Ok(Self::Internet),
+            2 => Ok(Self::Modem),
             _ => Err(WireError::OutOfRange),
         }
     }

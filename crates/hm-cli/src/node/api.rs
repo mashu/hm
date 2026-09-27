@@ -165,6 +165,12 @@ struct StatusView {
     radio_via: Option<String>,
     internet_listen: Option<String>,
     internet_peers: Vec<String>,
+    /// `null` without a modem; otherwise whether the modem program is reachable.
+    modem: Option<bool>,
+    /// How the modem is reached, when the node has one.
+    modem_via: Option<String>,
+    /// The station the modem is connected to right now.
+    modem_peer: Option<String>,
     estimates: Vec<Estimate>,
     /// Stations heard on the radio lately, most recent first.
     heard: Vec<HeardView>,
@@ -205,6 +211,9 @@ async fn status(State(s): State<AppState>) -> Json<StatusView> {
         radio_via: st.radio_via.clone(),
         internet_listen: st.internet_listen.map(|a| a.to_string()),
         internet_peers: st.internet_peers.iter().map(|c| c.to_string()).collect(),
+        modem: st.modem,
+        modem_via: s.cfg.modem.as_ref().map(|m| m.describe()),
+        modem_peer: st.modem_peer.map(|c| c.to_string()),
         estimates: st
             .estimates
             .into_iter()
@@ -628,6 +637,7 @@ struct LiveView {
     beacon_minutes: Option<u64>,
     radio_cost: Option<f64>,
     internet_cost: Option<f64>,
+    modem_cost: Option<f64>,
     retry_first_secs: Option<u64>,
     retry_max_secs: Option<u64>,
     retry_attempts: Option<u32>,
@@ -641,6 +651,8 @@ struct LiveView {
 #[derive(Serialize)]
 struct FixedView {
     internet_listen: Option<String>,
+    /// The ARQ modem, `[modem]`.
+    modem: Option<String>,
     http: String,
     store: String,
 }
@@ -666,6 +678,7 @@ fn settings_view(s: &AppState) -> SettingsView {
             beacon_minutes: Some(l.beacon_secs / 60),
             radio_cost: Some(l.costs.radio),
             internet_cost: Some(l.costs.internet),
+            modem_cost: Some(l.costs.modem),
             retry_first_secs: Some(l.retry.first_delay_secs),
             retry_max_secs: Some(l.retry.max_delay_secs),
             retry_attempts: Some(l.retry.max_attempts),
@@ -690,6 +703,7 @@ fn settings_view(s: &AppState) -> SettingsView {
                 .expect("lock")
                 .internet_listen
                 .map(|a| a.to_string()),
+            modem: s.cfg.modem.as_ref().map(|m| m.describe()),
             http: s.cfg.http.to_string(),
             store: s.cfg.store.display().to_string(),
         },
@@ -735,6 +749,7 @@ async fn change_settings(
             beacon_minutes: req.beacon_minutes,
             radio_cost: req.radio_cost,
             internet_cost: req.internet_cost,
+            modem_cost: req.modem_cost,
             retry_first_secs: req.retry_first_secs,
             retry_max_secs: req.retry_max_secs,
             retry_attempts: req.retry_attempts,

@@ -208,6 +208,7 @@ fn start(ether: &Ether, key: &KeyFile, me: &str, peer: &KeyFile, db: &Tmp) -> no
         }),
         radio_builder: None,
         internet: None,
+        modem: None,
         relay: Default::default(),
         schedules: vec![],
         store: db.0.clone(),

@@ -378,8 +378,18 @@ The receipt is the transfer receipt of section 7 with base callsigns and
 session 0: the receiver's signature over
 `"hm/xfer-receipt/v0" || receiver base call || sender base call || 0x0000 || transfer id`.
 A receiver accepts only bundles addressed to its callsign whose signatures do
-not fail against its trust file. Delivery therefore means the same on every
-link: the receiver signed for exactly these bytes.
+not fail against its trust file. This receipt proves next-hop custody of these
+exact bytes. Only the destination-signed end-to-end receipt in section 11.3
+marks the origin's message delivered.
+
+**Over ARQ modems.** A connection made by an ARQ modem (VARA, Mercury, ARDOP)
+is a reliable byte stream between two stations named by the modem. It carries
+the same exchange, one bundle after another on the same stream: `"HMD0"`,
+length, object from the sender; `0x00` and the receipt, or `0x01`, length and
+reason, from the receiver. Either station may send on a connection, whoever
+called; the first byte tells a bundle (`H`) from an answer (`0x00`, `0x01`).
+The caller hangs up when it has nothing more to send. There is no TLS on this
+path: the bundles' signatures and the custody receipt carry the authentication.
 
 ## 11. Phase 2 routing, custody and synchronization
 
@@ -467,7 +477,7 @@ and receiver; contact signatures name their origin separately.
 | 11 | 4 | contact start, Unix seconds |
 | 15 | 4 | contact end, Unix seconds |
 | 19 | 6 | peer callsign |
-| 25 | 1 | bearer: 0 radio, 1 internet |
+| 25 | 1 | bearer: 0 radio, 1 internet, 2 ARQ modem |
 | 26 | 2 | success, parts per 10,000 |
 | 28 | 4 | effective bit rate |
 | 32 | 4 | residual capacity bytes |

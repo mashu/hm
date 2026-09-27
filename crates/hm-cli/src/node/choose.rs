@@ -22,6 +22,8 @@ use hm_wire::Callsign;
 pub enum Bearer {
     Radio,
     Internet,
+    /// An ARQ modem: VARA, Mercury or ARDOP.
+    Modem,
 }
 
 impl Bearer {
@@ -29,6 +31,7 @@ impl Bearer {
         match self {
             Bearer::Radio => "radio",
             Bearer::Internet => "internet",
+            Bearer::Modem => "modem",
         }
     }
 }
@@ -38,6 +41,7 @@ impl Bearer {
 pub struct Costs {
     pub radio: f64,
     pub internet: f64,
+    pub modem: f64,
 }
 
 impl Default for Costs {
@@ -45,6 +49,7 @@ impl Default for Costs {
         Costs {
             radio: 1.0,
             internet: 2.0,
+            modem: 1.5,
         }
     }
 }
@@ -118,6 +123,7 @@ impl Chooser {
         match b {
             Bearer::Radio => self.costs.radio,
             Bearer::Internet => self.costs.internet,
+            Bearer::Modem => self.costs.modem,
         }
     }
 
@@ -255,6 +261,7 @@ mod tests {
             Costs {
                 radio: 5.0,
                 internet: 1.0,
+                modem: 3.0,
             },
             3600,
             DetRng::from_seed(5),

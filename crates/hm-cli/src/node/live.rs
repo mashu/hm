@@ -45,6 +45,7 @@ impl Live {
             costs: Costs {
                 radio: c.delivery.radio_cost,
                 internet: c.delivery.internet_cost,
+                modem: c.delivery.modem_cost,
             },
             retry: RetryPolicy {
                 first_delay_secs: c.delivery.retry_first_secs,
@@ -72,6 +73,7 @@ pub struct Change {
     pub beacon_minutes: Option<u64>,
     pub radio_cost: Option<f64>,
     pub internet_cost: Option<f64>,
+    pub modem_cost: Option<f64>,
     pub retry_first_secs: Option<u64>,
     pub retry_max_secs: Option<u64>,
     pub retry_attempts: Option<u32>,
@@ -228,7 +230,10 @@ impl LiveConfig {
     /// Apply `c`, checking it first; nothing changes if any part is invalid.
     pub fn change(&self, c: Change) -> io::Result<()> {
         let bad = |m: &str| Err(io::Error::new(io::ErrorKind::InvalidInput, m.to_string()));
-        for cost in [c.radio_cost, c.internet_cost].into_iter().flatten() {
+        for cost in [c.radio_cost, c.internet_cost, c.modem_cost]
+            .into_iter()
+            .flatten()
+        {
             if !(cost.is_finite() && cost > 0.0) {
                 return bad("costs must be positive numbers");
             }
@@ -246,7 +251,11 @@ impl LiveConfig {
             if let Some(v) = c.beacon_minutes {
                 config::set_value(p, "radio", "beacon_minutes", v as i64)?;
             }
-            for (k, v) in [("radio_cost", c.radio_cost), ("internet_cost", c.internet_cost)] {
+            for (k, v) in [
+                ("radio_cost", c.radio_cost),
+                ("internet_cost", c.internet_cost),
+                ("modem_cost", c.modem_cost),
+            ] {
                 if let Some(v) = v {
                     config::set_value(p, "delivery", k, v)?;
                 }
@@ -283,6 +292,9 @@ impl LiveConfig {
             }
             if let Some(v) = c2.internet_cost {
                 l.costs.internet = v;
+            }
+            if let Some(v) = c2.modem_cost {
+                l.costs.modem = v;
             }
             if let Some(v) = c2.retry_first_secs {
                 l.retry.first_delay_secs = v;

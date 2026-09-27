@@ -5,18 +5,18 @@
 //! - **radio** (optional): a thread running the transfer engine over a KISS
 //!   TNC or the built-in modem, reconnecting if the link goes away. It also
 //!   sends a signed BEACON now and then, and keeps the table of stations heard;
-//! - **internet** (optional): QUIC links to other stations (`hm-net`).
+//! - **internet** (optional): QUIC links to other stations (`hm-net`);
+//! - **ARQ modem** (optional): VARA, Mercury or ARDOP host interfaces.
 //!
-//! A coordinator hands every due outbound message to one bearer, chosen per
-//! delivery by [`choose::Chooser`] from the bearers that can reach the
-//! destination right now. With the default costs radio carries the traffic
-//! whenever it delivers, and the internet takes over only while it does not.
-//! Everything that arrives, over either bearer, goes through one check
-//! (addressed to us, signature against the trusted keys) into the store, once.
+//! A coordinator routes every due message over a probabilistic contact graph,
+//! reserves capacity along the selected path, and transfers custody to its
+//! next hop. Everything that arrives over any bearer goes through one
+//! acceptance gate for destination delivery or relay custody.
 //!
 //! The HTTP thread serves the JSON API and web page behind an access token.
 
 mod api;
+pub mod arq;
 pub mod choose;
 mod control;
 pub mod heard;
@@ -61,6 +61,7 @@ fn route_bearer(bearer: Bearer) -> RouteBearer {
     match bearer {
         Bearer::Radio => RouteBearer::Radio,
         Bearer::Internet => RouteBearer::Internet,
+        Bearer::Modem => RouteBearer::Modem,
     }
 }
 
@@ -161,6 +162,8 @@ pub struct NodeConfig {
     /// changes take a restart.
     pub radio_builder: Option<RadioBuilder>,
     pub internet: Option<InternetConfig>,
+    /// An ARQ modem program (VARA, Mercury, ARDOP) as a third bearer.
+    pub modem: Option<arq::ArqConfig>,
     pub relay: RelaySettings,
     /// Planned directed contacts loaded from `[[contact]]`.
     pub schedules: Vec<ScheduledContact>,
@@ -175,6 +178,10 @@ pub struct NodeConfig {
 /// What the node is doing, for the status API.
 #[derive(Clone, Debug, Default)]
 pub struct Status {
+    /// `None` without a modem; otherwise whether the modem program is reachable.
+    pub modem: Option<bool>,
+    /// The station the modem is connected to.
+    pub modem_peer: Option<Callsign>,
     pub radio: Option<bool>,
     /// How the radio is reached, while the node has one.
     pub radio_via: Option<String>,
@@ -616,6 +623,36 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                         }
                     }
                 };
+                let modem = cfg.modem.clone().map(|mc| {
+                    let (store, gate_live, me, key_call, gate_identity, gate_notify, gate_relay) = (
+                        store.clone(),
+                        live.clone(),
+                        cfg.me,
+                        cfg.key.call,
+                        Identity::from_secret(cfg.key.identity.secret()),
+                        notify.clone(),
+                        cfg.relay.clone(),
+                    );
+                    let gate: hm_net::Accept = Arc::new(move |via, obj| {
+                        let current = gate_live.get();
+                        accept(
+                            AcceptanceGate {
+                                store: &store,
+                                notify: &gate_notify,
+                                trust: &current.trust,
+                                me,
+                                key_call,
+                                identity: &gate_identity,
+                                relay: &gate_relay,
+                            },
+                            via,
+                            &obj,
+                        )
+                        .verdict()
+                    });
+                    let id = hm_ident::Identity::from_secret(cfg.key.identity.secret());
+                    Arc::new(arq::Arq::start(mc, cfg.me, id, live.clone(), gate))
+                });
                 let _ = addr_tx.send(Ok(net.as_ref().and_then(|n| n.local_addr().ok())));
                 if let Some(n) = &net {
                     status.lock().expect("lock").internet_listen = n.local_addr().ok();
@@ -640,6 +677,7 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                     &cfg,
                     &store,
                     net.clone(),
+                    modem,
                     radio_cmd_tx,
                     radio_evt_rx,
                     net_control_rx,
@@ -659,10 +697,11 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
         .recv()
         .map_err(|_| io::Error::other("node thread failed to start"))??;
     log(format!(
-        "node {} up: radio {}, internet {}, web http://{http_addr}/",
+        "node {} up: radio {}, internet {}, modem {}, web http://{http_addr}/",
         cfg.me,
         cfg.radio.as_ref().map_or("off".to_string(), |r| r.describe()),
         internet_addr.map_or("off".to_string(), |a| format!("on {a}")),
+        cfg.modem.as_ref().map_or("off".to_string(), |m| m.describe()),
     ));
     Ok(NodeHandle {
         http_addr,
@@ -705,6 +744,7 @@ fn send_sync(
                 let _ = network.send_control(to, &payload).await;
             });
         }
+        Bearer::Modem => {}
     }
 }
 
@@ -850,6 +890,7 @@ async fn coordinator(
     cfg: &NodeConfig,
     store: &Store,
     net: Option<Arc<Net>>,
+    modem: Option<Arc<arq::Arq>>,
     radio_cmd: mpsc::Sender<RadioCmd>,
     mut radio_evt: tokio::sync::mpsc::UnboundedReceiver<RadioEvt>,
     mut net_control: tokio::sync::mpsc::UnboundedReceiver<(Callsign, Vec<u8>)>,
@@ -900,6 +941,8 @@ async fn coordinator(
     let mut last_pairwise_sync: BTreeMap<(Callsign, Bearer), u64> = BTreeMap::new();
     let mut advertised_live: BTreeMap<(Callsign, RouteBearer), u64> = BTreeMap::new();
     let (net_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<NetResult>();
+    let (modem_tx, mut modem_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(ObjectId, Callsign, Result<(), String>)>();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
 
     let finish = |id: ObjectId,
@@ -1232,6 +1275,27 @@ async fn coordinator(
                     );
                 }
             }
+            Some((id, peer, result)) = modem_rx.recv() => {
+                let outcome = match result {
+                    Ok(()) => Ok(true),
+                    Err(e) if e.starts_with("refused: busy for ") => Err((e, false)),
+                    Err(e) if e.starts_with("refused: ") => Err((e, true)),
+                    Err(e) => Err((e, false)),
+                };
+                if let Some(flight) = in_flight.remove(&(id, peer)) {
+                    if outcome.is_ok() {
+                        control.clear_request(id, peer);
+                    }
+                    finish(
+                        id,
+                        flight,
+                        outcome,
+                        &mut chooser,
+                        &mut graph,
+                        &mut failed_contacts,
+                    );
+                }
+            }
             _ = tick.tick() => {
                 match live.reload_if_changed() {
                     Some(Ok(())) => log("settings file changed; applied"),
@@ -1403,12 +1467,41 @@ async fn coordinator(
                     if r.direction == Direction::Relay && !cfg.relay.enabled {
                         max_hops = max_hops.min((visited.len() + 1) as u8);
                     }
-                    let excluded: Vec<ContactKey> = failed_contacts
+                    let modem_up = modem.as_ref().is_some_and(|handle| handle.status().up);
+                    if modem_up {
+                        let rate_bps = cfg
+                            .modem
+                            .as_ref()
+                            .map_or(1_200, arq::ArqConfig::estimated_rate_bps);
+                        let _ = graph.observe_live_link(LiveContact {
+                            from: cfg.me,
+                            to: route_destination,
+                            bearer: RouteBearer::Modem,
+                            rate_bps,
+                            capacity_bytes: arq::MAX_OBJECT as u64,
+                            success_permyriad: Some(7_000),
+                            flags: 0,
+                            observed_at: now,
+                        });
+                    }
+                    let mut excluded: Vec<ContactKey> = failed_contacts
                         .entry(r.id)
                         .or_default()
                         .iter()
                         .filter_map(|(contact, until)| (*until > now).then_some(*contact))
                         .collect();
+                    excluded.extend(
+                        graph
+                            .outgoing(cfg.me, now)
+                            .filter(|contact| match contact.key.bearer {
+                                RouteBearer::Radio => !radio_up,
+                                RouteBearer::Internet => net
+                                    .as_ref()
+                                    .is_none_or(|network| !network.is_connected(contact.key.to)),
+                                RouteBearer::Modem => !modem_up,
+                            })
+                            .map(|contact| contact.key),
+                    );
                     let routed_len = object.len()
                         + usize::from(r.direction == Direction::Relay)
                             * (10 + 6 * (usize::from(r.hop_count.unwrap_or(0)) + 1));
@@ -1474,6 +1567,7 @@ async fn coordinator(
                                 Bearer::Internet,
                                 net.as_ref().is_some_and(|network| network.is_connected(first.contact.to)),
                             ),
+                            RouteBearer::Modem => (Bearer::Modem, modem_up),
                         };
                         if !available || in_flight.contains_key(&(r.id, first.contact.to)) {
                             continue;
@@ -1539,6 +1633,17 @@ async fn coordinator(
                                     let _ = tx.send((id, peer, result));
                                 });
                             }
+                            Bearer::Modem => {
+                                let (modem, tx, id) = (
+                                    modem.clone().expect("route checked available"),
+                                    modem_tx.clone(),
+                                    r.id,
+                                );
+                                tokio::spawn(async move {
+                                    let result = modem.deliver(peer, wire_object).await;
+                                    let _ = tx.send((id, peer, result));
+                                });
+                            }
                         }
                     }
                 }
@@ -1547,6 +1652,18 @@ async fn coordinator(
                 if (st.radio, &st.radio_via, &st.internet_peers) != (radio, &radio_via, &links) {
                     notify.send("status");
                 }
+                let (modem_up, modem_peer) = match &modem {
+                    Some(m) => {
+                        let s = m.status();
+                        (Some(s.up), s.peer)
+                    }
+                    None => (None, None),
+                };
+                if (st.modem, st.modem_peer) != (modem_up, modem_peer) {
+                    notify.send("status");
+                }
+                st.modem = modem_up;
+                st.modem_peer = modem_peer;
                 st.radio = radio;
                 st.radio_via = radio_via.clone();
                 st.internet_peers = links;
@@ -1554,7 +1671,7 @@ async fn coordinator(
                     .peers()
                     .into_iter()
                     .flat_map(|p| {
-                        [Bearer::Radio, Bearer::Internet].map(|b| (p, b.name(), chooser.estimate(p, b, now)))
+                        [Bearer::Radio, Bearer::Internet, Bearer::Modem].map(|b| (p, b.name(), chooser.estimate(p, b, now)))
                     })
                     .collect();
             }

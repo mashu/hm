@@ -189,6 +189,7 @@ fn start_routed(s: Setup, relay: RelaySettings, schedules: Vec<ScheduledContact>
         }),
         radio_builder: Some(Arc::new(node::radio_config)),
         internet: s.internet.map(|i| node::InternetConfig { listen: i.listen }),
+        modem: None,
         relay,
         schedules,
         store: s.store.0.clone(),

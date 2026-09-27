@@ -287,6 +287,7 @@ fn evidence_key(key: EdgeKey) -> [u8; 16] {
     out[12] = match key.bearer {
         Bearer::Radio => 0,
         Bearer::Internet => 1,
+        Bearer::Modem => 2,
     };
     out[13] = key.utc_hour.unwrap_or(u8::MAX);
     out
@@ -308,6 +309,7 @@ fn decode_evidence_key(bytes: [u8; 16]) -> Result<EdgeKey> {
     let bearer = match bytes[12] {
         0 => Bearer::Radio,
         1 => Bearer::Internet,
+        2 => Bearer::Modem,
         _ => return Err(Error::Corrupt("contact evidence bearer".into())),
     };
     let utc_hour = match bytes[13] {
