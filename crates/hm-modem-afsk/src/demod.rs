@@ -31,12 +31,11 @@ impl DemodulatorConfig {
             slicer_gains: alloc::vec![0.5, 0.63, 0.79, 1.0, 1.26, 1.58, 2.0],
             inertia_searching: 0.50,
             inertia_locked: 0.74,
-            // Chosen on Direwolf's gen_packets benchmark at 11.025-48 kHz; results are
-            // flat for windows of 1.1-1.6 bits, and fall apart below one bit.
+            // Chosen on Direwolf's increasing-noise benchmark at 11.025-48 kHz.
             prefilter_lo: 900.0,
             prefilter_hi: 2500.0,
             prefilter_bits: 2.0,
-            window_bits: 1.2,
+            window_bits: 1.45,
         }
     }
 }

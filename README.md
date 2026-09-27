@@ -22,10 +22,11 @@ clear, identities signed.
 | `hm-net` | Internet links: QUIC with mutual TLS 1.3 on Ed25519 station keys (only trusted stations connect), automatic redial, one stream per bundle with a signed receipt |
 | `hm-modem-afsk` | Our own AFSK 1200 modem (Bell 202), pure Rust and `no_std`: HDLC framing and CRC, multi-slicer demodulator with per-tone AGC and PLL clock recovery, carrier detect |
 | `hm-rig` | Radio hardware: sound cards through `cpal` (ALSA, CoreAudio, WASAPI); PTT by rigctld (Hamlib CAT), serial RTS/DTR, CM108 GPIO (AIOC, Digirig) or VOX; a virtual radio channel for tests |
-| `hm-cli` | The `hm` command: `node` (the station daemon: packet radio, ARQ modems (VARA, Mercury, ARDOP) and/or Internet links, relay/mailbox, web interface, JSON API with access token, settings applied live), `keygen`, `whoami`, `trust`, `send`, `listen`, all set up by one `station.toml`; KISS links over TCP or a serial port, and a real-time driver |
+| `hm-cli` | The `hm` command: interactive first-run `setup`; `node` (the station daemon: packet radio, ARQ modems (VARA, Mercury, ARDOP) and/or Internet links, relay/mailbox, web interface, JSON API with access token, settings applied live); `keygen`, `whoami`, `trust`, `send` and `listen`; KISS links over TCP or a serial port, and a real-time driver |
 
-Phase 1 still to do: the on-air test ([plan](docs/on-air-test-plan.md)), better decoding
-deep in noise for the built-in modem, and the Dioxus interface with a setup wizard.
+Phase 1's remaining gate is the on-air test ([plan](docs/on-air-test-plan.md)). The
+first-run setup wizard and the built-in modem's deterministic deep-noise target are
+implemented; real RF measurements may still lead to tuning.
 Phase 2 now provides opt-in
 multi-hop relaying, mailbox custody, congestion-bounded control traffic, compressed
 message bodies and destination-signed end-to-end delivery receipts. It has deterministic
@@ -39,7 +40,7 @@ The core protocol and daemon are implemented, but the project is not yet field-c
   modem decoding and relay admission from real RF measurements.
 - Test long-running mixed radio/Internet networks and interoperability between independently
   deployed nodes before freezing wire version 0.
-- Finish the setup wizard and field-test the ARQ modem integrations.
+- Field-test the ARQ modem integrations.
 - Add discovery or rendezvous if it proves necessary. Today Internet peers use explicit
   DNS names or addresses; two nodes behind restrictive NAT need a publicly reachable relay.
 - The built-in web server intentionally does not terminate TLS or provide multi-user
@@ -48,18 +49,25 @@ The core protocol and daemon are implemented, but the project is not yet field-c
 ## Run a station
 
 ```sh
-hm keygen --call SA0KAM-1                 # writes station.key and a starter station.toml
+hm setup                                  # choose KISS, built-in audio, or Internet only
 hm trust add "SO5KM-1 8a1e…"              # the line `hm whoami` prints on their side
 hm node                                   # radio through Direwolf on 127.0.0.1:8001
 ```
+
+`hm setup` validates each answer, lists detected sound devices, defaults the built-in
+modem to IL2P, and can configure a locator, authenticated Internet listener, relay and
+mailbox. It shows a summary before writing and never overwrites an existing key or
+configuration. Type `q` at any prompt to leave without changing files. For scripted
+provisioning, `hm keygen --call SA0KAM-1` remains available.
 
 ### station.toml
 
 Everything a station needs to know lives in one TOML file in the station's folder:
 `[station]`, `[radio]`, `[internet]`, `[delivery]` and the trusted stations as `[[trust]]`
-entries. Every setting has a default, and `hm keygen` writes a starter file listing them
-with comments. The key itself stays in `station.key` (readable by you only) and the web
-page's access token in `station.token`. Paths in the file are relative to the file.
+entries. Every setting has a default. `hm setup` writes the chosen settings; `hm keygen`
+writes a commented starter file. The key itself stays in `station.key` (readable by you
+only) and the web page's access token in `station.token`. Paths in the file are relative
+to the file.
 
 ```toml
 [station]
@@ -167,11 +175,11 @@ releases PTT on every exit path.
 With `framing = "il2p"` under `[radio]`, it sends the same frames in IL2P, the framing of
 NinoTNC and Direwolf 1.7: Reed–Solomon parity repairs up to 8 bad bytes in each block, so
 frames get through far more noise. On a simulated channel, 40 frames of ~60 bytes at a
-full-band SNR of −4 dB: 19 arrived as AX.25, all 40 as IL2P; at −6 dB, none against 25.
+full-band SNR of −4 dB: 20 arrived as AX.25, all 40 as IL2P; at −6 dB, none against 30.
 `framing = "auto"` sends IL2P to stations that said they decode it (every hm station on the
 built-in modem does, and says so in its OPEN) and AX.25 to everyone else, beacons included.
 The modem always decodes both. Tested against Direwolf both ways: Direwolf decodes all of
-our IL2P frames, and we decode more of `gen_packets -I 1` than Direwolf itself (97 against
+our IL2P frames, and we decode more of `gen_packets -I 1` than Direwolf itself (95 against
 94 of 100 in rising noise).
 
 ### Radio, internet, or both
@@ -537,13 +545,13 @@ airtime). SNR is measured in a 3 kHz bandwidth.
 | 5 kB, clean link | hm headers and preambles 9.6%, OPEN, OFFER and ACK with receipt 2.2%, TXDELAY and TXTAIL 2.7%; AX.25 framing and bit stuffing 9.9%; 72.6% of airtime is useful payload | `cargo test -p hm-xfer --release --test sim exit_criterion_overhead -- --nocapture` |
 | 2 kB, bursty loss (Gilbert–Elliott, ~12% mean) | 100/100 delivered | `cargo test -p hm-xfer --release --test sim bursty -- --nocapture` |
 | Two hidden senders to one node, no CSMA | 30/30 both delivered, last within 141 s | `cargo test -p hm-xfer --release --test sim two_senders -- --nocapture` |
-| 2 kB over the modem's measured loss at 7 / 8 / 9 dB SNR | 100/100 delivered at each; latency p50 26.7 / 17.5 / 17.5 s | `cargo test -p hm-xfer --release --test sim measured_modem -- --nocapture` |
+| 2 kB over the modem's measured loss at 7 / 8 / 9 dB SNR | 100/100 delivered at each; latency p50 25.1 / 17.5 / 17.5 s | `cargo test -p hm-xfer --release --test sim measured_modem -- --nocapture` |
 | Four stations to one hub, 1.5 kB each, 9 dB, all hear each other | without CSMA: last delivery p50 251 s, 4.8 overs per object, 153 receptions lost to collisions per run; with CSMA: p50 126 s, 1.8 overs per object, 44 lost, all from stations keying up within the 125 ms carrier-detect delay of each other | `cargo test -p hm-xfer --release --test sim busy_channel -- --nocapture` |
 | Receiver never keys up during an over, 8 kB at 15% loss | 0 frames talked over in 40 runs | `cargo test -p hm-xfer --release --test sim nobody_talks -- --nocapture` |
-| Modem frame loss vs SNR, 48 kHz, white noise | 50% of 40-byte frames lost at 5.5 dB, 41% of 360-byte frames at 7 dB, none above 9.5 dB; table in `crates/hm-sim/src/afsk_1200.rs` | `HM_WRITE_CURVE=1 cargo test -p hm-sim --release --test afsk afsk_1200_curve -- --ignored` |
+| Modem frame loss vs SNR, 48 kHz, white noise | 38% of 40-byte frames lost at 5.5 dB, 40% of 360-byte frames at 7 dB, none at or above 9.5 dB; table in `crates/hm-sim/src/afsk_1200.rs` | `HM_WRITE_CURVE=1 cargo test -p hm-sim --release --test afsk afsk_1200_curve -- --ignored` |
 | Modem carrier detect | 68–101 ms after key-up at 7–20 dB SNR | `cargo test -p hm-sim --release --test afsk carrier_detect -- --nocapture` |
-| Modem vs Direwolf 1.7, `gen_packets -n 100` at 11–48 kHz | 241 frames decoded vs 236 for Direwolf's better profile (102%) | `cargo test -p hm-modem-afsk --release --test modem -- --nocapture` (needs `direwolf` installed) |
-| Modem vs Direwolf 1.7, held out: tilt ±6 dB/octave, SNR down to −4 dB | 322 vs 335 (96%); behind Direwolf deep in the noise | same |
+| Modem vs Direwolf 1.8.1, `gen_packets -n 100` at 11–48 kHz | 246 frames decoded vs 236 for Direwolf's better profile (104%) | `cargo test -p hm-modem-afsk --release --test modem -- --nocapture` (needs `direwolf` installed) |
+| Modem vs Direwolf 1.8.1, held out: tilt ±6 dB/octave, SNR down to −4 dB | 333 vs 328 (102%) | same |
 | Modem interop | Direwolf decodes 50/50 of our frames, clean and at 12 dB SNR | same |
 | 5% undetected frame corruption | 33/40 delivered (92% over 400 runs), none corrupt | `cargo test -p hm-xfer --release --test sim heavy_corruption -- --nocapture` |
 

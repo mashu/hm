@@ -434,4 +434,8 @@ fn il2p_outlasts_hdlc_in_noise() {
     }
     eprintln!("{}", report.join("; "));
     assert!(il2p_total > hdlc_total, "IL2P {il2p_total} vs HDLC {hdlc_total}");
+    assert!(
+        il2p_total >= 184,
+        "deep-noise exit criterion: IL2P decoded {il2p_total}/200; expected at least 184"
+    );
 }

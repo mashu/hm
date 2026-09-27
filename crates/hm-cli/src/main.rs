@@ -6,7 +6,7 @@
 //! line overrides the file for that run.
 //!
 //! ```text
-//! hm keygen --call SA0KAM-1          # station.key, and a starter station.toml
+//! hm setup                           # interactive first-run setup
 //! hm whoami                          # the line to give other stations
 //! hm trust add "SO5KM-1 8a1e…"       # trust a station (the line from its hm whoami)
 //! hm send --to SO5KM-1 --text "73 de SA0KAM"
@@ -39,6 +39,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Configure a new station interactively without overwriting existing files.
+    Setup,
     /// Create a station key file, and a starter station.toml if there is none.
     Keygen {
         /// Your callsign. With an SSID (SA0KAM-2) the key is for that station only;
@@ -668,6 +670,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let path = cli.config.as_path();
     let result = match &cli.cmd {
+        Cmd::Setup => hm_cli::setup::run(path),
         Cmd::Keygen { call, out } => keygen(path, call, out.as_deref()),
         Cmd::Whoami { key } => whoami(path, key.as_deref()),
         Cmd::Trust { cmd } => trust_cmd(path, cmd),

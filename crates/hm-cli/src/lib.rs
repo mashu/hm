@@ -16,5 +16,6 @@ pub mod files;
 pub mod hex;
 pub mod kiss_link;
 pub mod node;
+pub mod setup;
 pub mod sound_link;
 pub mod station;

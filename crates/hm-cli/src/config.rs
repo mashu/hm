@@ -21,7 +21,7 @@
 //! web page back with `toml_edit`, which keeps comments and layout.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -363,6 +363,19 @@ impl Config {
         c.modem.check()?;
         c.relay.check()?;
         Ok(c)
+    }
+
+    /// Write a complete, checked configuration and refuse to replace a file.
+    pub fn save_new(&self, path: &Path) -> io::Result<()> {
+        let text = toml::to_string_pretty(self).map_err(|e| invalid(format!("configuration: {e}")))?;
+        Config::parse(&text).map_err(|e| invalid(format!("configuration: {e}")))?;
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+        if let Err(error) = file.write_all(text.as_bytes()) {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// The trusted stations, checked.
