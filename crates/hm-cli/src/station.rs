@@ -22,6 +22,14 @@ use crate::files::{KeyFile, Trust};
 /// queue retries on its own schedule.
 const CHAT_TTL: u32 = 3600;
 const MAIL_TTL: u32 = 7 * 86_400;
+/// Bulletins stay useful for a day on a shared channel.
+pub const BULLETIN_TTL: u32 = 86_400;
+/// Sealed bulletin object size cap (smaller than routine mail on air).
+pub const MAX_BULLETIN_BYTES: usize = 4096;
+/// Local publishes allowed in a rolling hour.
+pub const MAX_BULLETINS_PER_HOUR: usize = 4;
+/// Inbound bulletins kept per origin in a rolling hour (flood guard).
+pub const MAX_INBOUND_BULLETINS_PER_ORIGIN_HOUR: usize = 12;
 
 /// Link parameters the transfer engine uses to time overs.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -191,6 +199,28 @@ pub fn build_bundle(
     bundle.seal(&key.identity)
 }
 
+/// Seal an RF bulletin to a named group. Always routine precedence; no station
+/// recipient. Callers must enforce [`MAX_BULLETIN_BYTES`] on the sealed bytes.
+pub fn build_bulletin(
+    key: &KeyFile,
+    me: Callsign,
+    group: &str,
+    text: &str,
+    subject: Option<&str>,
+) -> Result<SignedBundle, BundleError> {
+    let group = group.trim();
+    let address = Address::Group(group.to_string());
+    address.validate()?;
+    let mut bundle = Bundle::new(me, Kind::Bulletin, unix_now(), BULLETIN_TTL)
+        .to(address)
+        .with_text(text)
+        .with_precedence(Precedence::Routine);
+    if let Some(subject) = subject.map(str::trim).filter(|s| !s.is_empty()) {
+        bundle = bundle.with_subject(subject);
+    }
+    bundle.seal(&key.identity)
+}
+
 /// Decode `object` and check its signature against `trust`. `via` is who sent the frame.
 pub fn open_message(via: Callsign, object: &[u8], trust: &Trust) -> Message {
     let opened = match Opened::decode(object) {
@@ -320,5 +350,16 @@ mod tests {
         let junk = open_message(call("SA0KAM"), b"not a bundle", &trust);
         assert!(junk.bundle.is_none());
         assert!(junk.error.is_some());
+    }
+
+    #[test]
+    fn bulletin_addresses_a_group_without_a_station() {
+        let alice = KeyFile::generate(call("SA0KAM")).unwrap();
+        let sealed = build_bulletin(&alice, call("SA0KAM"), "SK-EMCOMM", "net open", Some("check-in"))
+            .unwrap();
+        assert_eq!(sealed.bundle().kind, Kind::Bulletin);
+        assert_eq!(sealed.bundle().to, vec![Address::Group("SK-EMCOMM".into())]);
+        assert!(sealed.to_vec().len() <= MAX_BULLETIN_BYTES);
+        assert!(build_bulletin(&alice, call("SA0KAM"), "", "x", None).is_err());
     }
 }

@@ -765,6 +765,7 @@ impl Store {
     }
 
     /// A verified transfer receipt proves durable custody at `next_hop`.
+    /// Unverified receipts MUST NOT transfer custody.
     pub fn custody_transferred(
         &self,
         id: ObjectId,
@@ -773,6 +774,9 @@ impl Store {
         by: &str,
         now: u64,
     ) -> Result<bool> {
+        if !receipt_verified {
+            return Ok(false);
+        }
         self.update(id, |r| {
             if !matches!(r.state, State::Queued | State::InTransit)
                 || !r
@@ -951,17 +955,27 @@ impl Store {
     pub fn holding_ids(&self, peer: Callsign, relayable: bool, now: u64) -> Result<Vec<ObjectId>> {
         let tx = self.db.begin_read()?;
         let messages = tx.open_table(MESSAGES)?;
+        // Outbox peer for RF/group bulletins (`hm_xfer::broadcast_peer`).
+        let bulletin_dest = Callsign::parse("ALL").expect("ALL is a valid callsign");
         let mut out = Vec::new();
         for entry in messages.iter()? {
             let (_, bytes) = entry?;
             let record = decode(bytes.value())?;
-            if record.state != State::Queued
-                || record.expires_at.is_some_and(|expires| expires <= now)
+            if record.expires_at.is_some_and(|expires| expires <= now)
                 || !matches!(record.direction, Direction::Out | Direction::Relay)
             {
                 continue;
             }
-            let eligible = if relayable {
+            let bulletin = record.direction == Direction::Out
+                && record.final_destination() == bulletin_dest
+                && matches!(record.state, State::Queued | State::Delivered);
+            if !bulletin && record.state != State::Queued {
+                continue;
+            }
+            let eligible = if bulletin {
+                // Group bulletins are for every peer that asks, not one destination.
+                true
+            } else if relayable {
                 record.custody_from != Some(peer)
                     && !record
                         .visited

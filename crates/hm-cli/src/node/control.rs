@@ -426,6 +426,7 @@ impl ControlPlane {
             }
             SyncMessage::Want(want) => {
                 let mut actions = Vec::new();
+                let bulletin_dest = Callsign::parse("ALL").expect("ALL is a valid callsign");
                 for prefix in want.prefixes {
                     if !self
                         .offered
@@ -443,8 +444,12 @@ impl ControlPlane {
                     let Some(record) = store.record(id).map_err(|error| error.to_string())? else {
                         continue;
                     };
-                    if record.state != State::Queued
-                        || !matches!(record.direction, Direction::Out | Direction::Relay)
+                    let bulletin = record.direction == Direction::Out
+                        && record.final_destination() == bulletin_dest
+                        && matches!(record.state, State::Queued | State::Delivered);
+                    if !bulletin
+                        && (record.state != State::Queued
+                            || !matches!(record.direction, Direction::Out | Direction::Relay))
                     {
                         continue;
                     }

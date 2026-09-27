@@ -1066,3 +1066,53 @@ fn a_corrupted_offer_length_does_not_end_the_transfer() {
         "offered again"
     );
 }
+
+#[test]
+fn broadcast_reaches_listeners_without_acks() {
+    let mut a = engine("SA0KAM");
+    let mut b = engine("SO5KM-1");
+    let mut c = engine("SP5AAA");
+    let object: Vec<u8> = (0..400u32).map(|i| (i * 3) as u8).collect();
+    let mut out = Vec::new();
+    a.handle(
+        Millis(0),
+        Input::Command(Command::Broadcast {
+            object: object.clone(),
+            precedence: 0,
+        }),
+        &mut out,
+    );
+    let burst = frames(&out);
+    assert!(!burst.is_empty());
+    for f in &burst {
+        let (h, _) = FrameHeader::decode(f).unwrap();
+        assert_eq!(h.dst, Dest::Broadcast);
+        assert_eq!(h.src, call("SA0KAM"));
+    }
+    // Publisher completes locally without any listener ACK.
+    assert_eq!(
+        events(&out),
+        vec![Event::Delivered {
+            to: broadcast_peer(),
+            id: object_id(&object),
+            rounds: 1,
+            receipt: Receipt::Unverified,
+        }]
+    );
+    assert_eq!(a.outgoing_count(), 0);
+
+    let want = Event::Received {
+        from: call("SA0KAM"),
+        id: object_id(&object),
+        object: object.clone(),
+    };
+    let b_out = deliver(&mut b, Millis(20_000), &burst);
+    assert_eq!(events(&b_out), vec![want.clone()]);
+    assert!(
+        frames(&b_out).is_empty(),
+        "broadcast listeners must not ACK"
+    );
+    let c_out = deliver(&mut c, Millis(20_000), &burst);
+    assert_eq!(events(&c_out), vec![want]);
+    assert!(frames(&c_out).is_empty());
+}

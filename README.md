@@ -49,16 +49,20 @@ The core protocol and daemon are implemented, but the project is not yet field-c
 ## Run a station
 
 ```sh
-hm setup                                  # choose KISS, built-in audio, or Internet only
+hm setup                                  # KISS, sound-card modem, internet only, or core node
 hm trust add "SO5KM-1 8a1e…"              # the line `hm whoami` prints on their side
 hm node                                   # radio through Direwolf on 127.0.0.1:8001
 ```
 
 `hm setup` validates each answer, lists detected sound devices, defaults the built-in
 modem to IL2P, and can configure a locator, authenticated Internet listener, relay and
-mailbox. It shows a summary before writing and never overwrites an existing key or
-configuration. Type `q` at any prompt to leave without changing files. For scripted
-provisioning, `hm keygen --call SA0KAM-1` remains available.
+mailbox. Option **4 (core node)** is for a hub with no radio: it listens on the internet,
+turns relay and mailbox on, and is meant to run on a computer with a public address (a
+small rented cloud server is typical). It shows a summary before writing and never
+overwrites an existing key or configuration. A second profile in the same folder uses
+matching names (`hm setup --config core.toml` writes `core.key` and `core.db`, leaving
+`station.key` alone). Type `q` at any prompt to leave without changing files. For
+scripted provisioning, `hm keygen --call SA0KAM-1` remains available.
 
 ### station.toml
 
@@ -123,18 +127,27 @@ even when the file changes; the web page lists them.
 
 `hm node` prints a link such as `http://127.0.0.1:8080/#token=…`. The token is also kept
 beside the store (`station.token`); the page asks for it if you open the plain address.
-The page has four views:
+The page has five views:
 
-- **Chat**: conversations by station, like a messenger. Type a callsign to start one;
-  Enter sends. Prominent badges distinguish pending, in-transit, delivered, failed,
-  cancelled and received lines. A queued line can be dropped before delivery. Chats can
-  be archived in the browser, or their inactive local history cleared; pending delivery
-  is never erased by either action.
+- **Chat**: 1:1 conversations by station, like a messenger. The left rail lists chats,
+  stations **On frequency** (heard on the radio) and **Trusted** peers as one-click
+  starts; type a callsign to open anyone else. Enter sends. The thread header shows
+  trust, hearability, locator/distance and delivery path estimates when known.
+  Badges distinguish pending, in-transit, delivered, failed, cancelled and received
+  lines. A queued line can be dropped before delivery. Chats can be archived in the
+  browser, or their inactive local history cleared; pending delivery is never erased
+  by either action.
 - **Mail**: messages with a subject and precedence, with an inbox and a sent log. Every
   chat line and mail item has a details view containing decoded metadata and the exact raw
   signed object, plus a control to delete an inactive local copy.
-- **Stations**: stations heard on the radio (with their beacons, locators, distance and
-  bearing) and the trusted stations, which you can add and remove.
+- **Bulletin**: group posts (`Address::Group`). On radio they broadcast once to listeners on
+  frequency; over the internet they go to linked stations, and others can pull missed ones via
+  holdings sync. No per-listener receipts; at most four publishes per hour and a small size cap.
+  See [bulletin channels](docs/bulletin-channels.md).
+- **Network**: link health (radio, internet, modem), per-station delivery estimates,
+  the outbound queue (queued / in transit), stations heard on the radio (beacons,
+  clock offset, offers, locators, distance and bearing), and trusted stations you can
+  add or remove.
 - **Settings**: everything the node applies without a restart.
 
 The page stays up to date by itself: the node tells it what changed over a server-sent
@@ -232,10 +245,15 @@ urgent_min_gain = 0.05
 control_airtime_fraction = 0.02
 ```
 
-Relay custody is allowlisted at both ends: the relay must trust both the bundle's
-origin and its final station destination. Removing the destination from the trust list
-also stops any queued relay holding from being forwarded. This does not change direct
-delivery to the local station, where an unknown sender is still shown as unverified.
+Relay custody requires a verified origin in the local trust list (that list is
+also the RF-authorization allowlist). The final destination need not be listed
+at every hop. Removing the origin from trust stops any queued relay holding from
+being forwarded. Before any packet-radio or ARQ-modem transmission, the node
+re-checks that the end-to-end origin is this station or a trusted station;
+Internet handoffs stay on mutual TLS and are not gated the same way. Custody
+moves only on a verified next-hop receipt. Direct delivery of an unknown sender
+is still shown as unverified, but no automatic end-to-end receipt is queued for
+it (so RF is not used to acknowledge an unauthorized origin).
 
 Signed contact deltas use Trickle suppression. Pairwise FILTER → OFFER → WANT exchanges
 reconcile holdings without broadcasting payload, and radio control traffic is capped at
@@ -265,12 +283,21 @@ The web/API listener and station-to-station listener are separate:
 - Station links are QUIC over UDP with mutual authentication by station identity keys.
   The listener rejects stations not present in `[[trust]]`.
 
-A public node can use:
+For a **core node** (hub that home stations dial), use a separate config so it does not
+touch your home station files:
+
+```sh
+hm setup --config core.toml   # option 4; writes core.toml, core.key, core.db
+hm --config core.toml node
+```
+
+Option 4 writes this shape: radio off, listen on `0.0.0.0:4433`, relay and mailbox on.
+You can also write it by hand:
 
 ```toml
 [station]
-key = "station.key"
-store = "station.db"
+key = "core.key"
+store = "core.db"
 http = "127.0.0.1:8080"
 
 [radio]
@@ -292,8 +319,8 @@ mailbox = true
 ```
 
 Exchange `hm whoami` output over a channel you trust, then add the other identity on both
-nodes with `hm trust add "CALL KEY"`. Point an A/AAAA DNS record at the public server and
-allow **UDP 4433** through its firewall and NAT. A peer connects with:
+nodes with `hm trust add "CALL KEY"`. Point DNS at the server and allow **UDP 4433** through
+its firewall. A home station connects with:
 
 ```toml
 [[internet.peers]]
@@ -302,7 +329,7 @@ address = "node.example.net:4433"
 ```
 
 QUIC is bidirectional once either side connects. If a home node cannot accept inbound UDP,
-let it dial a public relay; no automatic NAT traversal or public peer directory exists yet.
+let it dial a public core node; no automatic NAT traversal or public peer directory exists yet.
 Do not put UDP 4433 through an HTTP reverse proxy.
 
 For remote web access, keep port 8080 private and terminate HTTPS separately. For example,
@@ -404,7 +431,7 @@ target/debug/hm --config lab/a/station.toml node --no-radio \
 ```
 
 Each process prints its token-bearing web URL. Open A's URL on port 8101 and B's on
-8104, wait until the three links appear under Stations, then send from A to `SO5KM-1`.
+8104, wait until the three links appear under Network, then send from A to `SO5KM-1`.
 A's line passes through **Queued/In transit** and becomes **Delivered** only after B's
 signed receipt traverses the chain back. Stop R2 before sending to observe queuing and
 sequential retry; restart it to complete delivery. “Drop queued” in Chat or Mail cancels

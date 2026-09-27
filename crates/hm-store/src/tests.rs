@@ -211,6 +211,20 @@ fn active_custody_is_l_one_normally_and_l_two_only_when_urgent() {
 }
 
 #[test]
+fn unverified_receipt_does_not_transfer_custody() {
+    let db = TempDb::new("unverified-custody");
+    let s = Store::open(&db.0).unwrap();
+    let destination = call("M0CCC");
+    let relay = call("M0BBB");
+    s.enqueue(id(1), b"one", destination, 0, 10).unwrap();
+    assert!(s.set_next_hop(id(1), relay).unwrap());
+    assert!(!s.custody_transferred(id(1), relay, false, "radio", 20).unwrap());
+    let record = s.record(id(1)).unwrap().unwrap();
+    assert_eq!(record.state, State::Queued);
+    assert!(record.custody_by.is_none());
+}
+
+#[test]
 fn cancellation_ignores_late_receipt_and_e2e_requires_destination() {
     let db = TempDb::new("cancel-e2e");
     let s = Store::open(&db.0).unwrap();

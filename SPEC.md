@@ -156,8 +156,9 @@ original sender as its only recipient, and carry no subject, body or parts.
 Empty optional arrays, `prec = 0`, and `max_hops = 8` must be omitted.
 
 Receiving is two-step: decode for routing (recipients, precedence, expiry), then
-verify with the sender's key from their binding record before showing,
-acknowledging or delivering anything.
+verify with the sender's key from the local trust list (or a binding anchored
+there) before acknowledging. An unverified bundle addressed to this station may
+be stored and shown as unverified, but MUST NOT produce an automatic receipt.
 
 ## 7. Transfers
 
@@ -543,9 +544,22 @@ A relay answers busy/refuses custody when its configured holdings count, queue
 bytes or airtime budget is exhausted. Contact residual volume is reserved while
 a handoff is active and consumed on custody acceptance.
 
-A relay MUST accept custody only when its local trust list contains keys for
-both the signed bundle origin and the single final station destination. It MUST
-not forward an existing holding after that destination is removed from trust.
+A relay MUST accept custody only when the signed bundle origin verifies against
+its local trust list (the current RF-authorization allowlist) and the bundle
+names a single final station destination. The destination need not be listed
+locally. A relay MUST NOT forward an existing holding after that origin is
+removed from trust.
+
+Before transmitting over packet radio or an ARQ modem, a node MUST re-check that
+the bundle's end-to-end origin is either this station or present in the local
+trust list. Internet handoffs remain separately authenticated by mutual TLS and
+are not subject to that airtime gate. A hop MUST transfer custody only after a
+receipt signed by the next hop's trusted key; an unverified ACK leaves the
+previous custodian holding the copy.
+
+Final delivery of an unverified bundle is stored and shown as unverified, but
+MUST NOT produce an automatic end-to-end receipt (which could otherwise leave
+over RF).
 
 An operator may cancel a locally queued outbound bundle. Cancellation removes
 it from the local delivery queue and ignores late hop acknowledgements. It

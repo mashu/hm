@@ -8,14 +8,15 @@
 //! | --- | --- | --- |
 //! | GET | `/` | web page |
 //! | GET | `/api/status` | callsign, key, bearers and their estimated success per station |
-//! | GET | `/api/messages?direction=in\|out\|all&peer=CALL&kind=chat\|mail&limit=n` | newest first |
+//! | GET | `/api/messages?direction=in\|out\|all&peer=CALL&kind=chat\|mail\|bulletin&group=NAME&limit=n` | newest first |
 //! | GET | `/api/messages/{id}` | decoded metadata plus the exact raw signed object as hex |
 //! | GET | `/api/events` | server-sent events naming what changed: `message`, `status`, `settings` |
-//! | POST | `/api/send` | `{"to", "text", "subject"?, "precedence"?}` → `{"id"}` |
+//! | POST | `/api/send` | `{"to", "text", "subject"?, "precedence"?, "kind"?: "bulletin", "group"?}` → `{"id"}` |
 //! | DELETE | `/api/messages/{id}` | cancel queued outbound, otherwise delete inactive local history |
 //! | DELETE | `/api/conversations/{peer}` | delete inactive local chat history, preserving active delivery |
 //! | POST | `/api/read/{id}` | mark an inbound message read |
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, Query, Request, State};
@@ -33,7 +34,9 @@ use super::live::{Change, LiveConfig};
 use super::{NodeConfig, Notify, Status};
 use crate::config::RadioSettings;
 use crate::files::Trust;
-use crate::station::{build_bundle, unix_now};
+use crate::station::{
+    build_bulletin, build_bundle, unix_now, MAX_BULLETINS_PER_HOUR, MAX_BULLETIN_BYTES,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -42,6 +45,8 @@ pub struct AppState {
     pub status: Arc<Mutex<Status>>,
     pub live: Arc<LiveConfig>,
     pub notify: Notify,
+    /// Unix times of local bulletin publishes in the last hour (rate limit).
+    pub bulletin_publishes: Arc<Mutex<VecDeque<u64>>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -92,9 +97,10 @@ async fn security_headers(req: Request, next: Next) -> Response {
         HeaderName::from_static("content-security-policy"),
         HeaderValue::from_static(
             "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; \
-             form-action 'self'; connect-src 'self'; script-src 'self' 'unsafe-inline' \
-             https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; \
-             img-src 'self' data: https://cdn.jsdelivr.net https://*.tile.openstreetmap.org",
+             form-action 'self'; connect-src 'self' https://tiles.openfreemap.org; \
+             worker-src blob:; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; \
+             style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; \
+             img-src 'self' data: blob: https://cdn.jsdelivr.net https://tiles.openfreemap.org",
         ),
     );
     headers.insert(
@@ -257,8 +263,10 @@ struct ListQuery {
     direction: Option<String>,
     /// Only messages to or from this station (a conversation).
     peer: Option<String>,
-    /// "chat" or "mail".
+    /// "chat", "mail" or "bulletin".
     kind: Option<String>,
+    /// Bulletin group name (matches `group:NAME` in `to`).
+    group: Option<String>,
     limit: Option<usize>,
 }
 
@@ -352,13 +360,24 @@ async fn messages(
         None => None,
         Some("chat") => Some("Chat"),
         Some("mail") => Some("Mail"),
-        Some(other) => return Err(bad(format!("kind must be chat or mail, not {other:?}"))),
+        Some("bulletin") => Some("Bulletin"),
+        Some(other) => {
+            return Err(bad(format!(
+                "kind must be chat, mail or bulletin, not {other:?}"
+            )))
+        }
     };
+    let group = q
+        .group
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|g| format!("group:{g}"));
     let limit = q.limit.unwrap_or(100).min(1000);
     let store = s.store.clone();
     tokio::task::spawn_blocking(move || {
         // Filters apply to the newest 1000 of each direction.
-        let scan = if peer.is_some() || kind.is_some() {
+        let scan = if peer.is_some() || kind.is_some() || group.is_some() {
             1000
         } else {
             limit
@@ -371,6 +390,9 @@ async fn messages(
                 let with = |p: &String| v.peer == *p || v.from.as_ref() == Some(p) || v.to.contains(p);
                 if peer.as_ref().is_some_and(|p| !with(p))
                     || kind.is_some_and(|k| v.kind.as_deref() != Some(k))
+                    || group
+                        .as_ref()
+                        .is_some_and(|g| !v.to.iter().any(|t| t == g || t.eq_ignore_ascii_case(g)))
                 {
                     continue;
                 }
@@ -437,6 +459,10 @@ struct SendRequest {
     text: String,
     subject: Option<String>,
     precedence: Option<String>,
+    /// `"bulletin"` publishes an RF group bulletin (`to` is the group name).
+    kind: Option<String>,
+    /// Alternate to `to` when `kind` is bulletin.
+    group: Option<String>,
 }
 
 fn parse_precedence(p: Option<&str>) -> Result<Precedence, ApiError> {
@@ -449,14 +475,70 @@ fn parse_precedence(p: Option<&str>) -> Result<Precedence, ApiError> {
     })
 }
 
+fn admit_bulletin_publish(times: &mut VecDeque<u64>, now: u64) -> bool {
+    let hour_ago = now.saturating_sub(3600);
+    while times.front().is_some_and(|t| *t < hour_ago) {
+        times.pop_front();
+    }
+    if times.len() >= MAX_BULLETINS_PER_HOUR {
+        return false;
+    }
+    times.push_back(now);
+    true
+}
+
 async fn send(
     State(s): State<AppState>,
     Json(req): Json<SendRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let to = Callsign::parse(req.to.trim()).map_err(|e| bad(format!("to: {e}")))?;
     if req.text.is_empty() {
         return Err(bad("text is empty"));
     }
+    let is_bulletin = matches!(req.kind.as_deref(), Some("bulletin")) || req.group.is_some();
+    if is_bulletin {
+        let group = req
+            .group
+            .as_deref()
+            .or(Some(req.to.as_str()))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| bad("group name required"))?;
+        if req.precedence.as_deref().is_some_and(|p| p != "routine") {
+            return Err(bad("bulletins are routine precedence only"));
+        }
+        let now = unix_now();
+        {
+            let mut times = s.bulletin_publishes.lock().expect("lock");
+            if !admit_bulletin_publish(&mut times, now) {
+                return Err(ApiError(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!("at most {MAX_BULLETINS_PER_HOUR} bulletins per hour"),
+                ));
+            }
+        }
+        let subject = req.subject.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let bundle = build_bulletin(&s.cfg.key, s.cfg.me, group, &req.text, subject)
+            .map_err(|e| bad(e.to_string()))?;
+        let (id, bytes) = (bundle.id(), bundle.to_vec());
+        if bytes.len() > MAX_BULLETIN_BYTES {
+            return Err(bad(format!(
+                "bulletin too large ({} bytes; max {MAX_BULLETIN_BYTES})",
+                bytes.len()
+            )));
+        }
+        let peer = hm_xfer::broadcast_peer();
+        let store = s.store.clone();
+        tokio::task::spawn_blocking(move || store.enqueue(id, &bytes, peer, 0, unix_now()))
+            .await
+            .map_err(internal)?
+            .map_err(internal)?;
+        s.notify.send("message");
+        return Ok((
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "id": id.to_string() })),
+        ));
+    }
+    let to = Callsign::parse(req.to.trim()).map_err(|e| bad(format!("to: {e}")))?;
     let prec = parse_precedence(req.precedence.as_deref())?;
     let subject = req.subject.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let bundle =

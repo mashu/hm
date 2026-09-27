@@ -1030,6 +1030,80 @@ fn trusted_stations_change_while_the_node_runs() {
     std::fs::remove_file(&trust_file).unwrap();
 }
 
+/// A radio-only node can gain an internet peer without a restart: the dial
+/// stack starts when the first peer is added.
+#[test]
+fn internet_peer_added_while_radio_only_node_runs() {
+    let tnc = fake_tnc(0);
+    let (alice, bob) = keys();
+    let (a_db, h_db) = (Tmp::new("dial-later-a"), Tmp::new("dial-later-h"));
+    let settings = std::env::temp_dir().join(format!(
+        "hm-node-dial-later-{}.toml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &settings,
+        format!(
+            "[[trust]]\nstation = {:?}\nkey = {:?}\n",
+            bob.call.to_string(),
+            {
+                let line = bob.trust_line();
+                line.split_once(' ').unwrap().1.to_string()
+            }
+        ),
+    )
+    .unwrap();
+    let hub = start(Setup {
+        key: &bob,
+        me: "SO5KM",
+        peer: &alice,
+        also: &[],
+        tnc: None,
+        internet: Some(InternetConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            peers: vec![],
+        }),
+        store: &h_db,
+        retry: QUICK,
+        beacon_every: None,
+        trust_file: None,
+    });
+    let a = start(Setup {
+        key: &alice,
+        me: "SA0KAM",
+        peer: &bob,
+        also: &[],
+        tnc: Some(tnc.addr),
+        internet: None,
+        store: &a_db,
+        retry: QUICK,
+        beacon_every: None,
+        trust_file: Some(settings.clone()),
+    });
+    assert!(get(a.http_addr, "/api/status")["internet_listen"].is_null());
+    let hub_addr = hub.internet_addr.unwrap();
+    let (status, body) = http(
+        a.http_addr,
+        "PATCH",
+        "/api/settings",
+        Some(&json!({
+            "peers": [{"station": "SO5KM", "address": hub_addr.to_string()}]
+        })),
+        Some(TOKEN),
+    );
+    assert_eq!(status, 200, "{body}");
+    wait_for(Duration::from_secs(15), "internet dial after peer add", || {
+        let st = get(a.http_addr, "/api/status");
+        (st["internet_peers"] == json!(["SO5KM"]) && !st["internet_listen"].is_null()).then_some(())
+    });
+    send(a.http_addr, json!({"to": "SO5KM", "text": "dialled after start"}));
+    delivered(a.http_addr, 1, "internet delivery without restart");
+    assert_eq!(inbox(hub.http_addr)[0]["text"], "dialled after start");
+    a.stop().unwrap();
+    hub.stop().unwrap();
+    let _ = std::fs::remove_file(&settings);
+}
+
 /// Radio settings change without a restart: the node opens the link the new
 /// settings describe, and mail waiting for the radio goes out on it.
 #[test]

@@ -30,6 +30,8 @@ enum Connection {
     Kiss,
     BuiltIn,
     InternetOnly,
+    /// Public hub: listen on the internet, relay and mailbox on, no radio.
+    CoreNode,
 }
 
 impl Connection {
@@ -38,6 +40,7 @@ impl Connection {
             Connection::Kiss => "KISS TNC / Direwolf",
             Connection::BuiltIn => "built-in sound-card modem",
             Connection::InternetOnly => "internet only",
+            Connection::CoreNode => "core node (cloud hub)",
         }
     }
 }
@@ -85,6 +88,7 @@ impl<R: BufRead, W: Write> Wizard<'_, R, W> {
         self.say("  1. KISS TNC or Direwolf (default)")?;
         self.say("  2. Built-in sound-card modem")?;
         self.say("  3. Internet only (no radio)")?;
+        self.say("  4. Core node — hub for other stations (no radio; for a cloud server)")?;
         loop {
             let Some(answer) = self.answer("Connection [1]: ")? else {
                 return Ok(None);
@@ -93,7 +97,8 @@ impl<R: BufRead, W: Write> Wizard<'_, R, W> {
                 "" | "1" => return Ok(Some(Connection::Kiss)),
                 "2" => return Ok(Some(Connection::BuiltIn)),
                 "3" => return Ok(Some(Connection::InternetOnly)),
-                _ => self.say("Enter 1, 2, or 3.")?,
+                "4" => return Ok(Some(Connection::CoreNode)),
+                _ => self.say("Enter 1, 2, 3, or 4.")?,
             }
         }
     }
@@ -260,6 +265,16 @@ fn path_error(path: &Path, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("{}: {error}", path.display()))
 }
 
+/// Key/store basename from the config path: `core.toml` → `core.key` / `core.db`.
+fn companion_name(config_path: &Path, extension: &str) -> PathBuf {
+    let stem = config_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("station");
+    PathBuf::from(format!("{stem}.{extension}"))
+}
+
 fn ensure_paths_available(config_path: &Path, key_path: &Path) -> io::Result<()> {
     if config_path == key_path {
         return Err(io::Error::new(
@@ -295,7 +310,8 @@ fn run_with_io<R: BufRead, W: Write>(
     input: &mut R,
     output: &mut W,
 ) -> io::Result<SetupOutcome> {
-    let key_setting = PathBuf::from("station.key");
+    let key_setting = companion_name(config_path, "key");
+    let store_setting = companion_name(config_path, "db");
     let key_path = config::dir_of(config_path).join(&key_setting);
     ensure_paths_available(config_path, &key_path)?;
 
@@ -312,6 +328,7 @@ fn run_with_io<R: BufRead, W: Write>(
 
     let mut config = Config::default();
     config.station.key = key_setting;
+    config.station.store = store_setting;
     let connection_detail = match connection {
         Connection::Kiss => {
             let Some(endpoint) = wizard.kiss_endpoint()? else {
@@ -340,6 +357,13 @@ fn run_with_io<R: BufRead, W: Write>(
             config.radio.beacon_minutes = 0;
             "radio disabled".to_string()
         }
+        Connection::CoreNode => {
+            config.radio.enabled = false;
+            config.radio.beacon_minutes = 0;
+            config.relay.enabled = true;
+            config.relay.mailbox = true;
+            "hub: radio off; relay and mailbox on".to_string()
+        }
     };
 
     let Some(locator) = wizard.locator()? else {
@@ -347,36 +371,50 @@ fn run_with_io<R: BufRead, W: Write>(
     };
     config.station.locator = locator;
 
-    let listen_default = connection == Connection::InternetOnly;
-    let Some(enable_listener) = wizard.yes_no(
-        "\nAccept authenticated connections from trusted internet stations?",
-        listen_default,
-    )?
-    else {
-        return Ok(SetupOutcome::Cancelled);
-    };
-    if enable_listener {
+    if connection == Connection::CoreNode {
+        wizard.say("\nA core node is a meeting point on the internet for stations you trust.")?;
+        wizard.say(
+            "Run it on a computer with a public address (a small rented cloud server works well).",
+        )?;
+        wizard.say("Allow UDP port 4433 through the firewall so home stations can dial in.")?;
         let Some(address) = wizard.listen_address()? else {
             return Ok(SetupOutcome::Cancelled);
         };
         config.internet.listen = Some(address);
-    } else if connection == Connection::InternetOnly {
-        wizard.say("Note: add an internet peer before starting this internet-only node.")?;
+    } else {
+        let listen_default = connection == Connection::InternetOnly;
+        let Some(enable_listener) = wizard.yes_no(
+            "\nAccept authenticated connections from trusted internet stations?",
+            listen_default,
+        )?
+        else {
+            return Ok(SetupOutcome::Cancelled);
+        };
+        if enable_listener {
+            let Some(address) = wizard.listen_address()? else {
+                return Ok(SetupOutcome::Cancelled);
+            };
+            config.internet.listen = Some(address);
+        } else if connection == Connection::InternetOnly {
+            wizard.say("Note: add an internet peer before starting this internet-only node.")?;
+        }
+
+        let Some(relay) = wizard.yes_no(
+            "\nRelay messages when both the sender and final receiver are trusted?",
+            false,
+        )?
+        else {
+            return Ok(SetupOutcome::Cancelled);
+        };
+        config.relay.enabled = relay;
+
+        let Some(mailbox) =
+            wizard.yes_no("Hold mailbox traffic for offline trusted stations?", false)?
+        else {
+            return Ok(SetupOutcome::Cancelled);
+        };
+        config.relay.mailbox = mailbox;
     }
-
-    let Some(relay) = wizard.yes_no(
-        "\nRelay messages when both the sender and final receiver are trusted?",
-        false,
-    )?
-    else {
-        return Ok(SetupOutcome::Cancelled);
-    };
-    config.relay.enabled = relay;
-
-    let Some(mailbox) = wizard.yes_no("Hold mailbox traffic for offline trusted stations?", false)? else {
-        return Ok(SetupOutcome::Cancelled);
-    };
-    config.relay.mailbox = mailbox;
 
     wizard.say("\nConfiguration summary:")?;
     wizard.say(format!("  Callsign: {call}"))?;
@@ -419,9 +457,29 @@ fn run_with_io<R: BufRead, W: Write>(
     let key = save_setup(config_path, &key_path, &config, call)?;
     wizard.say(format!("\nWrote {}.", key_path.display()))?;
     wizard.say(format!("Wrote {}.", config_path.display()))?;
+    let config_flag = config_path
+        .to_str()
+        .filter(|p| *p != config::DEFAULT_PATH)
+        .map(|p| format!(" --config {p}"))
+        .unwrap_or_default();
     wizard.say("Other stations can trust this station with:")?;
     wizard.say(format!("  hm trust add {:?}", key.trust_line()))?;
-    wizard.say("Next: review station.toml, add trusted peers, then run `hm node`.")?;
+    if connection == Connection::CoreNode {
+        wizard.say("On each home station: trust this core node, then add under [internet]:")?;
+        wizard.say(format!(
+            "  [[internet.peers]]\n  station = {:?}\n  address = \"YOUR.SERVER.HOST:4433\"",
+            call.to_string()
+        ))?;
+        wizard.say(format!(
+            "On this core node: trust each home station (`hm{config_flag} trust add` their whoami line)."
+        ))?;
+        wizard.say(format!("Then run `hm{config_flag} node` here."))?;
+    } else {
+        wizard.say(format!(
+            "Next: review {}, add trusted peers, then run `hm{config_flag} node`.",
+            config_path.display()
+        ))?;
+    }
     Ok(SetupOutcome::Complete)
 }
 
@@ -517,6 +575,27 @@ mod tests {
         assert!(!config.radio.enabled);
         assert_eq!(config.radio.beacon_minutes, 0);
         assert_eq!(config.internet.listen.as_deref(), Some("0.0.0.0:4433"));
+        assert!(!config.relay.enabled);
+        assert!(!config.relay.mailbox);
+    }
+
+    #[test]
+    fn core_node_enables_listener_relay_and_mailbox() {
+        let dir = TestDir::new("core");
+        // callsign, connection 4, locator empty, listen default, write yes
+        let script = "SM0HUB-1\n4\n\n\n\n";
+        let (outcome, output) = run_script(&dir, script, AudioDevices::default());
+        assert_eq!(outcome.unwrap(), SetupOutcome::Complete, "{output}");
+
+        let config = Config::load(&dir.config()).unwrap();
+        assert!(!config.radio.enabled);
+        assert_eq!(config.radio.beacon_minutes, 0);
+        assert_eq!(config.internet.listen.as_deref(), Some("0.0.0.0:4433"));
+        assert!(config.relay.enabled);
+        assert!(config.relay.mailbox);
+        assert!(output.contains("cloud server") || output.contains("core node"), "{output}");
+        assert!(output.contains("hm trust add"), "{output}");
+        assert!(output.contains("[[internet.peers]]"), "{output}");
     }
 
     #[test]
@@ -548,5 +627,28 @@ mod tests {
             fs::read_to_string(dir.0.join("station.key")).unwrap(),
             "existing private key\n"
         );
+    }
+
+    #[test]
+    fn named_config_uses_matching_key_beside_existing_station() {
+        let dir = TestDir::new("named");
+        fs::write(dir.0.join("station.key"), "home station key\n").unwrap();
+        fs::write(dir.0.join("station.toml"), "home station config\n").unwrap();
+
+        let config = dir.0.join("core.toml");
+        let script = "SM0HUB-1\n4\n\n\n\n";
+        let mut input = io::Cursor::new(script.as_bytes());
+        let mut output = Vec::new();
+        let outcome = run_with_io(&config, &AudioDevices::default(), &mut input, &mut output);
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(outcome.unwrap(), SetupOutcome::Complete, "{text}");
+
+        assert_eq!(fs::read_to_string(dir.0.join("station.key")).unwrap(), "home station key\n");
+        assert!(dir.0.join("core.key").exists(), "{text}");
+        let written = Config::load(&config).unwrap();
+        assert_eq!(written.station.key, PathBuf::from("core.key"));
+        assert_eq!(written.station.store, PathBuf::from("core.db"));
+        assert!(text.contains("hm --config"), "{text}");
+        assert!(text.contains("core.toml"), "{text}");
     }
 }

@@ -10,7 +10,9 @@
 //!
 //! A coordinator routes every due message over a probabilistic contact graph,
 //! reserves capacity along the selected path, and transfers custody to its
-//! next hop. Everything that arrives over any bearer goes through one
+//! next hop only after a verified receipt. RF and ARQ transmissions are gated
+//! by [`rf_policy`]: the end-to-end origin must be this station or a trusted
+//! station. Everything that arrives over any bearer goes through one
 //! acceptance gate for destination delivery or relay custody.
 //!
 //! The HTTP thread serves the JSON API and web page behind an access token.
@@ -21,6 +23,7 @@ pub mod choose;
 mod control;
 pub mod heard;
 pub mod live;
+mod rf_policy;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
@@ -238,6 +241,11 @@ enum RadioCmd {
         to: Callsign,
         precedence: u8,
     },
+    /// RF bulletin: `Dest::Broadcast`, no ACK wait.
+    Broadcast {
+        object: Vec<u8>,
+        precedence: u8,
+    },
     Accept {
         from: Callsign,
         xfer_id: ObjectId,
@@ -347,6 +355,33 @@ struct AcceptanceGate<'a> {
     relay: &'a RelaySettings,
 }
 
+/// True when this origin already has too many inbound bulletins in the last hour.
+fn inbound_bulletin_flood(store: &Store, origin: Callsign, now: u64) -> bool {
+    let Ok(list) = store.list(Direction::In, 200) else {
+        return false;
+    };
+    let hour_ago = now.saturating_sub(3600);
+    let mut n = 0usize;
+    for record in list {
+        if record.at < hour_ago {
+            continue;
+        }
+        let Ok(Some(object)) = store.object(record.id) else {
+            continue;
+        };
+        let Ok(opened) = Opened::decode(&object) else {
+            continue;
+        };
+        if opened.bundle.kind == Kind::Bulletin && opened.bundle.from == origin {
+            n += 1;
+            if n >= crate::station::MAX_INBOUND_BULLETINS_PER_ORIGIN_HOUR {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// The one gate for final delivery and relay custody.
 fn accept(gate: AcceptanceGate<'_>, via: Callsign, object: &[u8]) -> Acceptance {
     let AcceptanceGate {
@@ -391,6 +426,37 @@ fn accept(gate: AcceptanceGate<'_>, via: Callsign, object: &[u8]) -> Acceptance 
             return Acceptance::Rejected(error.to_string());
         }
     }
+    // Bulletins are group-addressed RF posts: store locally, never receipt, never relay.
+    let bulletin_group = bundle.to.iter().find_map(|address| match address {
+        Address::Group(name) => Some(name.as_str()),
+        _ => None,
+    });
+    if bundle.kind == Kind::Bulletin {
+        if bulletin_group.is_none() {
+            return Acceptance::Rejected("bulletin requires a group address".into());
+        }
+        if inner.len() > crate::station::MAX_BULLETIN_BYTES {
+            return Acceptance::Rejected("bulletin too large".into());
+        }
+        if inbound_bulletin_flood(store, bundle.from, now) {
+            return Acceptance::Rejected("bulletin rate limit from this origin".into());
+        }
+        return match store.put_received(m.id, inner, via, verified, now) {
+            Ok(true) => {
+                log(format!(
+                    "bulletin {} from {} via {via} group {}{}",
+                    short(&m.id),
+                    bundle.from,
+                    bulletin_group.unwrap_or("?"),
+                    if verified { "" } else { " (unverified)" }
+                ));
+                notify.send("message");
+                Acceptance::Stored
+            }
+            Ok(false) => Acceptance::Duplicate,
+            Err(error) => Acceptance::Rejected(format!("store: {error}")),
+        };
+    }
     if our_recipient.is_none() {
         if !relay.enabled && !relay.mailbox {
             return Acceptance::Rejected(format!("not addressed to {me}; relay disabled"));
@@ -408,9 +474,9 @@ fn accept(gate: AcceptanceGate<'_>, via: Callsign, object: &[u8]) -> Acceptance 
         if destinations.next().is_some() {
             return Acceptance::Rejected("multi-recipient relay is not supported".into());
         }
-        if trust.key_for(destination).is_none() {
-            return Acceptance::Rejected(format!("relay destination {destination} is not trusted"));
-        }
+        // Destination need not be in the local trust list: RF authorization is
+        // re-checked at transmission time against the verified origin, and each
+        // hop authenticates only its next custodian.
         let max_hops = bundle.max_hops().min(relay.max_hops);
         if hop_count >= max_hops || visited.contains(&me) {
             return Acceptance::Rejected("hop limit or routing loop".into());
@@ -478,6 +544,23 @@ fn accept(gate: AcceptanceGate<'_>, via: Callsign, object: &[u8]) -> Acceptance 
             Acceptance::Duplicate
         };
     }
+    // Unverified final deliveries are stored but not acknowledged: a receipt
+    // would be locally originated and could consume RF for an unauthorized party.
+    if !verified {
+        return match store.put_received(m.id, inner, via, false, now) {
+            Ok(true) => {
+                log(format!(
+                    "received {} from {} via {via} (unverified; no receipt)",
+                    short(&m.id),
+                    bundle.from
+                ));
+                notify.send("message");
+                Acceptance::Stored
+            }
+            Ok(false) => Acceptance::Duplicate,
+            Err(error) => Acceptance::Rejected(format!("store: {error}")),
+        };
+    }
     let receipt_ttl = bundle
         .expires_at()
         .saturating_sub(now)
@@ -502,7 +585,7 @@ fn accept(gate: AcceptanceGate<'_>, via: Callsign, object: &[u8]) -> Acceptance 
         id: m.id,
         object: inner,
         from: via,
-        verified,
+        verified: true,
     };
     let reply = QueuedMessage {
         id: receipt.id(),
@@ -515,10 +598,9 @@ fn accept(gate: AcceptanceGate<'_>, via: Callsign, object: &[u8]) -> Acceptance 
     match store.receive_with_reply(received, reply, now) {
         Ok(true) => {
             log(format!(
-                "received {} from {} via {via} ({})",
+                "received {} from {} via {via} (verified)",
                 short(&m.id),
-                bundle.from,
-                if verified { "verified" } else { "unverified" }
+                bundle.from
             ));
             notify.send("message");
             Acceptance::Stored
@@ -561,6 +643,8 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
     };
 
     // The internet endpoint is bound here so its address is known on return.
+    // If the node starts without internet, the coordinator can still open one
+    // later when dial peers are added (no restart).
     let (addr_tx, addr_rx) = mpsc::channel::<io::Result<Option<SocketAddr>>>();
     let main = {
         let (cfg, store, status, live, notify) = (
@@ -578,53 +662,16 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                 .expect("tokio runtime");
             rt.block_on(async move {
                 let (net_control_tx, net_control_rx) = tokio::sync::mpsc::unbounded_channel();
-                let net = match &cfg.internet {
+                let mut net = match &cfg.internet {
                     None => None,
-                    Some(ic) => {
-                        let (store, gate_live, me, key_call, gate_identity, gate_notify, gate_relay) = (
-                            store.clone(),
-                            live.clone(),
-                            cfg.me,
-                            cfg.key.call,
-                            Identity::from_secret(cfg.key.identity.secret()),
-                            notify.clone(),
-                            cfg.relay.clone(),
-                        );
-                        let gate: hm_net::Accept = Arc::new(move |via, obj| {
-                            let current = gate_live.get();
-                            accept(
-                                AcceptanceGate {
-                                    store: &store,
-                                    notify: &gate_notify,
-                                    trust: &current.trust,
-                                    me,
-                                    key_call,
-                                    identity: &gate_identity,
-                                    relay: &gate_relay,
-                                },
-                                via,
-                                &obj,
-                            )
-                            .verdict()
-                        });
-                        let control: hm_net::Control = Arc::new(move |from, payload| {
-                            let _ = net_control_tx.send((from, payload));
-                        });
-                        let nc = NetConfig {
-                            me: cfg.me,
-                            secret: cfg.key.identity.secret(),
-                            trust: live.get().trust.iter().collect(),
-                            listen: ic.listen,
-                            dial: live.get().peers,
-                        };
-                        match Net::start_with_control(nc, gate, control) {
-                            Ok(n) => Some(n),
-                            Err(e) => {
-                                let _ = addr_tx.send(Err(e));
-                                return;
-                            }
+                    Some(ic) => match start_net(&cfg, &store, &live, &notify, ic.listen, net_control_tx.clone())
+                    {
+                        Ok(n) => Some(n),
+                        Err(e) => {
+                            let _ = addr_tx.send(Err(e));
+                            return;
                         }
-                    }
+                    },
                 };
                 let modem = cfg.modem.clone().map(|mc| {
                     let (store, gate_live, me, key_call, gate_identity, gate_notify, gate_relay) = (
@@ -666,6 +713,9 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                     status: status.clone(),
                     live: live.clone(),
                     notify: notify.clone(),
+                    bulletin_publishes: std::sync::Arc::new(std::sync::Mutex::new(
+                        std::collections::VecDeque::new(),
+                    )),
                 });
                 let http_listener = tokio::net::TcpListener::from_std(listener).expect("listener");
                 let mut http_shutdown = shutdown_rx.clone();
@@ -679,10 +729,11 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                 coordinator(
                     &cfg,
                     &store,
-                    net.clone(),
+                    &mut net,
                     modem,
                     radio_cmd_tx,
                     radio_evt_rx,
+                    net_control_tx,
                     net_control_rx,
                     &status,
                     &live,
@@ -889,16 +940,102 @@ fn live_advert(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn start_net(
+    cfg: &NodeConfig,
+    store: &Arc<Store>,
+    live: &Arc<LiveConfig>,
+    notify: &Notify,
+    listen: SocketAddr,
+    net_control_tx: tokio::sync::mpsc::UnboundedSender<(Callsign, Vec<u8>)>,
+) -> io::Result<Arc<Net>> {
+    let (store, gate_live, me, key_call, gate_identity, gate_notify, gate_relay) = (
+        Arc::clone(store),
+        Arc::clone(live),
+        cfg.me,
+        cfg.key.call,
+        Identity::from_secret(cfg.key.identity.secret()),
+        notify.clone(),
+        cfg.relay.clone(),
+    );
+    let gate: hm_net::Accept = Arc::new(move |via, obj| {
+        let current = gate_live.get();
+        accept(
+            AcceptanceGate {
+                store: &store,
+                notify: &gate_notify,
+                trust: &current.trust,
+                me,
+                key_call,
+                identity: &gate_identity,
+                relay: &gate_relay,
+            },
+            via,
+            &obj,
+        )
+        .verdict()
+    });
+    let control: hm_net::Control = Arc::new(move |from, payload| {
+        let _ = net_control_tx.send((from, payload));
+    });
+    let current = live.get();
+    Net::start_with_control(
+        NetConfig {
+            me: cfg.me,
+            secret: cfg.key.identity.secret(),
+            trust: current.trust.iter().collect(),
+            listen,
+            dial: current.peers,
+        },
+        gate,
+        control,
+    )
+}
+
+/// Open the internet stack when dial peers appear after a radio-only start.
+fn ensure_internet(
+    cfg: &NodeConfig,
+    store: &Arc<Store>,
+    live: &Arc<LiveConfig>,
+    notify: &Notify,
+    net: &mut Option<Arc<Net>>,
+    net_control_tx: &tokio::sync::mpsc::UnboundedSender<(Callsign, Vec<u8>)>,
+    status: &Mutex<Status>,
+) {
+    let peers = live.get().peers;
+    if net.is_some() || peers.is_empty() {
+        return;
+    }
+    let listen = cfg
+        .internet
+        .as_ref()
+        .map(|ic| ic.listen)
+        .unwrap_or_else(|| "0.0.0.0:0".parse().expect("valid"));
+    match start_net(cfg, store, live, notify, listen, net_control_tx.clone()) {
+        Ok(n) => {
+            let addr = n.local_addr().ok();
+            status.lock().expect("lock").internet_listen = addr;
+            log(format!(
+                "internet on {} (started for dial peers)",
+                addr.map_or_else(|| "unknown".into(), |a| a.to_string())
+            ));
+            *net = Some(n);
+            notify.send("status");
+        }
+        Err(error) => log(format!("could not start internet for dial peers: {error}")),
+    }
+}
+
 async fn coordinator(
     cfg: &NodeConfig,
-    store: &Store,
-    net: Option<Arc<Net>>,
+    store: &Arc<Store>,
+    net: &mut Option<Arc<Net>>,
     modem: Option<Arc<arq::Arq>>,
     radio_cmd: mpsc::Sender<RadioCmd>,
     mut radio_evt: tokio::sync::mpsc::UnboundedReceiver<RadioEvt>,
+    net_control_tx: tokio::sync::mpsc::UnboundedSender<(Callsign, Vec<u8>)>,
     mut net_control: tokio::sync::mpsc::UnboundedReceiver<(Callsign, Vec<u8>)>,
     status: &Mutex<Status>,
-    live: &LiveConfig,
+    live: &Arc<LiveConfig>,
     notify: &Notify,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -950,7 +1087,7 @@ async fn coordinator(
 
     let finish = |id: ObjectId,
                   flight: InFlight,
-                  outcome: Result<bool, (String, bool)>,
+                  outcome: Result<(), (String, bool)>,
                   chooser: &mut Chooser,
                   graph: &mut ContactGraph,
                   failed_contacts: &mut BTreeMap<ObjectId, BTreeMap<ContactKey, u64>>| {
@@ -958,7 +1095,7 @@ async fn coordinator(
         let peer = flight.peer;
         let bearer = flight.bearer;
         match outcome {
-            Ok(verified) => {
+            Ok(()) => {
                 chooser.record(peer, bearer, true, now);
                 let (key, evidence) = graph.record_delivery(cfg.me, peer, route_bearer(bearer), true, now);
                 if let Err(error) = store.save_contact_evidence(key, evidence) {
@@ -972,15 +1109,18 @@ async fn coordinator(
                         let _ = graph.release(hop.contact, flight.object_bytes);
                     }
                 }
-                if let Err(e) = store.custody_transferred(id, peer, verified, bearer.name(), now) {
-                    log(format!("store: {e}"));
+                match store.custody_transferred(id, peer, true, bearer.name(), now) {
+                    Ok(true) => log(format!(
+                        "custody of {} transferred to {peer} by {}",
+                        short(&id),
+                        bearer.name()
+                    )),
+                    Ok(false) => log(format!(
+                        "ignored late custody receipt for {} from {peer}",
+                        short(&id)
+                    )),
+                    Err(e) => log(format!("store: {e}")),
                 }
-                log(format!(
-                    "custody of {} transferred to {peer} by {}, receipt {}",
-                    short(&id),
-                    bearer.name(),
-                    if verified { "verified" } else { "unverified" }
-                ));
             }
             Err((reason, permanent)) => {
                 chooser.record(peer, bearer, false, now);
@@ -1202,12 +1342,35 @@ async fn coordinator(
                     receipt,
                 } => {
                     if let Some(id) = radio_ids.remove(&(xfer_id, to)) {
-                        if let Some(flight) = in_flight.remove(&(id, to)) {
-                            control.clear_request(id, to);
+                        if to == hm_xfer::broadcast_peer() {
+                            // Bulletin publish: no custody receipt expected.
+                            if let Some(flight) = in_flight.remove(&(id, to)) {
+                                for hop in &flight.route.hops {
+                                    let _ = graph.release(hop.contact, flight.object_bytes);
+                                }
+                            }
+                            match store.delivered(id, false, "radio", unix_now()) {
+                                Ok(()) => log(format!("published bulletin {}", short(&id))),
+                                Err(e) => log(format!("store: {e}")),
+                            }
+                            notify.send("message");
+                        } else if let Some(flight) = in_flight.remove(&(id, to)) {
+                            let outcome = match receipt {
+                                Receipt::Verified => {
+                                    control.clear_request(id, to);
+                                    Ok(())
+                                }
+                                Receipt::Unverified => Err((
+                                    format!(
+                                        "custody receipt from {to} is not verified; retaining custody"
+                                    ),
+                                    false,
+                                )),
+                            };
                             finish(
                                 id,
                                 flight,
-                                Ok(receipt == Receipt::Verified),
+                                outcome,
                                 &mut chooser,
                                 &mut graph,
                                 &mut failed_contacts,
@@ -1255,32 +1418,92 @@ async fn coordinator(
                 );
             }
             Some((id, peer, result)) = net_rx.recv() => {
-                let outcome = match result {
-                    Ok(()) => Ok(true),
-                    Err(NetError::Busy {
-                        retry_after,
-                        reason,
-                    }) => Err((format!("busy for {retry_after} s: {reason}"), false)),
-                    Err(NetError::Rejected(r)) => Err((format!("rejected: {r}"), false)),
-                    Err(e) => Err((e.to_string(), false)),
-                };
-                if let Some(flight) = in_flight.remove(&(id, peer)) {
-                    if outcome.is_ok() {
+                let bulletin = store
+                    .record(id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|r| r.final_destination() == hm_xfer::broadcast_peer());
+                if bulletin {
+                    if let Some(flight) = in_flight.remove(&(id, peer)) {
                         control.clear_request(id, peer);
+                        for hop in &flight.route.hops {
+                            let _ = graph.release(hop.contact, flight.object_bytes);
+                        }
+                        match result {
+                            Ok(()) => {
+                                match store.delivered(id, false, "internet", unix_now()) {
+                                    Ok(()) => log(format!(
+                                        "published bulletin {} to {peer} over the internet",
+                                        short(&id)
+                                    )),
+                                    Err(e) => log(format!("store: {e}")),
+                                }
+                            }
+                            Err(e) => {
+                                let reason = match e {
+                                    NetError::Busy {
+                                        retry_after,
+                                        reason,
+                                    } => format!("busy for {retry_after} s: {reason}"),
+                                    NetError::Rejected(r) => format!("rejected: {r}"),
+                                    other => other.to_string(),
+                                };
+                                log(format!(
+                                    "bulletin {} to {peer} failed: {reason}",
+                                    short(&id)
+                                ));
+                                // Retry only when nothing else is still carrying this id.
+                                if !in_flight.keys().any(|(flight_id, _)| *flight_id == id) {
+                                    match store.attempt_failed(
+                                        id,
+                                        &format!("{reason} (internet)"),
+                                        live.get().retry,
+                                        unix_now(),
+                                    ) {
+                                        Ok(Retry::At(t)) => log(format!(
+                                            "bulletin {}; next try in {} s",
+                                            short(&id),
+                                            t.saturating_sub(unix_now())
+                                        )),
+                                        Ok(Retry::GaveUp) => {
+                                            log(format!("gave up on bulletin {}", short(&id)))
+                                        }
+                                        Ok(Retry::Inactive) => {}
+                                        Err(err) => log(format!("store: {err}")),
+                                    }
+                                }
+                            }
+                        }
+                        notify.send("message");
                     }
-                    finish(
-                        id,
-                        flight,
-                        outcome,
-                        &mut chooser,
-                        &mut graph,
-                        &mut failed_contacts,
-                    );
+                } else {
+                    let outcome = match result {
+                        Ok(()) => Ok(()),
+                        Err(NetError::Busy {
+                            retry_after,
+                            reason,
+                        }) => Err((format!("busy for {retry_after} s: {reason}"), false)),
+                        Err(NetError::Rejected(r)) => Err((format!("rejected: {r}"), false)),
+                        Err(e) => Err((e.to_string(), false)),
+                    };
+                    if let Some(flight) = in_flight.remove(&(id, peer)) {
+                        if outcome.is_ok() {
+                            control.clear_request(id, peer);
+                        }
+                        finish(
+                            id,
+                            flight,
+                            outcome,
+                            &mut chooser,
+                            &mut graph,
+                            &mut failed_contacts,
+                        );
+                    }
                 }
             }
             Some((id, peer, result)) = modem_rx.recv() => {
                 let outcome = match result {
-                    Ok(()) => Ok(true),
+                    Ok(()) => Ok(()),
                     Err(e) if e.starts_with("refused: busy for ") => Err((e, false)),
                     Err(e) if e.starts_with("refused: ") => Err((e, true)),
                     Err(e) => Err((e, false)),
@@ -1308,11 +1531,20 @@ async fn coordinator(
                 if live.version() != live_version {
                     live_version = live.version();
                     notify.send("settings");
-                    let live = live.get();
-                    chooser.set_costs(live.costs);
-                    if let Some(n) = &net {
-                        n.set_trust(&live.trust.iter().collect::<Vec<_>>());
-                        n.set_dial(live.peers.clone());
+                    let snapshot = live.get();
+                    chooser.set_costs(snapshot.costs);
+                    ensure_internet(
+                        cfg,
+                        store,
+                        live,
+                        notify,
+                        net,
+                        &net_control_tx,
+                        status,
+                    );
+                    if let Some(n) = net.as_ref() {
+                        n.set_trust(&snapshot.trust.iter().collect::<Vec<_>>());
+                        n.set_dial(snapshot.peers.clone());
                     }
                 }
                 let now = unix_now();
@@ -1461,13 +1693,131 @@ async fn coordinator(
                         let _ = store.abandon(r.id, "bundle expired");
                         continue;
                     }
+                    if bundle.kind == Kind::Bulletin {
+                        let bulletin_peer = hm_xfer::broadcast_peer();
+                        let empty_route = || Route {
+                            hops: Vec::new(),
+                            arrival: now,
+                            airtime_millis: 0,
+                            success_probability: 1.0,
+                            risk_cost: 0.0,
+                        };
+                        // A peer asked for this bulletin over SYNC: send it on the internet.
+                        if let Some(peer) = control.target_for(r.id, now) {
+                            if net.as_ref().is_some_and(|network| network.is_connected(peer))
+                                && !in_flight.contains_key(&(r.id, peer))
+                            {
+                                in_flight.insert(
+                                    (r.id, peer),
+                                    InFlight {
+                                        bearer: Bearer::Internet,
+                                        peer,
+                                        route: empty_route(),
+                                        object_bytes: object.len() as u64,
+                                    },
+                                );
+                                let (network, tx, id) = (
+                                    net.clone().expect("checked connected"),
+                                    net_tx.clone(),
+                                    r.id,
+                                );
+                                let wire = object.clone();
+                                tokio::spawn(async move {
+                                    let result = network.deliver(peer, &wire).await;
+                                    let _ = tx.send((id, peer, result));
+                                });
+                                log(format!(
+                                    "sending bulletin {} to {peer} over the internet (requested)",
+                                    short(&r.id)
+                                ));
+                            }
+                            // Still fall through: RF publish / fan-out can proceed too.
+                        }
+                        if radio_up && !in_flight.contains_key(&(r.id, bulletin_peer)) {
+                            if let Err(error) = store.set_next_hop(r.id, bulletin_peer) {
+                                log(format!("store: {error}"));
+                                continue;
+                            }
+                            radio_ids.insert((hm_xfer::object_id(&object), bulletin_peer), r.id);
+                            in_flight.insert(
+                                (r.id, bulletin_peer),
+                                InFlight {
+                                    bearer: Bearer::Radio,
+                                    peer: bulletin_peer,
+                                    route: empty_route(),
+                                    object_bytes: object.len() as u64,
+                                },
+                            );
+                            let _ = radio_cmd.send(RadioCmd::Broadcast {
+                                object,
+                                precedence: r.precedence,
+                            });
+                            log(format!(
+                                "publishing bulletin {} on radio (attempt {})",
+                                short(&r.id),
+                                r.attempts + 1
+                            ));
+                            continue;
+                        }
+                        // No radio: push once to each connected internet peer.
+                        if !radio_up {
+                            let mut started = false;
+                            for peer in &links {
+                                if in_flight.contains_key(&(r.id, *peer)) {
+                                    continue;
+                                }
+                                if net.as_ref().is_none_or(|n| !n.is_connected(*peer)) {
+                                    continue;
+                                }
+                                in_flight.insert(
+                                    (r.id, *peer),
+                                    InFlight {
+                                        bearer: Bearer::Internet,
+                                        peer: *peer,
+                                        route: empty_route(),
+                                        object_bytes: object.len() as u64,
+                                    },
+                                );
+                                let (network, tx, id, peer) = (
+                                    net.clone().expect("checked"),
+                                    net_tx.clone(),
+                                    r.id,
+                                    *peer,
+                                );
+                                let wire = object.clone();
+                                tokio::spawn(async move {
+                                    let result = network.deliver(peer, &wire).await;
+                                    let _ = tx.send((id, peer, result));
+                                });
+                                log(format!(
+                                    "publishing bulletin {} to {peer} over the internet",
+                                    short(&r.id)
+                                ));
+                                started = true;
+                            }
+                            if !started {
+                                // Wait for radio or an internet link.
+                                continue;
+                            }
+                        }
+                        continue;
+                    }
                     let destination = r.final_destination();
-                    if r.direction == Direction::Relay && live.get().trust.key_for(destination).is_none() {
-                        let reason = format!("relay destination {destination} is no longer trusted");
+                    let origin = bundle.from;
+                    if r.direction == Direction::Relay
+                        && live.get().trust.key_for(origin).is_none()
+                    {
+                        let reason = format!("relay origin {origin} is no longer trusted");
                         let _ = store.abandon(r.id, &reason);
                         log(format!("stopped relaying {}: {reason}", short(&r.id)));
                         continue;
                     }
+                    let rf_ok = rf_policy::may_transmit_rf(
+                        origin,
+                        cfg.me,
+                        cfg.key.call,
+                        &live.get().trust,
+                    );
                     let requested_peer = control.target_for(r.id, now);
                     let route_destination = requested_peer.unwrap_or(destination);
                     let visited = r.visited.as_deref().unwrap_or(&[]);
@@ -1503,11 +1853,11 @@ async fn coordinator(
                         graph
                             .outgoing(cfg.me, now)
                             .filter(|contact| match contact.key.bearer {
-                                RouteBearer::Radio => !radio_up,
+                                RouteBearer::Radio => !radio_up || !rf_ok,
                                 RouteBearer::Internet => net
                                     .as_ref()
                                     .is_none_or(|network| !network.is_connected(contact.key.to)),
-                                RouteBearer::Modem => !modem_up,
+                                RouteBearer::Modem => !modem_up || !rf_ok,
                             })
                             .map(|contact| contact.key),
                     );
@@ -1531,7 +1881,7 @@ async fn coordinator(
                         ..RoutingPolicy::default()
                     };
                     let mut plan = plan_routes(&graph, &make_request(), policy);
-                    if plan.is_err() && radio_up {
+                    if plan.is_err() && radio_up && rf_ok {
                         let rate = live.get().radio.bitrate;
                         let _ = graph.observe_live_link(LiveContact {
                             from: cfg.me,
@@ -1571,12 +1921,12 @@ async fn coordinator(
                             continue;
                         }
                         let (bearer, available) = match first.contact.bearer {
-                            RouteBearer::Radio => (Bearer::Radio, radio_up),
+                            RouteBearer::Radio => (Bearer::Radio, radio_up && rf_ok),
                             RouteBearer::Internet => (
                                 Bearer::Internet,
                                 net.as_ref().is_some_and(|network| network.is_connected(first.contact.to)),
                             ),
-                            RouteBearer::Modem => (Bearer::Modem, modem_up),
+                            RouteBearer::Modem => (Bearer::Modem, modem_up && rf_ok),
                         };
                         if !available || in_flight.contains_key(&(r.id, first.contact.to)) {
                             continue;
@@ -1895,6 +2245,14 @@ fn radio_session(
                     }),
                     &mut out,
                 ),
+                RadioCmd::Broadcast { object, precedence } => x.handle(
+                    now(),
+                    Input::Command(Command::Broadcast {
+                        object,
+                        precedence,
+                    }),
+                    &mut out,
+                ),
                 RadioCmd::Accept {
                     from,
                     xfer_id,
@@ -2065,10 +2423,10 @@ mod tests {
     }
 
     #[test]
-    fn relay_requires_the_final_destination_to_be_trusted() {
+    fn relay_accepts_untrusted_destination_when_origin_verifies() {
         let sender = KeyFile::generate(call("SA0KAM")).unwrap();
         let relay = KeyFile::generate(call("SM0R1")).unwrap();
-        let destination = KeyFile::generate(call("SO5KM-1")).unwrap();
+        let destination = call("SO5KM-1");
         let path = std::env::temp_dir().join(format!("hm-relay-trust-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = Store::open(&path).unwrap();
@@ -2080,16 +2438,15 @@ mod tests {
         let bundle = build_bundle(
             &sender,
             sender.call,
-            destination.call,
+            destination,
             "relay policy",
             None,
             Precedence::Routine,
         )
         .unwrap()
         .to_vec();
-        let mut trust = Trust::default();
-        trust.insert(sender.call, sender.identity.public());
 
+        let mut trust = Trust::default();
         let rejected = accept(
             AcceptanceGate {
                 store: &store,
@@ -2105,11 +2462,11 @@ mod tests {
         );
         assert!(matches!(
             rejected,
-            Acceptance::Rejected(reason) if reason == "relay destination SO5KM-1 is not trusted"
+            Acceptance::Rejected(reason) if reason == "relay requires a verified sender"
         ));
         assert!(store.list(Direction::Relay, 10).unwrap().is_empty());
 
-        trust.insert(destination.call, destination.identity.public());
+        trust.insert(sender.call, sender.identity.public());
         let accepted = accept(
             AcceptanceGate {
                 store: &store,
@@ -2126,6 +2483,86 @@ mod tests {
         assert!(matches!(accepted, Acceptance::Stored));
         assert_eq!(store.list(Direction::Relay, 10).unwrap().len(), 1);
 
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unverified_final_delivery_stores_without_a_receipt() {
+        let sender = KeyFile::generate(call("SA0KAM")).unwrap();
+        let me = KeyFile::generate(call("SO5KM-1")).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("hm-unverified-receipt-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        let notify = Notify::new();
+        let bundle = build_bundle(
+            &sender,
+            sender.call,
+            me.call,
+            "hello",
+            None,
+            Precedence::Routine,
+        )
+        .unwrap()
+        .to_vec();
+        let trust = Trust::default();
+        let accepted = accept(
+            AcceptanceGate {
+                store: &store,
+                notify: &notify,
+                trust: &trust,
+                me: me.call,
+                key_call: me.call,
+                identity: &me.identity,
+                relay: &RelaySettings::default(),
+            },
+            sender.call,
+            &bundle,
+        );
+        assert!(matches!(accepted, Acceptance::Stored));
+        assert_eq!(store.list(Direction::In, 10).unwrap().len(), 1);
+        assert!(store.list(Direction::Out, 10).unwrap().is_empty());
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bulletin_stores_without_a_receipt_even_when_verified() {
+        let sender = KeyFile::generate(call("SA0KAM")).unwrap();
+        let me = KeyFile::generate(call("SO5KM-1")).unwrap();
+        let path = std::env::temp_dir().join(format!("hm-bulletin-accept-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        let notify = Notify::new();
+        let bundle = crate::station::build_bulletin(
+            &sender,
+            sender.call,
+            "SK-EMCOMM",
+            "net open",
+            Some("check-in"),
+        )
+        .unwrap()
+        .to_vec();
+        let mut trust = Trust::default();
+        trust.insert(sender.call, sender.identity.public());
+        let accepted = accept(
+            AcceptanceGate {
+                store: &store,
+                notify: &notify,
+                trust: &trust,
+                me: me.call,
+                key_call: me.call,
+                identity: &me.identity,
+                relay: &RelaySettings::default(),
+            },
+            sender.call,
+            &bundle,
+        );
+        assert!(matches!(accepted, Acceptance::Stored));
+        assert_eq!(store.list(Direction::In, 10).unwrap().len(), 1);
+        // No kind-5 receipt queued.
+        assert!(store.list(Direction::Out, 10).unwrap().is_empty());
         drop(store);
         std::fs::remove_file(path).unwrap();
     }

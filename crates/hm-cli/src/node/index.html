@@ -11,7 +11,7 @@
     --ok: #1e7a46; --warn: #9a6400; --bad: #b3261e;
     --mine: #0f5c8c; --mine-ink: #ffffff; --theirs: #ffffff; --theirs-ink: #17232b;
     --priority: #c99a00; --immediate: #d0620a; --flash: #c62828;
-    --radius: 10px;
+    --radius: 8px;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -25,7 +25,7 @@
   html, body { height: 100%; }
   body {
     margin: 0; background: var(--paper); color: var(--ink);
-    font: 16px/1.5 "Atkinson Hyperlegible", "Segoe UI", system-ui, -apple-system, sans-serif;
+    font: 15px/1.45 "Atkinson Hyperlegible", "Segoe UI", system-ui, -apple-system, sans-serif;
     font-variant-numeric: tabular-nums;
     display: flex; flex-direction: column; min-height: 100vh;
   }
@@ -34,99 +34,121 @@
   [hidden] { display: none !important; }
   code { font-size: 0.9em; }
 
-  /* Top bar */
   header.bar {
     background: var(--sheet); border-bottom: 1px solid var(--rule);
-    padding: 0.75rem clamp(1rem, 3vw, 2rem) 0; position: sticky; top: 0; z-index: 2;
+    padding: 0.45rem clamp(0.85rem, 2.5vw, 1.5rem) 0; position: sticky; top: 0; z-index: 2;
   }
-  .who-am-i { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem 1rem; }
-  h1 { margin: 0; font-size: clamp(1.6rem, 4.5vw, 2.2rem); line-height: 1.1; letter-spacing: 0.04em; font-weight: 800; }
-  .chips { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+  .who-am-i { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.2rem 0.85rem; }
+  h1 { margin: 0; font-size: clamp(1.35rem, 3.5vw, 1.85rem); line-height: 1.1; letter-spacing: 0.04em; font-weight: 800; }
+  .chips { display: flex; flex-wrap: wrap; gap: 0.35rem; }
   .chip {
-    display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.1rem 0.6rem; border-radius: 999px;
-    border: 1px solid var(--rule); font-size: 0.85rem; color: var(--muted); background: var(--raised);
+    display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.05rem 0.5rem; border-radius: 999px;
+    border: 1px solid var(--rule); font-size: 0.8rem; color: var(--muted); background: var(--raised);
   }
-  .chip::before { content: ""; width: 0.55rem; height: 0.55rem; border-radius: 50%; background: var(--muted); }
+  .chip::before { content: ""; width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--muted); }
   .chip.ok::before { background: var(--ok); } .chip.warn::before { background: var(--warn); } .chip.bad::before { background: var(--bad); }
   .chip.plain::before { display: none; }
-  nav.tabs { display: flex; gap: 0.25rem; margin-top: 0.6rem; overflow-x: auto; }
+  nav.tabs { display: flex; gap: 0.15rem; margin-top: 0.35rem; overflow-x: auto; }
   nav.tabs a {
-    padding: 0.5rem 0.9rem; color: var(--muted); text-decoration: none; font-weight: 700;
-    border-bottom: 3px solid transparent; white-space: nowrap;
+    padding: 0.4rem 0.75rem; color: var(--muted); text-decoration: none; font-weight: 700;
+    border-bottom: 3px solid transparent; white-space: nowrap; font-size: 0.95rem;
   }
   nav.tabs a[aria-current="page"] { color: var(--ink); border-bottom-color: var(--accent); }
   .badge {
-    display: inline-block; min-width: 1.3rem; padding: 0 0.35rem; margin-left: 0.3rem; border-radius: 999px;
-    background: var(--accent); color: var(--accent-ink); font-size: 0.75rem; text-align: center; line-height: 1.3rem;
+    display: inline-block; min-width: 1.2rem; padding: 0 0.3rem; margin-left: 0.25rem; border-radius: 999px;
+    background: var(--accent); color: var(--accent-ink); font-size: 0.72rem; text-align: center; line-height: 1.2rem;
   }
+  .filters { display: flex; flex-wrap: wrap; gap: 0.35rem; margin: 0 0 0.65rem; }
+  .filters button {
+    background: var(--raised); border: 1px solid var(--rule); border-radius: 999px; padding: 0.15rem 0.65rem;
+    color: var(--muted); font-weight: 650; cursor: pointer; font-size: 0.85rem;
+  }
+  .filters button[aria-pressed="true"] { color: var(--ink); border-color: var(--accent); background: var(--sheet); }
+  .bulletin { display: grid; grid-template-columns: minmax(0, 20rem) minmax(0, 1fr); gap: 0.75rem; align-items: start; }
+  @media (max-width: 52rem) { .bulletin { grid-template-columns: minmax(0, 1fr); } }
+  .bulletin-item { padding: 0.65rem 0; border-bottom: 1px solid var(--rule); }
+  .bulletin-item:last-child { border-bottom: 0; }
+  .bulletin-item .group { font-weight: 800; letter-spacing: 0.03em; }
+  .bulletin-item .meta { color: var(--muted); font-size: 0.8rem; }
+  .bulletin-item .subject { display: block; font-weight: 700; margin-top: 0.2rem; }
+  .bulletin-item .body { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 0.25rem; }
+  #bulletin-status { margin: 0.65rem 0 0; min-height: 1.4em; }
 
-  main { flex: 1; display: flex; flex-direction: column; padding: 1rem clamp(1rem, 3vw, 2rem) 2rem; gap: 1rem; }
-  .view { width: 100%; max-width: 72rem; margin: 0 auto; }
-  h2 { font-size: 1.1rem; margin: 0 0 0.6rem; }
-  .card { background: var(--sheet); border: 1px solid var(--rule); border-radius: var(--radius); padding: 1rem; }
+  main { flex: 1; display: flex; flex-direction: column; padding: 0.75rem clamp(0.85rem, 2.5vw, 1.5rem) 1.25rem; gap: 0.75rem; min-height: 0; }
+  .view { width: 100%; max-width: 78rem; margin: 0 auto; min-height: 0; }
+  h2 { font-size: 1rem; margin: 0 0 0.45rem; letter-spacing: 0.02em; }
+  h3.rail-title {
+    margin: 0; padding: 0.45rem 0.75rem 0.25rem; font-size: 0.72rem; font-weight: 800;
+    letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted);
+  }
+  .card { background: var(--sheet); border: 1px solid var(--rule); border-radius: var(--radius); padding: 0.85rem; }
   .hint { font-weight: 400; color: var(--muted); }
   .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
-  .empty { color: var(--muted); padding: 1rem 0; }
-  label { display: block; font-weight: 600; margin: 0.75rem 0 0.25rem; }
+  .empty { color: var(--muted); padding: 0.75rem; font-size: 0.9rem; }
+  label { display: block; font-weight: 600; margin: 0.65rem 0 0.2rem; }
   input, textarea, select {
-    width: 100%; padding: 0.5rem 0.6rem; background: var(--raised); border: 1px solid var(--rule); border-radius: 6px;
+    width: 100%; padding: 0.45rem 0.55rem; background: var(--raised); border: 1px solid var(--rule); border-radius: 6px;
   }
   textarea { resize: vertical; }
   .btn {
-    display: inline-block; margin-top: 1rem; padding: 0.55rem 1rem; border: 0; border-radius: 6px;
+    display: inline-block; margin-top: 0.85rem; padding: 0.5rem 0.9rem; border: 0; border-radius: 6px;
     background: var(--accent); color: var(--accent-ink); font-weight: 700; cursor: pointer; text-decoration: none;
   }
   .btn.quiet { background: none; color: var(--ink); border: 1px solid var(--rule); font-weight: 600; }
   .btn.danger { background: none; color: var(--bad); border: 1px solid currentColor; }
-  .btn.small { margin: 0; padding: 0.15rem 0.6rem; font-size: 0.85rem; }
+  .btn.small { margin: 0; padding: 0.12rem 0.5rem; font-size: 0.8rem; }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  #token-form { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; max-width: 40rem; margin: 0.5rem 0 0.75rem; }
+  #token-form { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; max-width: 40rem; margin: 0.4rem 0 0.5rem; }
   #token-form label { margin: 0; flex-basis: 100%; }
   #token-form input { flex: 1 1 16rem; width: auto; }
   #token-form .btn { margin: 0; }
 
   /* Chat */
-  .chat { display: grid; grid-template-columns: minmax(14rem, 20rem) minmax(0, 1fr); gap: 1rem; height: calc(100vh - 11rem); min-height: 26rem; }
+  .chat { display: grid; grid-template-columns: minmax(15rem, 21rem) minmax(0, 1fr); gap: 0.75rem; height: calc(100vh - 7.5rem); min-height: 24rem; }
   .convos { display: flex; flex-direction: column; min-height: 0; padding: 0; overflow: hidden; }
-  .convos form { display: flex; gap: 0.4rem; padding: 0.75rem; border-bottom: 1px solid var(--rule); }
+  .convos form { display: flex; gap: 0.35rem; padding: 0.6rem 0.65rem; border-bottom: 1px solid var(--rule); }
   .convos form input { text-transform: uppercase; }
   .convos form .btn { margin: 0; }
-  .convos ul { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
-  .convos li a {
-    display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 0.5rem; padding: 0.65rem 0.9rem;
+  .rail-scroll { overflow-y: auto; flex: 1; min-height: 0; }
+  .convos ul, .rail-list { list-style: none; margin: 0; padding: 0; }
+  .convos li a, .rail-list li a {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 0.45rem; padding: 0.5rem 0.75rem;
     color: inherit; text-decoration: none; border-bottom: 1px solid var(--rule);
   }
   .convos li a[aria-current="true"] { background: var(--raised); box-shadow: inset 3px 0 0 var(--accent); }
-  .convos .name { font-weight: 800; letter-spacing: 0.03em; }
-  .convos .time { color: var(--muted); font-size: 0.8rem; }
-  .convos .last { grid-column: 1 / -1; color: var(--muted); font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .convos li.empty { padding: 1rem; }
-  .convos-footer { margin: 0.6rem; }
+  .convos .name, .rail-list .name { font-weight: 800; letter-spacing: 0.03em; }
+  .convos .time, .rail-list .meta { color: var(--muted); font-size: 0.78rem; }
+  .convos .last, .rail-list .last {
+    grid-column: 1 / -1; color: var(--muted); font-size: 0.85rem;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .convos li.empty, .rail-list li.empty { padding: 0.65rem 0.75rem; border-bottom: 0; }
+  .convos-footer { margin: 0.5rem; }
   .thread { display: flex; flex-direction: column; min-height: 0; padding: 0; overflow: hidden; }
-  .thread-head { display: flex; align-items: center; gap: 0.75rem; padding: 0.7rem 1rem; border-bottom: 1px solid var(--rule); flex-wrap: wrap; }
+  .thread-head { display: flex; align-items: flex-start; gap: 0.6rem; padding: 0.55rem 0.85rem; border-bottom: 1px solid var(--rule); flex-wrap: wrap; }
   .thread-head h2 { margin: 0; letter-spacing: 0.04em; }
-  .thread-head .sub { color: var(--muted); font-size: 0.85rem; }
-  .thread-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-left: auto; }
-  .lines { list-style: none; margin: 0; padding: 1rem; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 0.35rem; }
-  .lines .day { align-self: center; color: var(--muted); font-size: 0.8rem; margin: 0.5rem 0; }
+  .thread-head .sub { color: var(--muted); font-size: 0.8rem; width: 100%; line-height: 1.35; }
+  .thread-actions { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-left: auto; }
+  .lines { list-style: none; margin: 0; padding: 0.85rem; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 0.3rem; }
+  .lines .day { align-self: center; color: var(--muted); font-size: 0.78rem; margin: 0.4rem 0; }
   .bubble {
-    max-width: min(34rem, 85%); padding: 0.45rem 0.75rem; border-radius: 14px; white-space: pre-wrap; overflow-wrap: anywhere;
+    max-width: min(34rem, 85%); padding: 0.4rem 0.7rem; border-radius: 12px; white-space: pre-wrap; overflow-wrap: anywhere;
     background: var(--theirs); color: var(--theirs-ink); border: 1px solid var(--rule); align-self: flex-start;
   }
   .bubble.mine { background: var(--mine); color: var(--mine-ink); border-color: transparent; align-self: flex-end; }
-  .bubble .meta { min-width: 0; flex: 1 1 12rem; font-size: 0.72rem; opacity: 0.78; }
+  .bubble .meta { min-width: 0; flex: 1 1 8rem; font-size: 0.7rem; opacity: 0.72; }
   .bubble.failed { box-shadow: inset 3px 0 0 var(--bad); }
   .bubble.cancelled { opacity: 0.7; }
   .bubble.unverified .meta { color: var(--warn); opacity: 1; }
   .message-footer {
-    display: flex; align-items: center; flex-wrap: wrap; gap: 0.15rem 0.4rem;
-    margin-top: 0.2rem; white-space: normal;
+    display: flex; align-items: center; flex-wrap: wrap; gap: 0.1rem 0.35rem;
+    margin-top: 0.15rem; white-space: normal;
   }
   .message-footer .state { display: inline; min-width: 0; flex: 1 1 12rem; margin: 0; font-size: 0.78rem; }
   .message-status {
-    display: inline-flex; align-items: center; width: fit-content; padding: 0 0.35rem;
+    display: inline-flex; align-items: center; width: fit-content; padding: 0 0.3rem;
     border: 1px solid currentColor; border-radius: 999px; color: var(--muted);
-    font-size: 0.62rem; font-weight: 800; letter-spacing: 0.04em; line-height: 1.05rem; text-transform: uppercase;
+    font-size: 0.6rem; font-weight: 800; letter-spacing: 0.04em; line-height: 1rem; text-transform: uppercase;
   }
   .message-status.ok { color: var(--ok); } .message-status.warn { color: var(--warn); } .message-status.bad { color: var(--bad); }
   .bubble.mine .message-status {
@@ -134,48 +156,74 @@
   }
   .message-actions { display: inline-flex; align-items: center; gap: 0.1rem; margin-left: auto; white-space: normal; }
   .message-action {
-    display: inline-flex; align-items: center; justify-content: center; min-height: 1.5rem; margin: 0; padding: 0 0.3rem;
+    display: inline-flex; align-items: center; justify-content: center; min-height: 1.4rem; margin: 0; padding: 0 0.25rem;
     border: 0; border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer;
-    font-size: 0.7rem; font-weight: 650; line-height: 1; opacity: 0.76; text-decoration: underline;
+    font-size: 0.68rem; font-weight: 650; line-height: 1; opacity: 0.7; text-decoration: underline;
     text-decoration-color: transparent; text-underline-offset: 0.18em;
   }
   .message-action.danger { color: var(--bad); }
   .message-action:hover, .message-action:focus-visible { opacity: 1; text-decoration-color: currentColor; }
   .message-action:disabled { cursor: not-allowed; opacity: 0.45; }
   .bubble.mine .message-action { color: var(--mine-ink); }
-  .composer { display: flex; gap: 0.5rem; padding: 0.75rem; border-top: 1px solid var(--rule); align-items: end; }
-  .composer textarea { min-height: 2.6rem; max-height: 10rem; resize: none; }
+  .composer { display: flex; gap: 0.45rem; padding: 0.6rem; border-top: 1px solid var(--rule); align-items: end; }
+  .composer textarea { min-height: 2.4rem; max-height: 10rem; resize: none; }
   .composer .btn { margin: 0; }
-  .placeholder { margin: auto; color: var(--muted); text-align: center; padding: 2rem; }
+  .placeholder { margin: auto; color: var(--muted); text-align: center; padding: 1.5rem; max-width: 28rem; }
   @media (max-width: 48rem) {
-    .chat { grid-template-columns: minmax(0, 1fr); height: calc(100vh - 10rem); }
+    .chat { grid-template-columns: minmax(0, 1fr); height: calc(100vh - 7rem); }
     .chat.open .convos { display: none; }
     .chat:not(.open) .thread { display: none; }
   }
 
   /* Mail */
-  .mail { display: grid; grid-template-columns: minmax(0, 22rem) minmax(0, 1fr); gap: 1rem; align-items: start; }
+  .mail { display: grid; grid-template-columns: minmax(0, 20rem) minmax(0, 1fr); gap: 0.75rem; align-items: start; }
   @media (max-width: 52rem) { .mail { grid-template-columns: minmax(0, 1fr); } }
   #to { text-transform: uppercase; font-weight: 700; letter-spacing: 0.04em; }
-  .subtabs { display: flex; border-bottom: 1px solid var(--rule); margin-bottom: 0.25rem; }
-  .subtabs button { background: none; border: 0; border-bottom: 3px solid transparent; padding: 0.5rem 0.9rem; font-weight: 700; color: var(--muted); cursor: pointer; }
+  .subtabs { display: flex; border-bottom: 1px solid var(--rule); margin-bottom: 0.2rem; }
+  .subtabs button { background: none; border: 0; border-bottom: 3px solid transparent; padding: 0.4rem 0.75rem; font-weight: 700; color: var(--muted); cursor: pointer; }
   .subtabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
   ol.log { list-style: none; margin: 0; padding: 0; }
   ol.log li {
-    display: grid; grid-template-columns: 5.5rem 7rem minmax(0, 1fr); gap: 0.25rem 1rem;
-    padding: 0.7rem 0.5rem 0.7rem 0.9rem; border-bottom: 1px solid var(--rule); border-left: 4px solid transparent;
+    display: grid; grid-template-columns: 5rem 6.5rem minmax(0, 1fr); gap: 0.2rem 0.75rem;
+    padding: 0.55rem 0.4rem 0.55rem 0.7rem; border-bottom: 1px solid var(--rule); border-left: 4px solid transparent;
   }
   ol.log li.p1 { border-left-color: var(--priority); } ol.log li.p2 { border-left-color: var(--immediate); } ol.log li.p3 { border-left-color: var(--flash); }
   ol.log li.unread .body { font-weight: 700; }
   ol.log li.empty { display: block; }
   @media (max-width: 34rem) { ol.log li { grid-template-columns: 4.5rem minmax(0, 1fr); } ol.log .body { grid-column: 1 / -1; } }
-  .when { color: var(--muted); }
+  .when { color: var(--muted); font-size: 0.85rem; }
   .who { font-weight: 700; letter-spacing: 0.03em; overflow-wrap: anywhere; }
   .body { overflow-wrap: anywhere; white-space: pre-wrap; }
   .subject { display: block; font-weight: 700; }
-  .state { display: block; font-size: 0.9rem; margin-top: 0.2rem; color: var(--muted); }
+  .state { display: block; font-size: 0.85rem; margin-top: 0.15rem; color: var(--muted); }
   .state.ok { color: var(--ok); } .state.warn { color: var(--warn); } .state.bad { color: var(--bad); }
-  #form-status { margin: 0.75rem 0 0; min-height: 1.5em; }
+  #form-status { margin: 0.65rem 0 0; min-height: 1.4em; }
+
+  /* Network */
+  .network { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0.75rem; align-items: start; }
+  .network .wide { grid-column: 1 / -1; }
+  @media (max-width: 52rem) { .network { grid-template-columns: minmax(0, 1fr); } .network .wide { grid-column: auto; } }
+  ul.list { list-style: none; margin: 0; padding: 0; }
+  ul.list li { display: flex; flex-wrap: wrap; gap: 0.2rem 0.5rem; align-items: baseline; padding: 0.5rem 0; border-bottom: 1px solid var(--rule); }
+  ul.list li:last-child { border-bottom: 0; }
+  ul.list .grow { flex: 1; min-width: 0; }
+  ul.list .detail { display: block; font-size: 0.85rem; color: var(--muted); }
+  ul.list .detail.ok { color: var(--ok); } ul.list .detail.warn { color: var(--warn); } ul.list .detail.bad { color: var(--bad); font-weight: 700; }
+  ul.list .key { display: block; color: var(--muted); font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #trust-note, #settings-note { font-size: 0.85rem; color: var(--muted); margin: 0.45rem 0 0; min-height: 1.3em; }
+  #trust-note.ok, #settings-note.ok { color: var(--ok); } #trust-note.bad, #settings-note.bad { color: var(--bad); }
+  .myline { overflow-wrap: anywhere; font-size: 0.85rem; margin-top: 0.75rem; }
+  .link-grid { display: grid; gap: 0.45rem; margin: 0; }
+  .link-grid dt { font-weight: 700; font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .link-grid dd { margin: 0 0 0.35rem; overflow-wrap: anywhere; }
+  table.data { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  table.data th, table.data td { text-align: left; padding: 0.4rem 0.35rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  table.data th { color: var(--muted); font-size: 0.75rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em; }
+  table.data td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .queue-row { display: flex; flex-wrap: wrap; gap: 0.25rem 0.6rem; align-items: baseline; padding: 0.45rem 0; border-bottom: 1px solid var(--rule); }
+  .queue-row:last-child { border-bottom: 0; }
+  .queue-row .peer { font-weight: 800; letter-spacing: 0.03em; }
+  .queue-row .snip { flex: 1 1 12rem; color: var(--muted); font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   /* Message detail */
   dialog {
@@ -192,46 +240,32 @@
     font: 0.78rem/1.4 ui-monospace, "SFMono-Regular", Consolas, monospace;
   }
 
-  /* Stations */
-  .stations { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1rem; align-items: start; }
-  @media (max-width: 52rem) { .stations { grid-template-columns: minmax(0, 1fr); } }
-  ul.list { list-style: none; margin: 0; padding: 0; }
-  ul.list li { display: flex; flex-wrap: wrap; gap: 0.25rem 0.6rem; align-items: baseline; padding: 0.6rem 0; border-bottom: 1px solid var(--rule); }
-  ul.list li:last-child { border-bottom: 0; }
-  ul.list .grow { flex: 1; min-width: 0; }
-  ul.list .detail { display: block; font-size: 0.9rem; color: var(--muted); }
-  ul.list .detail.ok { color: var(--ok); } ul.list .detail.warn { color: var(--warn); } ul.list .detail.bad { color: var(--bad); font-weight: 700; }
-  ul.list .key { display: block; color: var(--muted); font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #trust-note, #settings-note { font-size: 0.9rem; color: var(--muted); margin: 0.5rem 0 0; min-height: 1.4em; }
-  #trust-note.ok, #settings-note.ok { color: var(--ok); } #trust-note.bad, #settings-note.bad { color: var(--bad); }
-  .myline { overflow-wrap: anywhere; font-size: 0.9rem; }
-
   /* Settings */
   .settings { max-width: 46rem; }
-  fieldset { border: 0; margin: 0 0 1.25rem; padding: 0; }
-  legend { font-weight: 800; font-size: 1.05rem; padding: 0; margin-bottom: 0.25rem; }
-  .pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 0.75rem; }
-  .pair label { margin-top: 0.5rem; }
+  fieldset { border: 0; margin: 0 0 1.1rem; padding: 0; }
+  legend { font-weight: 800; font-size: 1.02rem; padding: 0; margin-bottom: 0.2rem; }
+  .pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 0.65rem; }
+  .pair label { margin-top: 0.45rem; }
   label.check { display: flex; gap: 0.5rem; align-items: center; }
   label.check input { width: auto; }
-  details { margin-top: 0.75rem; }
+  details { margin-top: 0.65rem; }
   summary { cursor: pointer; color: var(--muted); }
-  .peer { display: grid; grid-template-columns: minmax(0, 7rem) minmax(0, 1fr) auto; gap: 0.4rem; margin-top: 0.4rem; }
+  .peer { display: grid; grid-template-columns: minmax(0, 7rem) minmax(0, 1fr) auto; gap: 0.35rem; margin-top: 0.35rem; }
   .peer input:first-child { text-transform: uppercase; }
-  dl.fixed { margin: 0.75rem 0 0; font-size: 0.9rem; color: var(--muted); display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.1rem 0.75rem; }
+  dl.fixed { margin: 0.65rem 0 0; font-size: 0.85rem; color: var(--muted); display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.1rem 0.65rem; }
   dl.fixed dd { margin: 0; overflow-wrap: anywhere; }
-  .locator-row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: stretch; }
+  .locator-row { display: flex; flex-wrap: wrap; gap: 0.45rem; align-items: stretch; }
   .locator-row input { flex: 1 1 10rem; width: auto; }
   .locator-row .btn { margin: 0; white-space: nowrap; }
-  .locator-fuzz { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: end; margin-top: 0.5rem; }
+  .locator-fuzz { display: flex; flex-wrap: wrap; gap: 0.45rem 0.85rem; align-items: end; margin-top: 0.45rem; }
   .locator-fuzz > div { flex: 1 1 12rem; }
   .locator-fuzz label { margin-top: 0; }
   #locator-map {
-    height: 18rem; margin-top: 0.6rem; border: 1px solid var(--rule); border-radius: 6px;
+    height: 18rem; margin-top: 0.55rem; border: 1px solid var(--rule); border-radius: 6px;
     background: var(--raised); z-index: 0;
   }
   #locator-map .leaflet-container { height: 100%; width: 100%; border-radius: 6px; font: inherit; }
-  #locator-hint { font-size: 0.85rem; color: var(--muted); margin: 0.35rem 0 0; min-height: 1.2em; }
+  #locator-hint { font-size: 0.8rem; color: var(--muted); margin: 0.3rem 0 0; min-height: 1.2em; }
   #locator-hint.bad { color: var(--bad); } #locator-hint.ok { color: var(--ok); }
 </style>
 </head>
@@ -255,7 +289,8 @@
   <nav class="tabs" aria-label="Views">
     <a href="#chat" data-view="chat">Chat<span class="badge" id="badge-chat" hidden></span></a>
     <a href="#mail" data-view="mail">Mail<span class="badge" id="badge-mail" hidden></span></a>
-    <a href="#stations" data-view="stations">Stations</a>
+    <a href="#bulletin" data-view="bulletin">Bulletin<span class="badge" id="badge-bulletin" hidden></span></a>
+    <a href="#network" data-view="network">Network<span class="badge" id="badge-queue" hidden></span></a>
     <a href="#settings" data-view="settings">Settings</a>
   </nav>
 </header>
@@ -267,18 +302,25 @@
           <input id="new-chat-call" maxlength="9" placeholder="Callsign" aria-label="Start a chat with" spellcheck="false" required>
           <button class="btn" type="submit">Chat</button>
         </form>
-        <ul id="convos"></ul>
-        <button class="btn quiet small convos-footer" type="button" id="show-archived" hidden></button>
+        <div class="rail-scroll">
+          <h3 class="rail-title">Chats</h3>
+          <ul id="convos"></ul>
+          <button class="btn quiet small convos-footer" type="button" id="show-archived" hidden></button>
+          <h3 class="rail-title">On frequency</h3>
+          <ul class="rail-list" id="rail-heard"></ul>
+          <h3 class="rail-title">Trusted</h3>
+          <ul class="rail-list" id="rail-trust"></ul>
+        </div>
       </div>
       <div class="card thread">
         <div class="thread-head" id="thread-head" hidden>
           <h2 id="thread-call"></h2>
-          <span class="sub" id="thread-sub"></span>
           <div class="thread-actions">
             <button class="btn quiet small" type="button" id="archive-chat">Archive</button>
             <button class="btn danger small" type="button" id="clear-chat">Clear history</button>
             <a class="btn quiet small close-chat" href="#chat">Close</a>
           </div>
+          <span class="sub" id="thread-sub"></span>
         </div>
         <ol class="lines" id="lines" aria-live="polite"></ol>
         <form class="composer" id="composer" autocomplete="off" hidden>
@@ -319,8 +361,42 @@
     </div>
   </section>
 
-  <section class="view" id="view-stations" aria-label="Stations" hidden>
-    <div class="stations">
+  <section class="view" id="view-bulletin" aria-label="Bulletin" hidden>
+    <div class="bulletin">
+      <form class="card" id="bulletin-compose" autocomplete="off">
+        <h2>Publish</h2>
+        <p class="hint">Posts go to the radio when it is up, and to linked internet stations (who can also ask for ones they missed). At most four per hour; no delivery receipts.</p>
+        <label for="bulletin-group">Group</label>
+        <input id="bulletin-group" name="group" required maxlength="32" placeholder="SK-EMCOMM" spellcheck="false">
+        <label for="bulletin-subject">Subject <span class="hint">(optional)</span></label>
+        <input id="bulletin-subject" name="subject" maxlength="128">
+        <label for="bulletin-text">Message</label>
+        <textarea id="bulletin-text" name="text" rows="6" required></textarea>
+        <button class="btn" type="submit">Publish on radio</button>
+        <p id="bulletin-status" role="status"></p>
+      </form>
+      <div class="card">
+        <h2>Bulletins</h2>
+        <div class="filters" id="bulletin-filters" aria-label="Filter by group"></div>
+        <div id="bulletin-list" aria-live="polite"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="view" id="view-network" aria-label="Network" hidden>
+    <div class="network">
+      <div class="card">
+        <h2>Links</h2>
+        <dl class="link-grid" id="network-links"></dl>
+      </div>
+      <div class="card">
+        <h2>Outbound queue</h2>
+        <div id="network-queue"></div>
+      </div>
+      <div class="card wide">
+        <h2>Reachability</h2>
+        <div id="network-estimates"></div>
+      </div>
       <div class="card" id="heard-section">
         <h2>Heard on the radio</h2>
         <ul class="list" id="heard"></ul>
@@ -457,6 +533,7 @@ const hhmm = (unix) => new Date(unix * 1000).toISOString().slice(11, 16) + "Z";
 const day = (unix) => new Date(unix * 1000).toISOString().slice(0, 10);
 const ago = (s) => s < 90 ? s + " s ago" : s < 5400 ? Math.round(s / 60) + " min ago" : Math.round(s / 3600) + " h ago";
 const compass = (deg) => ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][Math.round(deg / 45) % 8] + " (" + deg + "°)";
+const pct = (p) => Math.round(p * 100) + "%";
 const KEY = {
   trusted: ["Key matches the one you trust", "ok"],
   unknown: ["Not among your trusted stations", "warn"],
@@ -465,6 +542,7 @@ const KEY = {
 let me = "";
 let status = null;
 let trusted = [];
+let outbox = [];
 
 // The token comes from the #token= link hm node prints, or the form; it stays in this browser.
 if (location.hash.startsWith("#token=")) {
@@ -486,10 +564,15 @@ const chip = (id, text, cls) => { const c = $(id); c.textContent = text; c.class
 const quietly = (p) => p.catch(() => {});
 
 // ---- Views -------------------------------------------------------------
-const VIEWS = ["chat", "mail", "stations", "settings"];
+const VIEWS = ["chat", "mail", "bulletin", "network", "settings"];
 
 function route() {
-  const [view, arg] = (location.hash.slice(1) || "chat").split("/");
+  let raw = location.hash.slice(1) || "chat";
+  if (raw === "stations" || raw.startsWith("stations/")) {
+    history.replaceState(null, "", location.pathname + "#network");
+    raw = "network";
+  }
+  const [view, arg] = raw.split("/");
   const name = VIEWS.includes(view) ? view : "chat";
   for (const v of VIEWS) $("view-" + v).hidden = v !== name;
   for (const a of document.querySelectorAll("nav.tabs a")) {
@@ -497,7 +580,12 @@ function route() {
   }
   if (name === "chat") openThread(arg ? decodeURIComponent(arg).toUpperCase() : null);
   if (name === "mail") quietly(loadMail());
-  if (name === "stations") quietly(loadTrust());
+  if (name === "bulletin") quietly(loadBulletins());
+  if (name === "network") {
+    quietly(loadTrust());
+    quietly(loadQueue());
+    renderNetwork();
+  }
   if (name === "settings") {
     quietly(loadSettings(true));
     quietly(ensureLocatorMap());
@@ -547,6 +635,17 @@ function saveArchivedChats() {
   localStorage.setItem("hm-archived-chats", JSON.stringify(archivedChats));
 }
 
+function estimatesFor(call) {
+  if (!status || !status.estimates) return [];
+  return status.estimates.filter((e) => e.station === call);
+}
+
+function pathHint(call) {
+  const rows = estimatesFor(call);
+  if (!rows.length) return "";
+  return rows.map((e) => e.bearer + " ~" + pct(e.success)).join(" · ");
+}
+
 async function loadChats() {
   const r = await api("/api/messages?direction=all&kind=chat&limit=1000");
   if (!r.ok) return;
@@ -589,12 +688,52 @@ function renderConvos() {
     ul.append(li);
   }
   if (visible === 0) {
-    ul.append(el("li", "empty", hiddenArchived ? "All chats are archived." : "No chats yet. Type a callsign above to start one."));
+    ul.append(el("li", "empty", hiddenArchived ? "All chats are archived." : "No chats yet. Pick a station below or type a callsign."));
   }
   $("show-archived").hidden = hiddenArchived === 0 && !showArchived;
   $("show-archived").textContent = showArchived ? "Hide archived" : "Show archived (" + hiddenArchived + ")";
   $("badge-chat").hidden = unread === 0;
   $("badge-chat").textContent = String(unread);
+}
+
+function renderRailHeard() {
+  const ul = $("rail-heard");
+  ul.replaceChildren();
+  const list = (status && status.heard) || [];
+  if (list.length === 0) {
+    ul.append(el("li", "empty", status && status.radio === null ? "No radio configured." : "Nobody heard yet."));
+    return;
+  }
+  for (const h of list.slice(0, 12)) {
+    const a = el("a");
+    a.href = "#chat/" + encodeURIComponent(h.station);
+    a.append(el("span", "name", h.station), el("span", "meta", ago(h.ago)));
+    const bits = [];
+    if (h.locator) bits.push(h.locator + (h.distance_km !== null && h.distance_km !== undefined ? ", " + h.distance_km + " km" : ""));
+    if (h.key) bits.push((KEY[h.key] || [h.key])[0]);
+    a.append(el("span", "last", bits.join(" · ") || "Heard on the air"));
+    const li = el("li");
+    li.append(a);
+    ul.append(li);
+  }
+}
+
+function renderRailTrust() {
+  const ul = $("rail-trust");
+  ul.replaceChildren();
+  if (trusted.length === 0) {
+    ul.append(el("li", "empty", "Nobody trusted yet. Add stations under Network."));
+    return;
+  }
+  for (const s of trusted) {
+    const a = el("a");
+    a.href = "#chat/" + encodeURIComponent(s.station);
+    a.append(el("span", "name", s.station), el("span", "meta", "trusted"));
+    a.append(el("span", "last", s.note || "Start a chat"));
+    const li = el("li");
+    li.append(a);
+    ul.append(li);
+  }
 }
 
 function openThread(call) {
@@ -605,7 +744,7 @@ function openThread(call) {
   renderConvos();
   if (!call) {
     $("lines").replaceChildren(el("li", "placeholder",
-      "Pick a conversation, or start one with a callsign. Lines go by radio or internet, whichever reaches the station."));
+      "Pick a conversation, someone On frequency, or a Trusted station — or type a callsign. Lines go by radio or internet, whichever reaches them."));
     return;
   }
   $("thread-call").textContent = call;
@@ -616,7 +755,7 @@ function openThread(call) {
 function describeLine(m) {
   const [, detail] = messageState(m);
   const cls = m.state === "Failed" ? "failed" : m.state === "Cancelled" ? "cancelled" : m.direction === "in" && !m.verified ? "unverified" : "";
-  return [hhmm(m.at) + " · " + detail, cls];
+  return [hhmm(m.at), detail, cls];
 }
 
 function dropButton(id) {
@@ -633,7 +772,7 @@ function dropButton(id) {
         const detail = await r.json().catch(() => ({}));
         throw new Error(detail.error || r.statusText);
       }
-      await Promise.all([loadChats(), loadMail()]);
+      await Promise.all([loadChats(), loadMail(), loadQueue()]);
     } catch (e) {
       b.disabled = false;
       b.textContent = "Drop";
@@ -651,7 +790,7 @@ async function deleteStoredMessage(m) {
     throw new Error(detail.error || r.statusText);
   }
   if ($("message-detail").open) $("message-detail").close();
-  await Promise.all([loadChats(), loadMail(), countMail()]);
+  await Promise.all([loadChats(), loadMail(), countMail(), loadQueue()]);
 }
 
 function messageActions(m) {
@@ -731,10 +870,11 @@ function renderThread() {
   let lastDay = "";
   for (const m of lines) {
     if (day(m.at) !== lastDay) { lastDay = day(m.at); ol.append(el("li", "day", lastDay)); }
-    const [meta, cls] = describeLine(m);
+    const [when, detail, cls] = describeLine(m);
     const li = el("li", "bubble " + (m.direction === "out" ? "mine " : "") + cls);
     const footer = el("span", "message-footer");
-    footer.append(statusBadge(m), el("span", "meta", meta), messageActions(m));
+    footer.append(statusBadge(m), el("span", "meta", when), messageActions(m));
+    footer.title = detail;
     li.append(
       el("span", null, m.text !== null ? m.text : "(no text)"),
       footer
@@ -742,19 +882,19 @@ function renderThread() {
     ol.append(li);
   }
   ol.scrollTop = ol.scrollHeight;
-  // The station's standing, from its beacon, the trust list and the links.
   const h = status && status.heard.find((x) => x.station === current);
   const t = trusted.find((x) => x.station === current);
   const bits = [t ? "trusted" + (t.note ? " · " + t.note : "") : "not trusted"];
   if (h) bits.push("heard " + ago(h.ago));
-  if (h && h.locator) bits.push(h.locator + (h.distance_km !== null ? ", " + h.distance_km + " km " + compass(h.bearing) : ""));
+  if (h && h.locator) bits.push(h.locator + (h.distance_km !== null && h.distance_km !== undefined ? ", " + h.distance_km + " km " + compass(h.bearing) : ""));
   if (status && status.internet_peers.includes(current)) bits.push("linked over the internet");
+  const path = pathHint(current);
+  if (path) bits.push(path);
   $("thread-sub").textContent = bits.join(" · ");
   const hasActive = lines.some(isActiveMessage);
   $("archive-chat").disabled = lines.length === 0 || hasActive;
   $("archive-chat").title = hasActive ? "Wait for or drop pending messages before archiving" : "Hide this chat until a new message arrives";
   $("clear-chat").disabled = lines.length === 0;
-  // Seen: mark read while the page is in front.
   if (!document.hidden) {
     for (const m of lines) if (m.state === "Unread") quietly(api("/api/read/" + m.id, { method: "POST" }));
   }
@@ -814,6 +954,7 @@ $("composer").addEventListener("submit", async (ev) => {
     $("line").value = "";
     autosize();
     loadChats();
+    loadQueue();
   } else {
     alert("Not sent: " + ((await r.json()).error || r.statusText));
   }
@@ -900,15 +1041,135 @@ $("compose").addEventListener("submit", async (ev) => {
     const j = await r.json();
     if (!r.ok) throw new Error(j.error);
     st.className = "ok";
-    st.textContent = "Queued for " + body.to + ". It goes out when a link allows; follow it under Sent.";
+    st.textContent = "Queued for " + body.to + ". It goes out when a link allows; follow it under Sent or Network.";
     f.text.value = ""; f.subject.value = "";
+    quietly(loadQueue());
   } catch (e) {
     st.className = "bad";
     st.textContent = "Not queued: " + e.message;
   }
 });
 
-// ---- Stations ----------------------------------------------------------
+// ---- Bulletin ----------------------------------------------------------
+let bulletinList = [];
+let bulletinFilter = "";
+
+function bulletinGroup(m) {
+  const g = (m.to || []).find((t) => t.startsWith("group:"));
+  return g ? g.slice(6) : "";
+}
+
+function bulletinState(m) {
+  if (m.direction === "out") {
+    if (m.state === "Delivered") return ["Published", "Sent on the radio (no per-listener receipts)", "ok"];
+    if (m.state === "Failed") return ["Failed", "Not published: " + (m.note || "gave up"), "bad"];
+    if (m.state === "Cancelled") return ["Cancelled", "Dropped from the local queue", ""];
+    if (m.state === "InTransit" || m.state === "Queued") return ["Pending", "Waiting for a clear channel", "warn"];
+  }
+  if (m.state === "Unread") {
+    return ["New", m.verified ? "Received · unread · verified" : "Received · unread · not verified", m.verified ? "ok" : "warn"];
+  }
+  return ["Received", m.verified ? "Received · verified" : "Received · not verified", m.verified ? "ok" : "warn"];
+}
+
+async function loadBulletins() {
+  const r = await api("/api/messages?direction=all&kind=bulletin&limit=200");
+  if (!r.ok) return;
+  bulletinList = await r.json();
+  renderBulletinFilters();
+  renderBulletins();
+  const unread = bulletinList.filter((m) => m.direction === "in" && m.state === "Unread").length;
+  $("badge-bulletin").hidden = unread === 0;
+  $("badge-bulletin").textContent = String(unread);
+}
+
+function renderBulletinFilters() {
+  const groups = [...new Set(bulletinList.map(bulletinGroup).filter(Boolean))].sort();
+  const box = $("bulletin-filters");
+  box.replaceChildren();
+  const all = el("button", null, "All");
+  all.type = "button";
+  all.setAttribute("aria-pressed", String(!bulletinFilter));
+  all.addEventListener("click", () => { bulletinFilter = ""; renderBulletinFilters(); renderBulletins(); });
+  box.append(all);
+  for (const g of groups) {
+    const b = el("button", null, g);
+    b.type = "button";
+    b.setAttribute("aria-pressed", String(bulletinFilter === g));
+    b.addEventListener("click", () => { bulletinFilter = g; renderBulletinFilters(); renderBulletins(); });
+    box.append(b);
+  }
+}
+
+function renderBulletins() {
+  const box = $("bulletin-list");
+  box.replaceChildren();
+  const list = bulletinList.filter((m) => !bulletinFilter || bulletinGroup(m) === bulletinFilter);
+  if (list.length === 0) {
+    box.append(el("p", "empty", bulletinFilter
+      ? "No bulletins in group " + bulletinFilter + " yet."
+      : "No bulletins yet. Publish one, or wait for a station on frequency."));
+    return;
+  }
+  for (const m of list) {
+    const item = el("div", "bulletin-item" + (m.state === "Unread" ? " unread" : ""));
+    const head = el("div");
+    const group = bulletinGroup(m) || "(no group)";
+    head.append(el("span", "group", group));
+    const who = m.direction === "out" ? "you" : (m.from || m.peer);
+    const [label, detail, cls] = bulletinState(m);
+    const badge = el("span", "message-status " + cls, label);
+    badge.title = detail;
+    head.append(el("span", "meta", " · " + who + " · " + hhmm(m.at) + " · "), badge);
+    item.append(head);
+    if (m.subject) item.append(el("span", "subject", m.subject));
+    item.append(el("div", "body", m.text !== null ? m.text : "(no text)"));
+    const footer = el("span", "message-footer");
+    footer.append(messageActions(m));
+    if (m.direction === "in" && m.state === "Unread") {
+      const b = el("button", "message-action", "Mark read");
+      b.type = "button";
+      b.addEventListener("click", () => quietly(api("/api/read/" + m.id, { method: "POST" }).then(loadBulletins)));
+      footer.append(b);
+    }
+    item.append(footer);
+    box.append(item);
+    if (!document.hidden && m.state === "Unread") {
+      quietly(api("/api/read/" + m.id, { method: "POST" }));
+    }
+  }
+}
+
+$("bulletin-compose").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const f = ev.target;
+  const st = $("bulletin-status");
+  const body = {
+    kind: "bulletin",
+    group: f.group.value.trim(),
+    to: f.group.value.trim(),
+    text: f.text.value,
+    subject: f.subject.value.trim() || undefined,
+  };
+  st.className = "";
+  st.textContent = "Publishing…";
+  try {
+    const r = await api("/api/send", Object.assign({ method: "POST" }, json(body)));
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    st.className = "ok";
+    st.textContent = "Queued for RF publish. It goes out when the channel is clear.";
+    f.text.value = "";
+    f.subject.value = "";
+    quietly(loadBulletins());
+    quietly(loadQueue());
+  } catch (e) {
+    st.className = "bad";
+    st.textContent = "Not published: " + e.message;
+  }
+});
+
+// ---- Network -----------------------------------------------------------
 function renderHeard(list) {
   const ul = $("heard");
   ul.replaceChildren();
@@ -921,13 +1182,20 @@ function renderHeard(list) {
     const main = el("span", "grow");
     main.append(el("strong", "who", h.station), el("span", "hint", " · " + ago(h.ago)));
     if (h.locator) {
-      main.append(el("span", "hint", " · " + h.locator + (h.distance_km !== null ? ", " + h.distance_km + " km " + compass(h.bearing) : "")));
+      main.append(el("span", "hint", " · " + h.locator + (h.distance_km !== null && h.distance_km !== undefined ? ", " + h.distance_km + " km " + compass(h.bearing) : "")));
     }
     if (h.key) {
       const [text, cls] = KEY[h.key] || [h.key, "warn"];
       main.append(el("span", "detail " + cls, text));
-      const offers = h.offers.length ? "Offers " + h.offers.join(", ") + ". " : "";
-      const hears = h.hears.length ? "Hears " + h.hears.join(", ") + "." : "Hears no one yet.";
+      const bits = [];
+      if (h.beacon_ago !== null && h.beacon_ago !== undefined) bits.push("beacon " + ago(h.beacon_ago));
+      if (h.clock_offset !== null && h.clock_offset !== undefined) {
+        const off = h.clock_offset;
+        bits.push("clock " + (off === 0 ? "in sync" : (off > 0 ? "+" : "") + off + " s"));
+      }
+      if (bits.length) main.append(el("span", "detail", bits.join(" · ")));
+      const offers = (h.offers && h.offers.length) ? "Offers " + h.offers.join(", ") + ". " : "";
+      const hears = (h.hears && h.hears.length) ? "Hears " + h.hears.join(", ") + "." : "Hears no one yet.";
       main.append(el("span", "detail", offers + hears));
     } else {
       main.append(el("span", "detail", "No beacon heard yet."));
@@ -939,6 +1207,110 @@ function renderHeard(list) {
   }
 }
 
+function renderLinks() {
+  const dl = $("network-links");
+  dl.replaceChildren();
+  if (!status) {
+    dl.append(el("dt", null, "Status"), el("dd", null, "Waiting for the node…"));
+    return;
+  }
+  const add = (k, v) => { dl.append(el("dt", null, k), el("dd", null, v)); };
+  if (status.radio === null) add("Radio", "not configured");
+  else add("Radio", (status.radio ? "up" : "down") + (status.radio_via ? " · " + status.radio_via : ""));
+  if (status.internet_listen || status.internet_peers.length) {
+    const parts = [];
+    if (status.internet_listen) parts.push("listening on " + status.internet_listen);
+    parts.push(status.internet_peers.length ? "peers: " + status.internet_peers.join(", ") : "no dialled peers linked");
+    add("Internet", parts.join(" · "));
+  } else {
+    add("Internet", "not configured");
+  }
+  if (status.modem === null) add("Modem", "none");
+  else {
+    const peer = status.modem_peer ? " · linked to " + status.modem_peer : "";
+    add("Modem", (!status.modem ? "down" : "ready") + peer + (status.modem_via ? " · " + status.modem_via : ""));
+  }
+  if (status.locator) add("Our grid", status.locator);
+}
+
+function renderEstimates() {
+  const box = $("network-estimates");
+  box.replaceChildren();
+  const list = (status && status.estimates) || [];
+  if (list.length === 0) {
+    box.append(el("p", "empty", "No delivery estimates yet. They appear once the node has contact evidence for a station."));
+    return;
+  }
+  const table = el("table", "data");
+  const thead = el("thead");
+  const hr = el("tr");
+  for (const h of ["Station", "Bearer", "Success"]) hr.append(el("th", null, h));
+  thead.append(hr);
+  table.append(thead);
+  const tbody = el("tbody");
+  for (const e of list) {
+    const tr = el("tr");
+    const call = el("td");
+    const a = el("a", null, e.station);
+    a.href = "#chat/" + encodeURIComponent(e.station);
+    call.append(a);
+    tr.append(call, el("td", null, e.bearer), el("td", "num", pct(e.success)));
+    tbody.append(tr);
+  }
+  table.append(tbody);
+  box.append(table);
+}
+
+function renderQueue() {
+  const box = $("network-queue");
+  box.replaceChildren();
+  const active = outbox.filter(isActiveMessage);
+  $("badge-queue").hidden = active.length === 0;
+  $("badge-queue").textContent = String(active.length);
+  if (active.length === 0) {
+    box.append(el("p", "empty", "Nothing queued or in transit."));
+    return;
+  }
+  for (const m of active) {
+    const row = el("div", "queue-row");
+    row.append(el("span", "peer", m.peer));
+    const [label, detail, cls] = messageState(m);
+    const badge = el("span", "message-status " + cls, label);
+    badge.title = detail;
+    row.append(badge);
+    const snip = (m.subject ? m.subject + " — " : "") + (m.text || "");
+    row.append(el("span", "snip", snip || "(no text)"));
+    const open = el("button", "btn quiet small", "Open");
+    open.type = "button";
+    open.addEventListener("click", () => {
+      if (m.kind === "Bulletin") location.hash = "#bulletin";
+      else if (m.kind === "Mail" || m.subject) location.hash = "#mail";
+      else location.hash = "#chat/" + encodeURIComponent(m.peer);
+      quietly(openMessageDetail(m));
+    });
+    row.append(open);
+    if (m.state === "Queued") row.append(dropButton(m.id));
+    box.append(row);
+  }
+}
+
+function renderNetwork() {
+  renderLinks();
+  renderEstimates();
+  renderQueue();
+  if (status) {
+    $("heard-section").hidden = status.radio === null && status.heard.length === 0;
+    renderHeard(status.heard);
+  }
+}
+
+async function loadQueue() {
+  const r = await api("/api/messages?direction=out&limit=200");
+  if (!r.ok) return;
+  outbox = await r.json();
+  renderQueue();
+}
+
 let trustFile = null;
 
 async function loadTrust() {
@@ -947,6 +1319,7 @@ async function loadTrust() {
   const t = await r.json();
   trustFile = t.file;
   trusted = t.stations;
+  renderRailTrust();
   const ul = $("trust");
   ul.replaceChildren();
   if (t.stations.length === 0) ul.append(el("li", "empty", "Nobody yet. Messages from untrusted stations arrive marked unverified."));
@@ -969,6 +1342,7 @@ async function loadTrust() {
     li.append(main, chat, b);
     ul.append(li);
   }
+  if (current) renderThread();
 }
 
 function note(text, cls) {
@@ -999,11 +1373,9 @@ const radioNumbers = ["txdelay_ms", "tnc_port", "persist", "slottime_ms", "bitra
 const liveFields = ["beacon_minutes", "radio_cost", "internet_cost", "modem_cost", "retry_first_secs", "retry_max_secs", "retry_attempts"];
 let settingsFile = null;
 
-// Maidenhead grid: same rules as hm_wire::Locator (4 or 6 characters).
 const LOCATOR_RE = /^[A-R]{2}[0-9]{2}([A-X]{2})?$/i;
 
 function latLonToLocator(lat, lon) {
-  // Clamp just inside the poles / antimeridian so the last square stays valid.
   const la = Math.min(89.999999, Math.max(-90, lat));
   const lo = Math.min(179.999999, Math.max(-180, lon));
   const adjLon = lo + 180;
@@ -1051,29 +1423,58 @@ function locatorHint(text, cls) {
 let locatorMap = null;
 let locatorMarker = null;
 let locatorCircle = null;
-let locatorAnchor = null; // last GPS/map point before privacy offset
+let locatorAnchor = null;
 let leafletPromise = null;
 
-function loadLeaflet() {
-  if (window.L) return Promise.resolve(window.L);
-  if (leafletPromise) return leafletPromise;
-  leafletPromise = new Promise((resolve, reject) => {
-    const css = document.createElement("link");
-    css.rel = "stylesheet";
-    css.href = "https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css";
-    css.integrity = "sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=";
-    css.crossOrigin = "anonymous";
-    document.head.append(css);
+function loadCss(href, integrity) {
+  const css = document.createElement("link");
+  css.rel = "stylesheet";
+  css.href = href;
+  if (integrity) css.integrity = integrity;
+  css.crossOrigin = "anonymous";
+  document.head.append(css);
+}
+
+function loadScript(src, integrity) {
+  return new Promise((resolve, reject) => {
     const script = document.createElement("script");
-    script.src = "https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js";
-    script.integrity = "sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=";
+    script.src = src;
+    if (integrity) script.integrity = integrity;
     script.crossOrigin = "anonymous";
-    script.onload = () => resolve(window.L);
-    script.onerror = () => {
-      leafletPromise = null;
-      reject(new Error("Could not load the map library (need a network for tiles)."));
-    };
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("Could not load the map library (need a network for tiles)."));
     document.head.append(script);
+  });
+}
+
+// Leaflet + MapLibre GL (OpenFreeMap vector tiles — no API key; OSM/CARTO rasters are blocked or keyed).
+function loadLeaflet() {
+  if (window.L && window.L.maplibreGL) return Promise.resolve(window.L);
+  if (leafletPromise) return leafletPromise;
+  leafletPromise = (async () => {
+    if (!window.L) {
+      loadCss(
+        "https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css",
+        "sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      );
+      await loadScript(
+        "https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js",
+        "sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      );
+    }
+    if (!window.maplibregl) {
+      loadCss("https://cdn.jsdelivr.net/npm/maplibre-gl@5.24.0/dist/maplibre-gl.css");
+      await loadScript("https://cdn.jsdelivr.net/npm/maplibre-gl@5.24.0/dist/maplibre-gl.js");
+    }
+    if (!window.L.maplibreGL) {
+      await loadScript(
+        "https://cdn.jsdelivr.net/npm/@maplibre/maplibre-gl-leaflet@0.1.4/leaflet-maplibre-gl.js"
+      );
+    }
+    return window.L;
+  })().catch((err) => {
+    leafletPromise = null;
+    throw err;
   });
   return leafletPromise;
 }
@@ -1082,11 +1483,10 @@ function locatorRangeKm() {
   return Number($("locator-range").value) || 0;
 }
 
-/** Uniform random point within `km` of (lat, lon). */
 function fuzzAround(lat, lon, km) {
   if (km <= 0) return { lat, lon };
   const bearing = Math.random() * 2 * Math.PI;
-  const dist = Math.sqrt(Math.random()) * km; // uniform in disk
+  const dist = Math.sqrt(Math.random()) * km;
   const dLat = (dist / 111.32) * Math.cos(bearing);
   const cosLat = Math.cos((lat * Math.PI) / 180);
   const dLon = cosLat < 1e-6 ? 0 : (dist / (111.32 * cosLat)) * Math.sin(bearing);
@@ -1172,13 +1572,13 @@ async function ensureLocatorMap() {
     const L = await loadLeaflet();
     if (!locatorMap) {
       locatorMap = L.map($("locator-map"), { worldCopyJump: true }).setView([20, 0], 2);
-      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        maxZoom: 18,
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+      // OpenFreeMap: OSM-derived vector tiles, no API key. Avoid tile.openstreetmap.org
+      // (blocked under our no-referrer policy) and CARTO free rasters (watermarked "API KEY REQUIRED").
+      L.maplibreGL({
+        style: "https://tiles.openfreemap.org/styles/liberty",
       }).addTo(locatorMap);
       locatorMap.on("click", (ev) => setLocatorFromLatLon(ev.latlng.lat, ev.latlng.lng, "map"));
     }
-    // Hidden maps need a size pass once the Settings view is shown.
     requestAnimationFrame(() => {
       locatorMap.invalidateSize();
       syncLocatorMap($("locator").value, true);
@@ -1212,13 +1612,11 @@ function settingsBusy() {
   if (form.contains(ae) && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.tagName === "SELECT" || ae.tagName === "BUTTON")) {
     return true;
   }
-  // Leaflet keeps focus on the map pane while panning/zooming.
   return !!(locatorMap && locatorMap.getContainer().contains(ae));
 }
 
 function showSettings(v, force) {
   settingsFile = v.file;
-  // Leave the form alone while someone is editing it or using the map.
   if (!force && settingsBusy()) return;
   for (const k of liveFields) $(k).value = v.live[k];
   $("locator").value = v.live.locator || "";
@@ -1353,9 +1751,13 @@ async function loadStatus() {
       chip("chip-modem", !s.modem ? "Modem down" : s.modem_peer ? "Modem: " + s.modem_peer : "Modem ready", s.modem ? "ok" : "bad");
       $("chip-modem").title = s.modem_via || "";
     }
-    $("heard-section").hidden = s.radio === null && s.heard.length === 0;
     $("my-line").textContent = s.trust_line;
-    renderHeard(s.heard);
+    renderRailHeard();
+    if (!$("view-network").hidden) renderNetwork();
+    else {
+      $("heard-section").hidden = s.radio === null && s.heard.length === 0;
+      renderHeard(s.heard);
+    }
     $("token-form").hidden = true;
     if (current) renderThread();
   } catch (e) {
@@ -1364,10 +1766,14 @@ async function loadStatus() {
 }
 
 // ---- Live updates ------------------------------------------------------
-// The node names what changed on /api/events, and the page fetches that
-// again. A plain fetch keeps the token in a header (EventSource cannot).
 const onChange = {
-  message: () => { quietly(loadChats()); quietly(countMail()); if (!$("view-mail").hidden) quietly(loadMail()); },
+  message: () => {
+    quietly(loadChats());
+    quietly(countMail());
+    quietly(loadQueue());
+    quietly(loadBulletins());
+    if (!$("view-mail").hidden) quietly(loadMail());
+  },
   status: () => quietly(loadStatus()),
   settings: () => { quietly(loadTrust()); if (!$("view-settings").hidden) quietly(loadSettings(false)); },
 };
@@ -1417,7 +1823,6 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden && cu
 route();
 onChange.all();
 listen();
-// A slow poll as well, for times shown as "ago".
 setInterval(onChange.status, 30000);
 </script>
 </body>

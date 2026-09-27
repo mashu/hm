@@ -112,6 +112,17 @@ pub fn burst_size(need: u32, loss_permille: u32, cap: u32) -> u32 {
 /// Domain prefix of the receipt signature.
 pub const RECEIPT_PREFIX: &[u8] = b"hm/xfer-receipt/v0";
 
+/// Bookkeeping callsign for RF broadcast transfers (bulletins). Frames use
+/// [`Dest::Broadcast`]; this name appears only in store/events.
+pub fn broadcast_peer() -> Callsign {
+    Callsign::parse("ALL").expect("ALL is a valid callsign")
+}
+
+/// Assumed frame loss when sizing a one-shot broadcast over, per mille.
+const BROADCAST_LOSS_PERMILLE: u32 = 300;
+/// Most overs a broadcast publish may take before local completion.
+const BROADCAST_MAX_ROUNDS: u8 = 2;
+
 /// The statement a receiver signs to prove it holds object `id`.
 pub fn receipt_statement(receiver: Callsign, sender: Callsign, session: u16, id: &ObjectId) -> Vec<u8> {
     let mut m = Vec::with_capacity(RECEIPT_PREFIX.len() + 6 + 6 + 2 + 32);
@@ -252,6 +263,14 @@ pub enum Command {
         object: Vec<u8>,
         precedence: u8,
     },
+    /// Publish `object` once on RF (`Dest::Broadcast`). No ACK wait; listeners
+    /// that reconstruct it emit [`Event::Received`] and do not ACK. Completes
+    /// locally as [`Event::Delivered`] to [`broadcast_peer`] with
+    /// [`Receipt::Unverified`].
+    Broadcast {
+        object: Vec<u8>,
+        precedence: u8,
+    },
     /// Application durably stored (or refused) a just-received object.
     Accept {
         from: Callsign,
@@ -310,6 +329,8 @@ struct Pending {
     to: Callsign,
     object: Vec<u8>,
     precedence: u8,
+    /// RF bulletin: frames use [`Dest::Broadcast`], no ACK.
+    broadcast: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -347,6 +368,8 @@ struct Outgoing {
     sent_last_round: u32,
     /// The last over carried an OPEN, so the answer may carry one too.
     opened: bool,
+    /// RF bulletin publish: no ACK wait.
+    broadcast: bool,
     state: OutState,
 }
 
@@ -364,10 +387,12 @@ struct Incoming {
     receipt: Option<[u8; 64]>,
     ack_at: Option<Millis>,
     last_heard: Millis,
+    /// Heard on `Dest::Broadcast`: store locally, never ACK.
+    broadcast: bool,
 }
 
 impl Incoming {
-    fn new(len: u32, symbol_size: u16, k: u32, now: Millis) -> Incoming {
+    fn new(len: u32, symbol_size: u16, k: u32, now: Millis, broadcast: bool) -> Incoming {
         Incoming {
             id: None,
             len,
@@ -381,6 +406,7 @@ impl Incoming {
             receipt: None,
             ack_at: None,
             last_heard: now,
+            broadcast,
         }
     }
 
@@ -529,11 +555,23 @@ impl Xfer {
         (k <= MAX_SOURCE_SYMBOLS).then_some((t, k))
     }
 
-    fn frame(&self, ftype: FrameType, to: Callsign, session: u16, index: u32, payload: &[u8]) -> Vec<u8> {
+    fn frame(
+        &self,
+        ftype: FrameType,
+        to: Callsign,
+        session: u16,
+        index: u32,
+        payload: &[u8],
+        broadcast: bool,
+    ) -> Vec<u8> {
         FrameHeader {
             ftype,
             src: self.cfg.me,
-            dst: Dest::Station(to),
+            dst: if broadcast {
+                Dest::Broadcast
+            } else {
+                Dest::Station(to)
+            },
             session,
             index,
         }
@@ -576,10 +614,11 @@ impl Xfer {
         to: Callsign,
         object: Vec<u8>,
         precedence: u8,
+        broadcast: bool,
         out: &mut Vec<Output<Event>>,
     ) {
         let id = object_id(&object);
-        let reason = if to == self.cfg.me {
+        let reason = if !broadcast && to == self.cfg.me {
             Some(Failure::SelfAddressed)
         } else if object.is_empty() {
             Some(Failure::Empty)
@@ -608,6 +647,7 @@ impl Xfer {
                 to,
                 object,
                 precedence,
+                broadcast,
             },
         );
         let _ = now;
@@ -620,20 +660,22 @@ impl Xfer {
         let Some(p) = self.queue.pop_front() else { return };
         let len = p.object.len() as u32;
         // What the peer told us it takes: larger objects fail at once, and
-        // symbols are no larger than it accepts.
+        // symbols are no larger than it accepts. Broadcast has no peer OPEN.
         let mut t = self.cfg.symbol_size;
-        if let Some((open, _)) = self.peers.get(&p.to).filter(|_| self.knows(p.to, now)) {
-            if len > open.max_object {
-                out.push(Output::Event(Event::Failed {
-                    to: p.to,
-                    id: object_id(&p.object),
-                    reason: Failure::TooLarge,
-                }));
-                return self.start_next(now, out);
-            }
-            let theirs = open.max_symbol - open.max_symbol % SYMBOL_ALIGNMENT;
-            if theirs >= SYMBOL_ALIGNMENT {
-                t = t.min(theirs);
+        if !p.broadcast {
+            if let Some((open, _)) = self.peers.get(&p.to).filter(|_| self.knows(p.to, now)) {
+                if len > open.max_object {
+                    out.push(Output::Event(Event::Failed {
+                        to: p.to,
+                        id: object_id(&p.object),
+                        reason: Failure::TooLarge,
+                    }));
+                    return self.start_next(now, out);
+                }
+                let theirs = open.max_symbol - open.max_symbol % SYMBOL_ALIGNMENT;
+                if theirs >= SYMBOL_ALIGNMENT {
+                    t = t.min(theirs);
+                }
             }
         }
         let (t, k) = match self.check_params(len, t as usize) {
@@ -663,13 +705,14 @@ impl Xfer {
             next_esi: 0,
             rounds: 0,
             offer_next: true,
-            open_next: self.cfg.sessions && !self.knows(p.to, now),
+            open_next: !p.broadcast && self.cfg.sessions && !self.knows(p.to, now),
             need: k,
             probe: false,
             timeouts: 0,
             last_cost: Millis::ZERO,
             sent_last_round: 0,
             opened: false,
+            broadcast: p.broadcast,
             state: OutState::Ready { at: now },
         });
     }
@@ -697,7 +740,7 @@ impl Xfer {
         if at > now {
             return;
         }
-        if o.rounds >= self.cfg.max_rounds {
+        if o.rounds >= self.cfg.max_rounds && !o.broadcast {
             let o = self.active.take().expect("checked");
             out.push(Output::Event(Event::Failed {
                 to: o.to,
@@ -707,8 +750,23 @@ impl Xfer {
             self.start_next(now, out);
             return self.pump(now, out);
         }
+        if o.broadcast && o.rounds >= BROADCAST_MAX_ROUNDS {
+            let o = self.active.take().expect("checked");
+            out.push(Output::Event(Event::Delivered {
+                to: o.to,
+                id: o.id,
+                rounds: o.rounds,
+                receipt: Receipt::Unverified,
+            }));
+            self.start_next(now, out);
+            return self.pump(now, out);
+        }
 
-        let loss = self.loss_estimate(o.to).max(self.cfg.redundancy_permille);
+        let loss = if o.broadcast {
+            BROADCAST_LOSS_PERMILLE.max(self.cfg.redundancy_permille)
+        } else {
+            self.loss_estimate(o.to).max(self.cfg.redundancy_permille)
+        };
         let cap = (self.cfg.max_burst as u32)
             .min(MAX_INDEX - o.next_esi.min(MAX_INDEX))
             .max(1);
@@ -723,7 +781,8 @@ impl Xfer {
         if o.offer_next {
             fixed += self.cfg.air(1, HEADER_LEN + hm_wire::OFFER_LEN);
         }
-        let open = (o.offer_next && o.open_next) || self.open_replies.contains(&o.to);
+        let open = !o.broadcast
+            && ((o.offer_next && o.open_next) || self.open_replies.contains(&o.to));
         if open {
             fixed += self.open_air();
         }
@@ -742,15 +801,15 @@ impl Xfer {
             return;
         }
 
-        let (to, session) = {
+        let (to, session, broadcast) = {
             let o = self.active.as_ref().expect("checked");
-            (o.to, o.session)
+            (o.to, o.session, o.broadcast)
         };
         let mut frames = Vec::with_capacity(n as usize + 2);
         if open {
             let reply = self.open_replies.remove(&to);
             let ours = self.our_open(reply).to_bytes().expect("in range");
-            frames.push(self.frame(FrameType::Ctrl, to, session, 0, &ours));
+            frames.push(self.frame(FrameType::Ctrl, to, session, 0, &ours, false));
         }
         let o = self.active.as_ref().expect("checked");
         if o.offer_next {
@@ -767,6 +826,7 @@ impl Xfer {
                 o.session,
                 0,
                 &offer.to_bytes().expect("len checked"),
+                broadcast,
             ));
         }
         for i in 0..n {
@@ -777,28 +837,55 @@ impl Xfer {
             };
             let mut payload = pre.to_bytes().expect("len checked").to_vec();
             payload.extend_from_slice(&Self::symbol(o, esi));
-            frames.push(self.frame(FrameType::Data, o.to, o.session, esi, &payload));
+            frames.push(self.frame(FrameType::Data, o.to, o.session, esi, &payload, broadcast));
         }
         for f in frames {
             self.transmit(f, out);
         }
         self.tokens_ms -= cost.0 as i64;
 
+        let broadcast_done = {
+            let o = self.active.as_mut().expect("checked");
+            o.next_esi += n;
+            o.rounds += 1;
+            o.offer_next = false;
+            o.open_next = false;
+            o.opened = open;
+            o.probe = false;
+            o.last_cost = cost;
+            o.sent_last_round = n;
+            if o.broadcast {
+                // One-shot publish: no ACK. Finish when we have sent enough source
+                // coverage or hit the round cap.
+                let done = o.next_esi >= o.k || o.rounds >= BROADCAST_MAX_ROUNDS;
+                if !done {
+                    o.state = OutState::Ready { at: now + cost };
+                }
+                Some(done)
+            } else {
+                None
+            }
+        };
+        if let Some(done) = broadcast_done {
+            if done {
+                let o = self.active.take().expect("checked");
+                out.push(Output::Event(Event::Delivered {
+                    to: o.to,
+                    id: o.id,
+                    rounds: o.rounds,
+                    receipt: Receipt::Unverified,
+                }));
+                self.start_next(now, out);
+                return self.pump(now, out);
+            }
+            return;
+        }
         // The peer answers after our over: its guard, its key-up, a full ACK
         // (and its OPEN, if we sent ours), our slack.
         let ack_air = self.ack_air() + if open { self.open_air() } else { Millis::ZERO };
         let jitter = Millis(self.rng.below(self.cfg.ack_guard.0 + 1));
         let until = now + cost + self.cfg.ack_guard + ack_air + self.cfg.ack_guard + jitter;
-        let o = self.active.as_mut().expect("checked");
-        o.next_esi += n;
-        o.rounds += 1;
-        o.offer_next = false;
-        o.open_next = false;
-        o.opened = open;
-        o.probe = false;
-        o.last_cost = cost;
-        o.sent_last_round = n;
-        o.state = OutState::Waiting { until };
+        self.active.as_mut().expect("checked").state = OutState::Waiting { until };
     }
 
     fn on_ack(
@@ -935,14 +1022,21 @@ impl Xfer {
         t: u16,
         k: u32,
         authoritative: bool,
+        broadcast: bool,
     ) -> bool {
         match self.incoming.get(&key) {
-            Some(i) if i.len == len && i.symbol_size == t => return true,
+            Some(i) if i.len == len && i.symbol_size == t => {
+                if broadcast {
+                    self.incoming.get_mut(&key).expect("checked").broadcast = true;
+                }
+                return true;
+            }
             Some(_) if !authoritative => return false,
             Some(_) => {}
             None => self.make_room(now, key.0),
         }
-        self.incoming.insert(key, Incoming::new(len, t, k, now));
+        self.incoming
+            .insert(key, Incoming::new(len, t, k, now, broadcast));
         true
     }
 
@@ -952,6 +1046,7 @@ impl Xfer {
         from: Callsign,
         session: u16,
         payload: &[u8],
+        broadcast: bool,
         out: &mut Vec<Output<Event>>,
     ) {
         let Ok(offer) = hm_wire::Offer::decode(payload) else {
@@ -960,23 +1055,28 @@ impl Xfer {
         let key = (from, session);
         let answer = self.ack_at(now, offer.remaining, offer.symbol_size as usize);
         if offer.object_len > self.cfg.max_object_len {
-            let close = Close {
-                reason: CloseReason::TooLarge,
-                retry_after: 0,
-            };
-            self.closes.insert(key, (close, answer));
+            if !broadcast {
+                let close = Close {
+                    reason: CloseReason::TooLarge,
+                    retry_after: 0,
+                };
+                self.closes.insert(key, (close, answer));
+            }
             return;
         }
         let Some((t, k)) = self.check_params(offer.object_len, offer.symbol_size as usize) else {
             return;
         };
         let id = ObjectId(offer.hash);
-        if !self.incoming.contains_key(&key) && !self.seen.contains_key(&id) && self.busy_for(now, from) {
-            let close = Close {
-                reason: CloseReason::Busy,
-                retry_after: self.cfg.busy_retry_secs,
-            };
-            self.closes.insert(key, (close, answer));
+        if !self.incoming.contains_key(&key) && !self.seen.contains_key(&id) && self.busy_for(now, from)
+        {
+            if !broadcast {
+                let close = Close {
+                    reason: CloseReason::Busy,
+                    retry_after: self.cfg.busy_retry_secs,
+                };
+                self.closes.insert(key, (close, answer));
+            }
             return;
         }
         if self
@@ -986,19 +1086,27 @@ impl Xfer {
         {
             self.incoming.remove(&key); // a new object on a reused session
         }
-        if !self.slot(now, key, offer.object_len, t, k, true) {
+        if !self.slot(now, key, offer.object_len, t, k, true, broadcast) {
             return;
         }
-        let ack_at = self.ack_at(now, offer.remaining, t as usize);
         let already = self.seen.contains_key(&id);
         let receipt = self.sign_receipt(key, &id);
+        let ack_at = if broadcast {
+            None
+        } else {
+            Some(self.ack_at(now, offer.remaining, t as usize))
+        };
         let inc = self.incoming.get_mut(&key).expect("slot ensured");
         inc.id = Some(id);
         inc.last_heard = now;
-        inc.ack_at = Some(ack_at);
+        inc.broadcast = broadcast;
+        // Broadcast listeners never ACK (would storm the channel).
+        inc.ack_at = ack_at;
         if already {
             inc.done = true;
-            inc.receipt = Some(receipt);
+            if !broadcast {
+                inc.receipt = Some(receipt);
+            }
         } else if let Some(data) = inc.decoded.take() {
             self.finish(now, key, data, out);
         }
@@ -1011,6 +1119,7 @@ impl Xfer {
         session: u16,
         esi: u32,
         payload: &[u8],
+        broadcast: bool,
         out: &mut Vec<Output<Event>>,
     ) {
         let Ok((pre, symbol)) = DataPreamble::decode(payload) else {
@@ -1029,16 +1138,25 @@ impl Xfer {
         }
         // Symbols for a transfer we are turning away, or would have to make
         // room for by dropping others' work, are not collected.
-        if self.closes.contains_key(&key) || (!self.incoming.contains_key(&key) && self.busy_for(now, from)) {
+        if self.closes.contains_key(&key)
+            || (!self.incoming.contains_key(&key) && self.busy_for(now, from))
+        {
             return;
         }
-        if !self.slot(now, key, pre.object_len, t, k, false) {
+        if !self.slot(now, key, pre.object_len, t, k, false, broadcast) {
             return;
         }
-        let ack_at = self.ack_at(now, pre.remaining, t as usize);
+        let ack_at = if broadcast {
+            None
+        } else {
+            Some(self.ack_at(now, pre.remaining, t as usize))
+        };
         let inc = self.incoming.get_mut(&key).expect("slot ensured");
         inc.last_heard = now;
-        inc.ack_at = Some(ack_at);
+        if broadcast {
+            inc.broadcast = true;
+        }
+        inc.ack_at = ack_at;
         if inc.done || inc.awaiting_application || inc.decoded.is_some() || !inc.esis.insert(esi) {
             return;
         }
@@ -1088,12 +1206,20 @@ impl Xfer {
     }
 
     fn complete_incoming(&mut self, now: Millis, key: (Callsign, u16), id: ObjectId) {
-        let receipt = self.sign_receipt(key, &id);
+        let broadcast = self.incoming[&key].broadcast;
+        let receipt = if broadcast {
+            None
+        } else {
+            Some(self.sign_receipt(key, &id))
+        };
         let inc = self.incoming.get_mut(&key).expect("caller holds the key");
-        inc.receipt = Some(receipt);
+        inc.receipt = receipt;
         inc.done = true;
         inc.awaiting_application = false;
         inc.last_heard = now;
+        if broadcast {
+            inc.ack_at = None;
+        }
         self.seen.insert(id, now + self.cfg.done_ttl);
     }
 
@@ -1114,8 +1240,11 @@ impl Xfer {
             .map(|(key, _)| *key);
         let Some(key) = key else { return };
         if accepted {
+            let broadcast = self.incoming[&key].broadcast;
             self.complete_incoming(now, key, id);
-            self.incoming.get_mut(&key).expect("completed above").ack_at = Some(now);
+            if !broadcast {
+                self.incoming.get_mut(&key).expect("completed above").ack_at = Some(now);
+            }
             return;
         }
         self.incoming.remove(&key);
@@ -1142,7 +1271,7 @@ impl Xfer {
         let due: Vec<(Callsign, u16)> = self
             .incoming
             .iter()
-            .filter(|(_, i)| i.ack_at.is_some())
+            .filter(|(_, i)| i.ack_at.is_some() && !i.broadcast)
             .map(|(k, _)| *k)
             .collect();
         let closes: Vec<((Callsign, u16), Close)> = core::mem::take(&mut self.closes)
@@ -1153,16 +1282,16 @@ impl Xfer {
             // Our OPEN first, so the sender learns the limit it ran into.
             if self.open_replies.remove(&key.0) {
                 let ours = self.our_open(true).to_bytes().expect("in range");
-                let f = self.frame(FrameType::Ctrl, key.0, key.1, 0, &ours);
+                let f = self.frame(FrameType::Ctrl, key.0, key.1, 0, &ours, false);
                 self.transmit(f, out);
             }
-            let f = self.frame(FrameType::Ctrl, key.0, key.1, 0, &close.to_bytes());
+            let f = self.frame(FrameType::Ctrl, key.0, key.1, 0, &close.to_bytes(), false);
             self.transmit(f, out);
         }
         for key in due {
             if self.open_replies.remove(&key.0) {
                 let ours = self.our_open(true).to_bytes().expect("in range");
-                let f = self.frame(FrameType::Ctrl, key.0, key.1, 0, &ours);
+                let f = self.frame(FrameType::Ctrl, key.0, key.1, 0, &ours, false);
                 self.transmit(f, out);
             }
             let inc = self.incoming.get_mut(&key).expect("collected above");
@@ -1188,7 +1317,7 @@ impl Xfer {
                 }
             };
             let payload = ack.to_vec().expect("fields in range");
-            let f = self.frame(FrameType::Ack, key.0, key.1, 0, &payload);
+            let f = self.frame(FrameType::Ack, key.0, key.1, 0, &payload, false);
             self.transmit(f, out);
         }
     }
@@ -1305,19 +1434,25 @@ impl Xfer {
             return;
         }
         self.hear_traffic(now, &h, payload);
-        if h.dst != Dest::Station(self.cfg.me) {
+        let for_me = h.dst == Dest::Station(self.cfg.me);
+        let broadcast = h.dst == Dest::Broadcast;
+        if !for_me && !broadcast {
             return;
         }
         match h.ftype {
-            FrameType::Data => self.on_data(now, h.src, h.session, h.index, payload, out),
-            FrameType::Ctrl if payload.first() == Some(&CTRL_OFFER) => {
-                self.on_offer(now, h.src, h.session, payload, out)
+            FrameType::Data if for_me || broadcast => {
+                self.on_data(now, h.src, h.session, h.index, payload, broadcast, out)
             }
-            FrameType::Ctrl if payload.first() == Some(&CTRL_OPEN) => self.on_open(now, h.src, payload),
-            FrameType::Ctrl if payload.first() == Some(&CTRL_CLOSE) => {
+            FrameType::Ctrl if payload.first() == Some(&CTRL_OFFER) && (for_me || broadcast) => {
+                self.on_offer(now, h.src, h.session, payload, broadcast, out)
+            }
+            FrameType::Ctrl if payload.first() == Some(&CTRL_OPEN) && for_me => {
+                self.on_open(now, h.src, payload)
+            }
+            FrameType::Ctrl if payload.first() == Some(&CTRL_CLOSE) && for_me => {
                 self.on_close(now, h.src, h.session, payload, out)
             }
-            FrameType::Ack => self.on_ack(now, h.src, h.session, payload, out),
+            FrameType::Ack if for_me => self.on_ack(now, h.src, h.session, payload, out),
             _ => {}
         }
     }
@@ -1333,7 +1468,10 @@ impl Machine for Xfer {
                 to,
                 object,
                 precedence,
-            }) => self.enqueue(now, to, object, precedence, out),
+            }) => self.enqueue(now, to, object, precedence, false, out),
+            Input::Command(Command::Broadcast { object, precedence }) => {
+                self.enqueue(now, broadcast_peer(), object, precedence, true, out)
+            }
             Input::Command(Command::Accept {
                 from,
                 id,
