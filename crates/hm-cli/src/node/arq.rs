@@ -7,7 +7,8 @@
 //! the internet (SPEC section 10): `"HMD0"`, the length, the bundle; then
 //! `0x00` and the receiver's signed receipt (base callsigns, session 0, as on
 //! the internet), or `0x01` and a reason. The receipt is checked against the
-//! receiver's trusted key, so a delivery means the same as on every other bearer.
+//! receiver's trusted key and proves next-hop custody. Final delivery still
+//! requires the destination's end-to-end bundle receipt.
 //!
 //! One connection at a time, as the modems allow: deliveries to other
 //! stations wait their turn. A delivery calls the station, sends every waiting
@@ -37,7 +38,7 @@ use crate::sound_link::PttFactory;
 
 const MAGIC: &[u8; 4] = b"HMD0";
 /// Largest bundle accepted over a modem connection.
-const MAX_OBJECT: usize = 256 * 1024;
+pub const MAX_OBJECT: usize = 256 * 1024;
 /// A call not answered in this long has failed.
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Longest wait for a receipt once a bundle is sent (HF is slow).
@@ -85,6 +86,20 @@ impl ArqConfig {
             Kind::Ardop => "ARDOP",
         };
         format!("{kind} modem at {}:{}", self.host, self.port)
+    }
+
+    /// Conservative effective rate for route capacity and airtime estimates.
+    /// Host protocols expose occupied bandwidth, not the currently negotiated
+    /// modulation rate, so use one bit/s per configured Hz.
+    pub fn estimated_rate_bps(&self) -> u32 {
+        if self.bandwidth > 0 {
+            self.bandwidth
+        } else {
+            match self.kind {
+                Kind::Vara => 1_200,
+                Kind::Ardop => 500,
+            }
+        }
     }
 }
 
@@ -593,6 +608,9 @@ impl Task {
                             r.extend_from_slice(&sig);
                             r
                         }
+                        Verdict::Busy { retry_after, reason } => {
+                            rejection(&format!("busy for {retry_after} s: {reason}"))
+                        }
                         Verdict::Rejected(reason) => rejection(&reason),
                     };
                     self.send_data(p, &reply).await?;
@@ -669,7 +687,7 @@ impl Task {
                 inbox,
                 last: _,
                 hanging_up: false,
-            } if self.waiting.iter().any(|r| r.to == peer) => State::Connected {
+            } if self.waiting.iter().any(|request| request.to == peer) => State::Connected {
                 peer,
                 ours,
                 sent: self.send_next(p, peer).await?,
@@ -677,7 +695,7 @@ impl Task {
                 last: now,
                 hanging_up: false,
             },
-            s => s,
+            current => current,
         };
         match state {
             State::Calling { req, since } if now - since > CALL_TIMEOUT => {

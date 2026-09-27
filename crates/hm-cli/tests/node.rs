@@ -9,14 +9,15 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hm_cli::config::{Config, RadioSettings};
+use hm_cli::config::{Config, RadioSettings, RelaySettings};
 use hm_cli::files::{KeyFile, Trust};
 use hm_cli::kiss_link::{KissTarget, TncParams};
 use hm_cli::node::choose::Costs;
 use hm_cli::node::live::Live;
 use hm_cli::node::{self, NodeConfig, NodeHandle, RadioConfig, RadioLink};
 use hm_cli::station::LinkTiming;
-use hm_store::RetryPolicy;
+use hm_route::ScheduledContact;
+use hm_store::{Direction, RetryPolicy, State, Store};
 use hm_wire::{Callsign, Locator};
 use serde_json::{json, Value};
 
@@ -40,14 +41,8 @@ fn call(s: &str) -> Callsign {
     Callsign::parse(s).unwrap()
 }
 
-/// Minimal HTTP/1.1 client: returns status and body.
-fn http(
-    addr: SocketAddr,
-    method: &str,
-    path: &str,
-    body: Option<&Value>,
-    token: Option<&str>,
-) -> (u16, String) {
+/// Minimal HTTP/1.1 client.
+fn raw_http(addr: SocketAddr, method: &str, path: &str, body: Option<&Value>, token: Option<&str>) -> String {
     let mut s = TcpStream::connect(addr).unwrap();
     let body = body.map(|b| b.to_string()).unwrap_or_default();
     let auth = token
@@ -61,6 +56,17 @@ fn http(
     .unwrap();
     let mut resp = String::new();
     s.read_to_string(&mut resp).unwrap();
+    resp
+}
+
+fn http(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    token: Option<&str>,
+) -> (u16, String) {
+    let resp = raw_http(addr, method, path, body, token);
     let status = resp[9..12].parse().unwrap();
     let body = resp
         .split_once("\r\n\r\n")
@@ -135,6 +141,10 @@ struct Setup<'a> {
 }
 
 fn start(s: Setup) -> NodeHandle {
+    start_routed(s, Default::default(), vec![])
+}
+
+fn start_routed(s: Setup, relay: RelaySettings, schedules: Vec<ScheduledContact>) -> NodeHandle {
     let mut trust = Trust::default();
     trust.insert(s.peer.call, s.peer.identity.public());
     for k in s.also {
@@ -180,6 +190,8 @@ fn start(s: Setup) -> NodeHandle {
         radio_builder: Some(Arc::new(node::radio_config)),
         internet: s.internet.map(|i| node::InternetConfig { listen: i.listen }),
         modem: None,
+        relay,
+        schedules,
         store: s.store.0.clone(),
         http: "127.0.0.1:0".parse().unwrap(),
         token: TOKEN.into(),
@@ -206,6 +218,202 @@ fn delivered(addr: SocketAddr, n: usize, what: &str) -> Value {
             .collect();
         (done.len() >= n).then(|| out[0].clone())
     })
+}
+
+#[test]
+fn queued_outbound_message_can_be_dropped() {
+    let (alice, bob) = keys();
+    let db = Tmp::new("cancel");
+    let node = start(Setup {
+        key: &alice,
+        me: "SA0KAM",
+        peer: &bob,
+        also: &[],
+        tnc: None,
+        internet: None,
+        store: &db,
+        retry: QUICK,
+        beacon_every: None,
+        trust_file: None,
+    });
+    let (status, body) = http(
+        node.http_addr,
+        "POST",
+        "/api/send",
+        Some(&json!({"to": "SO5KM-1", "text": "cancel me"})),
+        Some(TOKEN),
+    );
+    assert_eq!(status, 201, "{body}");
+    let id = serde_json::from_str::<Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        http(
+            node.http_addr,
+            "DELETE",
+            &format!("/api/messages/{id}"),
+            None,
+            Some(TOKEN)
+        )
+        .0,
+        204
+    );
+    assert_eq!(
+        get(node.http_addr, "/api/messages?direction=out")[0]["state"],
+        "Cancelled"
+    );
+    assert_eq!(
+        http(
+            node.http_addr,
+            "DELETE",
+            &format!("/api/messages/{id}"),
+            None,
+            Some(TOKEN)
+        )
+        .0,
+        409
+    );
+    assert_eq!(
+        http(
+            node.http_addr,
+            "DELETE",
+            "/api/messages/0000000000000000000000000000000000000000000000000000000000000000",
+            None,
+            Some(TOKEN)
+        )
+        .0,
+        404
+    );
+    node.stop().unwrap();
+}
+
+#[test]
+fn four_internet_nodes_relay_end_to_end_without_flooding() {
+    let alice = KeyFile::generate(call("SA0KAM")).unwrap();
+    let relay_one = KeyFile::generate(call("SM0R1")).unwrap();
+    let relay_two = KeyFile::generate(call("SM0R2")).unwrap();
+    let bob = KeyFile::generate(call("SO5KM-1")).unwrap();
+    let (a_db, r1_db, r2_db, b_db) = (
+        Tmp::new("route-a"),
+        Tmp::new("route-r1"),
+        Tmp::new("route-r2"),
+        Tmp::new("route-b"),
+    );
+    let b = start(Setup {
+        key: &bob,
+        me: "SO5KM-1",
+        peer: &relay_two,
+        also: &[&alice, &relay_one],
+        tnc: None,
+        internet: Some(InternetConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            peers: vec![],
+        }),
+        store: &b_db,
+        retry: QUICK,
+        beacon_every: None,
+        trust_file: None,
+    });
+    let relay = RelaySettings {
+        enabled: true,
+        mailbox: true,
+        ..RelaySettings::default()
+    };
+    let r2 = start_routed(
+        Setup {
+            key: &relay_two,
+            me: "SM0R2",
+            peer: &bob,
+            also: &[&alice, &relay_one],
+            tnc: None,
+            internet: Some(InternetConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                peers: vec![(bob.call, b.internet_addr.unwrap())],
+            }),
+            store: &r2_db,
+            retry: QUICK,
+            beacon_every: None,
+            trust_file: None,
+        },
+        relay.clone(),
+        vec![],
+    );
+    let r1 = start_routed(
+        Setup {
+            key: &relay_one,
+            me: "SM0R1",
+            peer: &relay_two,
+            also: &[&alice, &bob],
+            tnc: None,
+            internet: Some(InternetConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                peers: vec![(relay_two.call, r2.internet_addr.unwrap())],
+            }),
+            store: &r1_db,
+            retry: QUICK,
+            beacon_every: None,
+            trust_file: None,
+        },
+        relay,
+        vec![],
+    );
+    let a = start(Setup {
+        key: &alice,
+        me: "SA0KAM",
+        peer: &relay_one,
+        also: &[&relay_two, &bob],
+        tnc: None,
+        internet: Some(InternetConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            peers: vec![(relay_one.call, r1.internet_addr.unwrap())],
+        }),
+        store: &a_db,
+        retry: QUICK,
+        beacon_every: None,
+        trust_file: None,
+    });
+    wait_for(Duration::from_secs(20), "the three authenticated links", || {
+        let links = [
+            get(a.http_addr, "/api/status")["internet_peers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            get(r1.http_addr, "/api/status")["internet_peers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            get(r2.http_addr, "/api/status")["internet_peers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            get(b.http_addr, "/api/status")["internet_peers"]
+                .as_array()
+                .unwrap()
+                .len(),
+        ];
+        (links == [1, 2, 2, 1]).then_some(())
+    });
+    send(
+        a.http_addr,
+        json!({"to": "SO5KM-1", "subject": "Multi-hop", "text": "A-R1-R2-B"}),
+    );
+    let sent = delivered(a.http_addr, 1, "four-node end-to-end receipt");
+    assert_eq!(sent["state"], "Delivered");
+    assert_eq!(inbox(b.http_addr)[0]["text"], "A-R1-R2-B");
+
+    a.stop().unwrap();
+    r1.stop().unwrap();
+    r2.stop().unwrap();
+    b.stop().unwrap();
+    for db in [&r1_db, &r2_db] {
+        let records = Store::open(&db.0).unwrap().list(Direction::Relay, 10).unwrap();
+        let original = records
+            .iter()
+            .find(|record| record.final_destination() == bob.call)
+            .expect("relay retained one audit copy of the original");
+        assert_eq!(original.state, State::InTransit);
+    }
 }
 
 #[test]
@@ -242,6 +450,12 @@ fn radio_nodes_exchange_mail_and_survive_a_restart() {
     // The page is public; the API wants the token.
     let (status, page) = http(a.http_addr, "GET", "/", None, None);
     assert!(status == 200 && page.contains("Queue message"));
+    assert!(page.contains("Close chat") && page.contains("Drop message"));
+    let headers = raw_http(a.http_addr, "GET", "/", None, None).to_ascii_lowercase();
+    assert!(headers.contains("content-security-policy:"));
+    assert!(headers.contains("permissions-policy:"));
+    assert!(headers.contains("x-frame-options: deny"));
+    assert!(headers.contains("cache-control: no-store"));
     assert_eq!(http(a.http_addr, "GET", "/api/status", None, None).0, 401);
     assert_eq!(
         http(a.http_addr, "GET", "/api/status", None, Some("wrong")).0,

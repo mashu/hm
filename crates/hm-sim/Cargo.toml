@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 hm-core = { path = "../hm-core" }
 hm-wire = { path = "../hm-wire" }
+hm-route = { path = "../hm-route" }
 libm = "0.2"
 
 [dev-dependencies]

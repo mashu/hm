@@ -22,7 +22,9 @@ mod data;
 mod frame;
 mod id;
 mod locator;
+mod route;
 mod session;
+mod sync;
 
 pub use ack::{Ack, MAX_ACK_COMPLETED, NEED_OFFER, RECEIPT_LEN};
 pub use beacon::{Beacon, Heard, BEACON_SIG_PREFIX, FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY, MAX_HEARD};
@@ -31,9 +33,15 @@ pub use data::{DataPreamble, Offer, CTRL_OFFER, DATA_PREAMBLE_LEN, MAX_OBJECT_LE
 pub use frame::{Dest, FrameHeader, FrameType, HEADER_LEN, MAX_INDEX, WIRE_VERSION};
 pub use id::ObjectId;
 pub use locator::Locator;
+pub use route::{unwrap_routed, wrap_routed, RoutedBundle, MAX_ROUTE_HOPS, ROUTE_MAGIC};
 pub use session::{
     Close, CloseReason, Open, CLOSE_LEN, CTRL_CLOSE, CTRL_OPEN, FEATURE_IL2P, FEATURE_MAILBOX, FEATURE_RELAY,
     OPEN_LEN, OPEN_REPLY,
+};
+pub use sync::{
+    ContactAdvert, ContactBearer, SyncFilter, SyncMessage, SyncOffer, SyncWant, CONTACT_LEN,
+    CONTACT_SIG_PREFIX, MAX_FILTER_BYTES, MAX_OFFER, MAX_WANT, SYNC_CONTACT, SYNC_FILTER, SYNC_OFFER,
+    SYNC_WANT,
 };
 
 /// Errors from encoding or decoding wire structures.

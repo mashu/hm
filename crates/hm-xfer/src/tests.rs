@@ -115,6 +115,70 @@ fn one_clean_over_delivers() {
 }
 
 #[test]
+fn custody_receipt_waits_for_durable_application_acceptance() {
+    let mut a = engine("SA0KAM");
+    let mut b = engine("SO5KM");
+    b.set_application_ack(true);
+    let object = b"persist me first".to_vec();
+    let id = object_id(&object);
+    let mut out = Vec::new();
+    a.handle(
+        Millis(0),
+        Input::Command(Command::Send {
+            to: call("SO5KM"),
+            object: object.clone(),
+            precedence: 0,
+        }),
+        &mut out,
+    );
+    let received = deliver(&mut b, Millis(20_000), &frames(&out));
+    assert_eq!(
+        events(&received),
+        vec![Event::Received {
+            from: call("SA0KAM"),
+            id,
+            object,
+        }]
+    );
+    let mut sender = Vec::new();
+    for frame in frames(&received) {
+        a.handle(Millis(21_000), Input::Frame { port: 0, data: frame }, &mut sender);
+    }
+    assert!(
+        events(&sender).is_empty(),
+        "no custody receipt before persistence"
+    );
+
+    let mut accepted = Vec::new();
+    b.handle(
+        Millis(22_000),
+        Input::Command(Command::Accept {
+            from: call("SA0KAM"),
+            id,
+            accepted: true,
+            retry_after: 0,
+        }),
+        &mut accepted,
+    );
+    let deadline = b.next_deadline().unwrap();
+    b.on_deadline(deadline, &mut accepted);
+    assert_eq!(frames(&accepted).len(), 1);
+    let mut sender = Vec::new();
+    a.handle(
+        Millis(23_000),
+        Input::Frame {
+            port: 0,
+            data: frames(&accepted)[0].clone(),
+        },
+        &mut sender,
+    );
+    assert!(matches!(
+        events(&sender).as_slice(),
+        [Event::Delivered { id: delivered, .. }] if *delivered == id
+    ));
+}
+
+#[test]
 fn missed_offer_is_requested_then_delivered() {
     let mut a = engine("SA0KAM");
     let mut b = engine("SO5KM-1");

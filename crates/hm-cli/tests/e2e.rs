@@ -128,7 +128,7 @@ fn chat_over_kiss_tcp_is_delivered_and_verified() {
     );
     assert_eq!(msgs.len(), 1, "{msgs:?}");
     assert_eq!(msgs[0].verification, Verification::Verified);
-    assert_eq!(msgs[0].text(), Some("73 de SA0KAM, test over KISS"));
+    assert_eq!(msgs[0].text().as_deref(), Some("73 de SA0KAM, test over KISS"));
     assert_eq!(msgs[0].via, call("SA0KAM"));
 }
 
@@ -148,7 +148,7 @@ fn lossy_channel_still_delivers_exactly_once() {
     );
     assert!(dropped > 0, "the channel dropped frames");
     assert_eq!(msgs.len(), 1);
-    assert_eq!(msgs[0].text(), Some(text.as_str()));
+    assert_eq!(msgs[0].text().as_deref(), Some(text.as_str()));
 }
 
 /// The real binary: keygen, whoami, listen, send.

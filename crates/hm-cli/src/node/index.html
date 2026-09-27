@@ -77,6 +77,7 @@
     background: var(--accent); color: var(--accent-ink); font-weight: 700; cursor: pointer; text-decoration: none;
   }
   .btn.quiet { background: none; color: var(--ink); border: 1px solid var(--rule); font-weight: 600; }
+  .btn.danger { background: none; color: var(--bad); border: 1px solid currentColor; }
   .btn.small { margin: 0; padding: 0.15rem 0.6rem; font-size: 0.85rem; }
   #token-form { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; max-width: 40rem; margin: 0.5rem 0 0.75rem; }
   #token-form label { margin: 0; flex-basis: 100%; }
@@ -103,7 +104,7 @@
   .thread-head { display: flex; align-items: center; gap: 0.75rem; padding: 0.7rem 1rem; border-bottom: 1px solid var(--rule); flex-wrap: wrap; }
   .thread-head h2 { margin: 0; letter-spacing: 0.04em; }
   .thread-head .sub { color: var(--muted); font-size: 0.85rem; }
-  .back { display: none; }
+  .close-chat { margin-left: auto; }
   .lines { list-style: none; margin: 0; padding: 1rem; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 0.35rem; }
   .lines .day { align-self: center; color: var(--muted); font-size: 0.8rem; margin: 0.5rem 0; }
   .bubble {
@@ -113,7 +114,10 @@
   .bubble.mine { background: var(--mine); color: var(--mine-ink); border-color: transparent; align-self: flex-end; }
   .bubble .meta { display: block; font-size: 0.75rem; opacity: 0.8; margin-top: 0.15rem; text-align: right; }
   .bubble.failed { outline: 2px solid var(--bad); }
+  .bubble.cancelled { opacity: 0.7; }
   .bubble.unverified .meta { color: var(--warn); opacity: 1; }
+  .bubble.mine .btn.danger { color: var(--mine-ink); }
+  .bubble .btn.drop { display: block; margin-top: 0.35rem; margin-left: auto; }
   .composer { display: flex; gap: 0.5rem; padding: 0.75rem; border-top: 1px solid var(--rule); align-items: end; }
   .composer textarea { min-height: 2.6rem; max-height: 10rem; resize: none; }
   .composer .btn { margin: 0; }
@@ -122,7 +126,6 @@
     .chat { grid-template-columns: minmax(0, 1fr); height: calc(100vh - 10rem); }
     .chat.open .convos { display: none; }
     .chat:not(.open) .thread { display: none; }
-    .back { display: inline-block; }
   }
 
   /* Mail */
@@ -177,6 +180,19 @@
   .peer input:first-child { text-transform: uppercase; }
   dl.fixed { margin: 0.75rem 0 0; font-size: 0.9rem; color: var(--muted); display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.1rem 0.75rem; }
   dl.fixed dd { margin: 0; overflow-wrap: anywhere; }
+  .locator-row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: stretch; }
+  .locator-row input { flex: 1 1 10rem; width: auto; }
+  .locator-row .btn { margin: 0; white-space: nowrap; }
+  .locator-fuzz { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: end; margin-top: 0.5rem; }
+  .locator-fuzz > div { flex: 1 1 12rem; }
+  .locator-fuzz label { margin-top: 0; }
+  #locator-map {
+    height: 18rem; margin-top: 0.6rem; border: 1px solid var(--rule); border-radius: 6px;
+    background: var(--raised); z-index: 0;
+  }
+  #locator-map .leaflet-container { height: 100%; width: 100%; border-radius: 6px; font: inherit; }
+  #locator-hint { font-size: 0.85rem; color: var(--muted); margin: 0.35rem 0 0; min-height: 1.2em; }
+  #locator-hint.bad { color: var(--bad); } #locator-hint.ok { color: var(--ok); }
 </style>
 </head>
 <body>
@@ -193,7 +209,7 @@
   </div>
   <form id="token-form" hidden>
     <label for="token">Access token <span class="hint">(printed by <code>hm node</code> at start-up, and kept in <code>station.token</code>)</span></label>
-    <input id="token" autocomplete="off" spellcheck="false">
+    <input id="token" type="password" autocomplete="off" spellcheck="false">
     <button class="btn" type="submit">Use token</button>
   </form>
   <nav class="tabs" aria-label="Views">
@@ -215,9 +231,9 @@
       </div>
       <div class="card thread">
         <div class="thread-head" id="thread-head" hidden>
-          <a class="btn quiet small back" href="#chat">Back</a>
           <h2 id="thread-call"></h2>
           <span class="sub" id="thread-sub"></span>
+          <a class="btn quiet small close-chat" href="#chat">Close chat</a>
         </div>
         <ol class="lines" id="lines" aria-live="polite"></ol>
         <form class="composer" id="composer" autocomplete="off" hidden>
@@ -284,8 +300,26 @@
     <form class="card settings" id="settings-form" autocomplete="off">
       <fieldset>
         <legend>Station</legend>
-        <label for="locator">Grid locator <span class="hint">(like JO89xi; sent in beacons, empty for none)</span></label>
-        <input id="locator" maxlength="6" spellcheck="false" pattern="[A-Ra-r]{2}[0-9]{2}([A-Xa-x]{2})?">
+        <label for="locator">Grid locator <span class="hint">(Maidenhead square sent in beacons; empty for none)</span></label>
+        <div class="locator-row">
+          <input id="locator" maxlength="6" spellcheck="false" pattern="[A-Ra-r]{2}[0-9]{2}([A-Xa-x]{2})?" placeholder="AA00aa" autocomplete="off">
+          <button class="btn quiet" type="button" id="locator-gps">Use my location</button>
+        </div>
+        <div class="locator-fuzz">
+          <div>
+            <label for="locator-range">Privacy range <span class="hint">(GPS and map click pick a square at random within this)</span></label>
+            <select id="locator-range">
+              <option value="5">± 5 km</option>
+              <option value="10" selected>± 10 km</option>
+              <option value="25">± 25 km</option>
+              <option value="50">± 50 km</option>
+              <option value="0">Exact (no offset)</option>
+            </select>
+          </div>
+          <button class="btn quiet" type="button" id="locator-reroll" hidden>Pick another square in range</button>
+        </div>
+        <div id="locator-map" role="application" aria-label="Map: click to set grid locator"></div>
+        <p id="locator-hint" role="status">Click the map or use your location; a nearby square is chosen within the range. Or type one.</p>
       </fieldset>
       <fieldset>
         <legend>Radio</legend>
@@ -402,7 +436,10 @@ function route() {
   if (name === "chat") openThread(arg ? decodeURIComponent(arg).toUpperCase() : null);
   if (name === "mail") quietly(loadMail());
   if (name === "stations") quietly(loadTrust());
-  if (name === "settings") quietly(loadSettings(true));
+  if (name === "settings") {
+    quietly(loadSettings(true));
+    quietly(ensureLocatorMap());
+  }
 }
 window.addEventListener("hashchange", route);
 
@@ -473,8 +510,33 @@ function describeLine(m) {
     return [hhmm(m.at) + " · delivered" + (m.delivered_by ? " by " + m.delivered_by : "") + (m.verified ? " ✓" : ""), ""];
   }
   if (m.state === "Failed") return [hhmm(m.at) + " · not delivered: " + (m.note || "gave up"), "failed"];
+  if (m.state === "Cancelled") return [hhmm(m.at) + " · dropped from queue", "cancelled"];
+  if (m.state === "InTransit") return [hhmm(m.at) + " · relayed; awaiting destination receipt", ""];
   const next = m.next_attempt * 1000 > Date.now() ? ", next try " + hhmm(m.next_attempt) : "";
   return [hhmm(m.at) + " · waiting" + (m.attempts ? " (" + m.attempts + " tries" + next + ")" : ""), ""];
+}
+
+function dropButton(id) {
+  const b = el("button", "btn danger small drop", "Drop message");
+  b.type = "button";
+  b.setAttribute("aria-label", "Drop this queued message");
+  b.addEventListener("click", async () => {
+    b.disabled = true;
+    b.textContent = "Dropping…";
+    try {
+      const r = await api("/api/messages/" + id, { method: "DELETE" });
+      if (!r.ok) {
+        const detail = await r.json().catch(() => ({}));
+        throw new Error(detail.error || r.statusText);
+      }
+      await Promise.all([loadChats(), loadMail()]);
+    } catch (e) {
+      b.disabled = false;
+      b.textContent = "Drop message";
+      alert("Could not drop message: " + e.message);
+    }
+  });
+  return b;
 }
 
 function renderThread() {
@@ -488,6 +550,7 @@ function renderThread() {
     const [meta, cls] = describeLine(m);
     const li = el("li", "bubble " + (m.direction === "out" ? "mine " : "") + cls);
     li.append(el("span", null, m.text !== null ? m.text : "(no text)"), el("span", "meta", meta));
+    if (m.direction === "out" && m.state === "Queued") li.append(dropButton(m.id));
     ol.append(li);
   }
   ol.scrollTop = ol.scrollHeight;
@@ -540,6 +603,8 @@ function describeOut(m) {
     return m.verified ? ["Delivered" + by + ", receipt verified", "ok"] : ["Delivered" + by + ", receipt not verified (no key for the receiver)", "warn"];
   }
   if (m.state === "Failed") return ["Not delivered: " + (m.note || "gave up"), "bad"];
+  if (m.state === "Cancelled") return ["Dropped from queue", ""];
+  if (m.state === "InTransit") return ["Relayed; awaiting destination receipt", "warn"];
   const next = m.next_attempt * 1000 > Date.now() ? ", next try " + hhmm(m.next_attempt) : "";
   return ["Queued" + (m.attempts ? " after " + m.attempts + " attempt" + (m.attempts > 1 ? "s" : "") : "") + next, "warn"];
 }
@@ -576,6 +641,7 @@ async function loadMail() {
     } else {
       const [text, cls] = describeOut(m);
       body.append(el("span", "state " + cls, text));
+      if (m.state === "Queued") body.append(dropButton(m.id));
     }
     li.append(when, who, body);
     log.append(li);
@@ -710,6 +776,195 @@ const radioNumbers = ["txdelay_ms", "tnc_port", "persist", "slottime_ms", "bitra
 const liveFields = ["beacon_minutes", "radio_cost", "internet_cost", "modem_cost", "retry_first_secs", "retry_max_secs", "retry_attempts"];
 let settingsFile = null;
 
+// Maidenhead grid: same rules as hm_wire::Locator (4 or 6 characters).
+const LOCATOR_RE = /^[A-R]{2}[0-9]{2}([A-X]{2})?$/i;
+
+function latLonToLocator(lat, lon) {
+  // Clamp just inside the poles / antimeridian so the last square stays valid.
+  const la = Math.min(89.999999, Math.max(-90, lat));
+  const lo = Math.min(179.999999, Math.max(-180, lon));
+  const adjLon = lo + 180;
+  const adjLat = la + 90;
+  const f0 = Math.floor(adjLon / 20);
+  const f1 = Math.floor(adjLat / 10);
+  const s0 = Math.floor((adjLon % 20) / 2);
+  const s1 = Math.floor(adjLat % 10);
+  const u0 = Math.floor((adjLon % 2) / (2 / 24));
+  const u1 = Math.floor((adjLat % 1) / (1 / 24));
+  return String.fromCharCode(65 + f0, 65 + f1)
+    + String(s0) + String(s1)
+    + String.fromCharCode(97 + u0, 97 + u1);
+}
+
+function locatorToCentre(s) {
+  const t = s.trim();
+  if (!LOCATOR_RE.test(t)) return null;
+  const b = t.toUpperCase();
+  let lon = -180 + (b.charCodeAt(0) - 65) * 20 + (b.charCodeAt(2) - 48) * 2;
+  let lat = -90 + (b.charCodeAt(1) - 65) * 10 + (b.charCodeAt(3) - 48);
+  if (b.length === 6) {
+    lon += (b.charCodeAt(4) - 65) * (2 / 24) + 1 / 24;
+    lat += (b.charCodeAt(5) - 65) * (1 / 24) + 0.5 / 24;
+  } else {
+    lon += 1;
+    lat += 0.5;
+  }
+  return { lat, lon };
+}
+
+function formatLocator(s) {
+  const t = s.trim();
+  if (!LOCATOR_RE.test(t)) return null;
+  const u = t.toUpperCase();
+  return u.length === 6 ? u.slice(0, 4) + u.slice(4).toLowerCase() : u;
+}
+
+function locatorHint(text, cls) {
+  const n = $("locator-hint");
+  n.className = cls || "";
+  n.textContent = text;
+}
+
+let locatorMap = null;
+let locatorMarker = null;
+let locatorCircle = null;
+let locatorAnchor = null; // last GPS/map point before privacy offset
+let leafletPromise = null;
+
+function loadLeaflet() {
+  if (window.L) return Promise.resolve(window.L);
+  if (leafletPromise) return leafletPromise;
+  leafletPromise = new Promise((resolve, reject) => {
+    const css = document.createElement("link");
+    css.rel = "stylesheet";
+    css.href = "https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css";
+    css.integrity = "sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=";
+    css.crossOrigin = "anonymous";
+    document.head.append(css);
+    const script = document.createElement("script");
+    script.src = "https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js";
+    script.integrity = "sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=";
+    script.crossOrigin = "anonymous";
+    script.onload = () => resolve(window.L);
+    script.onerror = () => {
+      leafletPromise = null;
+      reject(new Error("Could not load the map library (need a network for tiles)."));
+    };
+    document.head.append(script);
+  });
+  return leafletPromise;
+}
+
+function locatorRangeKm() {
+  return Number($("locator-range").value) || 0;
+}
+
+/** Uniform random point within `km` of (lat, lon). */
+function fuzzAround(lat, lon, km) {
+  if (km <= 0) return { lat, lon };
+  const bearing = Math.random() * 2 * Math.PI;
+  const dist = Math.sqrt(Math.random()) * km; // uniform in disk
+  const dLat = (dist / 111.32) * Math.cos(bearing);
+  const cosLat = Math.cos((lat * Math.PI) / 180);
+  const dLon = cosLat < 1e-6 ? 0 : (dist / (111.32 * cosLat)) * Math.sin(bearing);
+  return {
+    lat: Math.min(90, Math.max(-90, lat + dLat)),
+    lon: ((lon + dLon + 540) % 360) - 180,
+  };
+}
+
+function clearLocatorOverlay() {
+  if (locatorMarker) { locatorMarker.remove(); locatorMarker = null; }
+  if (locatorCircle) { locatorCircle.remove(); locatorCircle = null; }
+}
+
+function setLocatorFromLatLon(lat, lon, source) {
+  locatorAnchor = { lat, lon };
+  $("locator-reroll").hidden = locatorRangeKm() <= 0;
+  applyLocatorFromAnchor(source);
+}
+
+function applyLocatorFromAnchor(source) {
+  if (!locatorAnchor) return;
+  const km = locatorRangeKm();
+  const fuzzed = fuzzAround(locatorAnchor.lat, locatorAnchor.lon, km);
+  const loc = latLonToLocator(fuzzed.lat, fuzzed.lon);
+  $("locator").value = loc;
+  syncLocatorMap(loc, true);
+  const via = source === "gps" ? "your location"
+    : source === "map" ? "the map"
+    : source === "reroll" ? "the same place"
+    : "the placed point";
+  locatorHint(
+    km > 0
+      ? "Beacon square " + loc + " (random within ±" + km + " km of " + via + "). Save settings to apply."
+      : "Beacon square " + loc + " (exact). Save settings to apply.",
+    "ok"
+  );
+}
+
+function syncLocatorMap(value, pan) {
+  if (!locatorMap) return;
+  const loc = formatLocator(value || "");
+  if (!loc) {
+    clearLocatorOverlay();
+    return;
+  }
+  const c = locatorToCentre(loc);
+  if (!c) return;
+  const L = window.L;
+  if (locatorMarker) locatorMarker.setLatLng(c);
+  else locatorMarker = L.marker(c).addTo(locatorMap);
+
+  const km = locatorRangeKm();
+  const centre = locatorAnchor || c;
+  if (km > 0) {
+    if (locatorCircle) {
+      locatorCircle.setLatLng(centre);
+      locatorCircle.setRadius(km * 1000);
+    } else {
+      locatorCircle = L.circle(centre, {
+        radius: km * 1000,
+        color: "#0f5c8c",
+        weight: 1,
+        fillOpacity: 0.08,
+      }).addTo(locatorMap);
+    }
+  } else if (locatorCircle) {
+    locatorCircle.remove();
+    locatorCircle = null;
+  }
+
+  if (pan) {
+    if (km > 0 && locatorCircle) {
+      locatorMap.fitBounds(locatorCircle.getBounds().pad(0.15));
+    } else {
+      locatorMap.setView(c, Math.max(locatorMap.getZoom(), loc.length === 6 ? 10 : 7));
+    }
+  }
+}
+
+async function ensureLocatorMap() {
+  try {
+    const L = await loadLeaflet();
+    if (!locatorMap) {
+      locatorMap = L.map($("locator-map"), { worldCopyJump: true }).setView([20, 0], 2);
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 18,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+      }).addTo(locatorMap);
+      locatorMap.on("click", (ev) => setLocatorFromLatLon(ev.latlng.lat, ev.latlng.lng, "map"));
+    }
+    // Hidden maps need a size pass once the Settings view is shown.
+    requestAnimationFrame(() => {
+      locatorMap.invalidateSize();
+      syncLocatorMap($("locator").value, true);
+    });
+  } catch (e) {
+    locatorHint(e.message + " You can still type a locator.", "bad");
+  }
+}
+
 function peerRow(p) {
   const row = el("div", "peer");
   const call = el("input"); call.value = p.station; call.placeholder = "SO5KM"; call.maxLength = 9;
@@ -728,12 +983,25 @@ function settingsNote(text, cls) {
   n.textContent = text;
 }
 
+function settingsBusy() {
+  const form = $("settings-form");
+  const ae = document.activeElement;
+  if (form.contains(ae) && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.tagName === "SELECT" || ae.tagName === "BUTTON")) {
+    return true;
+  }
+  // Leaflet keeps focus on the map pane while panning/zooming.
+  return !!(locatorMap && locatorMap.getContainer().contains(ae));
+}
+
 function showSettings(v, force) {
   settingsFile = v.file;
-  // Leave the form alone while someone is editing it.
-  if (!force && $("settings-form").contains(document.activeElement) && document.activeElement.tagName === "INPUT") return;
+  // Leave the form alone while someone is editing it or using the map.
+  if (!force && settingsBusy()) return;
   for (const k of liveFields) $(k).value = v.live[k];
   $("locator").value = v.live.locator || "";
+  locatorAnchor = null;
+  $("locator-reroll").hidden = true;
+  syncLocatorMap($("locator").value, true);
   const r = v.live.radio;
   $("r-enabled").checked = r.enabled;
   for (const k of radioText.concat(radioNumbers)) $("r-" + k).value = r[k];
@@ -765,6 +1033,59 @@ $("add-peer").addEventListener("click", () => {
   const row = peerRow({ station: "", address: "" });
   $("peers").append(row);
   row.querySelector("input").focus();
+});
+
+$("locator").addEventListener("input", () => {
+  const raw = $("locator").value.trim();
+  locatorAnchor = null;
+  $("locator-reroll").hidden = true;
+  if (!raw) {
+    syncLocatorMap("", false);
+    locatorHint("Click the map or use your location; a nearby square is chosen within the range. Or type one.");
+    return;
+  }
+  const loc = formatLocator(raw);
+  if (loc) {
+    syncLocatorMap(loc, true);
+    locatorHint(loc.length === 6 ? loc : loc + " (4-character square).", "");
+  } else {
+    locatorHint("Not a Maidenhead locator (e.g. AA00 or AA00aa).", "bad");
+  }
+});
+
+$("locator").addEventListener("change", () => {
+  const loc = formatLocator($("locator").value);
+  if (loc) $("locator").value = loc;
+});
+
+$("locator-range").addEventListener("change", () => {
+  $("locator-reroll").hidden = !locatorAnchor || locatorRangeKm() <= 0;
+  if (locatorAnchor) applyLocatorFromAnchor("range");
+  else syncLocatorMap($("locator").value, true);
+});
+
+$("locator-reroll").addEventListener("click", () => {
+  if (!locatorAnchor) return;
+  applyLocatorFromAnchor("reroll");
+});
+
+$("locator-gps").addEventListener("click", () => {
+  if (!navigator.geolocation) {
+    locatorHint("This browser cannot give a location. Type a locator or click the map.", "bad");
+    return;
+  }
+  locatorHint("Finding your location…");
+  navigator.geolocation.getCurrentPosition(
+    (pos) => setLocatorFromLatLon(pos.coords.latitude, pos.coords.longitude, "gps"),
+    (err) => {
+      const why = err.code === 1 ? "Permission denied"
+        : err.code === 2 ? "Location unavailable"
+        : err.code === 3 ? "Timed out"
+        : "Could not read location";
+      locatorHint(why + ". Type a locator or click the map.", "bad");
+    },
+    { enableHighAccuracy: true, timeout: 15000, maximumAge: 60000 }
+  );
 });
 
 $("settings-form").addEventListener("submit", async (ev) => {
@@ -864,6 +1185,7 @@ async function listen() {
 $("token-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
   localStorage.setItem("hm-token", $("token").value.trim());
+  $("token").value = "";
   onChange.all();
 });
 

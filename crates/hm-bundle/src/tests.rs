@@ -152,6 +152,12 @@ fn validation_rules() {
     let receipt_without_ref =
         Bundle::new(call("SO5KM"), Kind::Receipt, 0, 60).to(Address::Station(call("SA0KAM")));
     assert!(receipt_without_ref.seal(&me()).is_err());
+    let nonminimal_receipt =
+        Bundle::receipt(call("SO5KM"), call("SA0KAM"), ObjectId([1; 32]), 0, 60).with_text("extra");
+    assert!(nonminimal_receipt.seal(&me()).is_err());
+    let multicast_receipt = Bundle::receipt(call("SO5KM"), call("SA0KAM"), ObjectId([1; 32]), 0, 60)
+        .to(Address::Station(call("SP5AAA")));
+    assert!(multicast_receipt.seal(&me()).is_err());
 }
 
 #[test]
@@ -177,6 +183,54 @@ fn expiry() {
     let b = chat();
     assert!(!b.is_expired(1_790_000_000 + 3599));
     assert!(b.is_expired(1_790_000_000 + 3600));
+}
+
+#[test]
+fn max_hops_is_bounded_and_default_is_canonical() {
+    assert_eq!(chat().max_hops(), DEFAULT_MAX_HOPS);
+    assert_eq!(chat().with_max_hops(DEFAULT_MAX_HOPS).max_hops, None);
+    let signed = chat().with_max_hops(3).seal(&me()).unwrap();
+    let opened = Opened::decode(&signed.to_vec()).unwrap();
+    assert_eq!(opened.bundle.max_hops(), 3);
+    assert!(chat().with_max_hops(0).seal(&me()).is_err());
+    assert!(chat().with_max_hops(MAX_HOPS + 1).seal(&me()).is_err());
+    let mut noncanonical = chat();
+    noncanonical.max_hops = Some(DEFAULT_MAX_HOPS);
+    assert!(noncanonical.seal(&me()).is_err());
+}
+
+#[test]
+fn codec_one_uses_the_pinned_dictionary_and_vector() {
+    assert_eq!(
+        blake3::hash(ZSTD_DICTIONARY).to_hex().as_str(),
+        ZSTD_DICTIONARY_BLAKE3
+    );
+    let text = "Net control calling all stations. Check in with callsign, location, and traffic. \
+        Net control calling all stations. Please acknowledge receipt.";
+    let body = Body::text(text);
+    assert_eq!(body.codec, Codec::Zstd);
+    assert_eq!(
+        body.data,
+        [
+            0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x8e, 0x75, 0x00, 0x00, 0x08, 0x20, 0x03, 0x00, 0x08, 0x25, 0x04,
+            0x2a, 0x9c, 0xeb, 0x60, 0x74, 0x05, 0x01,
+        ]
+    );
+    assert_eq!(body.as_text().unwrap(), text);
+    assert_eq!(Body::text("73").codec, Codec::Plain);
+}
+
+#[test]
+fn codec_one_rejects_invalid_and_oversized_output() {
+    let malformed = Body {
+        codec: Codec::Zstd,
+        data: vec![1, 2, 3],
+    };
+    assert!(malformed.as_text().is_err());
+    let too_large = "A".repeat(MAX_DECOMPRESSED_BODY + 1);
+    let compressed = Body::text(&too_large);
+    assert_eq!(compressed.codec, Codec::Zstd);
+    assert!(compressed.as_text().is_err());
 }
 
 #[test]

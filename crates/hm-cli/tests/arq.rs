@@ -277,6 +277,8 @@ fn start(
             bandwidth: 2300,
             ptt,
         }),
+        relay: Default::default(),
+        schedules: vec![],
         store: db.0.clone(),
         http: "127.0.0.1:0".parse().unwrap(),
         token: "t".into(),
@@ -369,9 +371,13 @@ fn exchange_through(kind: Kind, tag: &str) {
                 .find(|m| m["state"] == "Delivered")
                 .cloned()
         });
-        assert_eq!(
-            (sent["delivered_by"].as_str(), sent["verified"].as_bool()),
-            (Some("modem"), Some(true))
+        assert_eq!(sent["verified"], true, "{sent}");
+        // The end-to-end receipt can beat the modem's hop receipt when the
+        // caller disconnects. That still proves final delivery, but leaves no
+        // locally confirmed custody bearer to display.
+        assert!(
+            sent["delivered_by"].is_null() || sent["delivered_by"] == "modem",
+            "{sent}"
         );
     }
     // A keyed the radio when its modem asked, and let go again.

@@ -1,14 +1,13 @@
 [package]
-name = "hm-wire"
-description = "Wire primitives: base-40 callsigns, radio frame headers, ACKs, object ids"
+name = "hm-route"
+description = "Bayesian contact graph and capacity-aware delay-tolerant routing"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-minicbor.workspace = true
-blake3.workspace = true
+hm-wire = { path = "../hm-wire" }
 
 [dev-dependencies]
 proptest.workspace = true

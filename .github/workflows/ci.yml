@@ -71,4 +71,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - run: cargo check --target ${{ matrix.target }} -p hm-core -p hm-wire -p hm-ident -p hm-bundle
+      # These are the no_std + alloc protocol builds. hm-bundle's default
+      # `std` feature enables zstd-sys, which correctly needs each platform's
+      # C toolchain and is already exercised by the native jobs above.
+      - run: cargo check --target ${{ matrix.target }} --no-default-features -p hm-core -p hm-wire -p hm-ident -p hm-bundle

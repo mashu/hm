@@ -252,6 +252,14 @@ pub enum Command {
         object: Vec<u8>,
         precedence: u8,
     },
+    /// Application durably stored (or refused) a just-received object.
+    Accept {
+        from: Callsign,
+        id: ObjectId,
+        accepted: bool,
+        /// Zero means refuse permanently; otherwise ask the sender to retry.
+        retry_after: u16,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -351,6 +359,7 @@ struct Incoming {
     esis: BTreeSet<u32>,
     decoded: Option<Vec<u8>>,
     done: bool,
+    awaiting_application: bool,
     /// Our signature proving completion, sent in every final ACK.
     receipt: Option<[u8; 64]>,
     ack_at: Option<Millis>,
@@ -368,6 +377,7 @@ impl Incoming {
             esis: BTreeSet::new(),
             decoded: None,
             done: false,
+            awaiting_application: false,
             receipt: None,
             ack_at: None,
             last_heard: now,
@@ -415,6 +425,8 @@ pub struct Xfer {
     open_replies: BTreeSet<Callsign>,
     /// CLOSEs to send once the peer's over ends: (peer, session) -> (close, when).
     closes: BTreeMap<(Callsign, u16), (Close, Millis)>,
+    /// Delay the custody receipt until the application confirms durable storage.
+    application_ack: bool,
 }
 
 impl Xfer {
@@ -438,12 +450,18 @@ impl Xfer {
             peers: BTreeMap::new(),
             open_replies: BTreeSet::new(),
             closes: BTreeMap::new(),
+            application_ack: false,
         })
     }
 
     /// Change the feature bits sent in OPEN (for example once the link is known).
     pub fn set_features(&mut self, features: u32) {
         self.cfg.features = features;
+    }
+
+    /// Require [`Command::Accept`] before signing the final custody ACK.
+    pub fn set_application_ack(&mut self, enabled: bool) {
+        self.application_ack = enabled;
     }
 
     /// What `peer` told us in its latest OPEN, if it sent one lately.
@@ -1021,7 +1039,7 @@ impl Xfer {
         let inc = self.incoming.get_mut(&key).expect("slot ensured");
         inc.last_heard = now;
         inc.ack_at = Some(ack_at);
-        if inc.done || inc.decoded.is_some() || !inc.esis.insert(esi) {
+        if inc.done || inc.awaiting_application || inc.decoded.is_some() || !inc.esis.insert(esi) {
             return;
         }
         let packet = EncodingPacket::new(PayloadId::new(0, esi), symbol.to_vec());
@@ -1041,7 +1059,6 @@ impl Xfer {
 
     /// Check a decoded object against the offered hash and deliver it.
     fn finish(&mut self, now: Millis, key: (Callsign, u16), data: Vec<u8>, out: &mut Vec<Output<Event>>) {
-        let ttl = self.cfg.done_ttl;
         let id = self.incoming[&key].id.expect("caller checked");
         if object_id(&data) != id {
             // A bad symbol got through; start over.
@@ -1051,18 +1068,71 @@ impl Xfer {
                 .reset_decoder();
             return;
         }
-        let receipt = self.sign_receipt(key, &id);
-        let inc = self.incoming.get_mut(&key).expect("caller holds the key");
-        inc.receipt = Some(receipt);
-        inc.done = true;
-        inc.last_heard = now;
-        if self.seen.insert(id, now + ttl).is_none() {
+        if self.application_ack {
+            let inc = self.incoming.get_mut(&key).expect("caller holds the key");
+            inc.awaiting_application = true;
+            inc.last_heard = now;
+            out.push(Output::Event(Event::Received {
+                from: key.0,
+                id,
+                object: data,
+            }));
+        } else {
+            self.complete_incoming(now, key, id);
             out.push(Output::Event(Event::Received {
                 from: key.0,
                 id,
                 object: data,
             }));
         }
+    }
+
+    fn complete_incoming(&mut self, now: Millis, key: (Callsign, u16), id: ObjectId) {
+        let receipt = self.sign_receipt(key, &id);
+        let inc = self.incoming.get_mut(&key).expect("caller holds the key");
+        inc.receipt = Some(receipt);
+        inc.done = true;
+        inc.awaiting_application = false;
+        inc.last_heard = now;
+        self.seen.insert(id, now + self.cfg.done_ttl);
+    }
+
+    fn application_verdict(
+        &mut self,
+        now: Millis,
+        from: Callsign,
+        id: ObjectId,
+        accepted: bool,
+        retry_after: u16,
+    ) {
+        let key = self
+            .incoming
+            .iter()
+            .find(|((peer, _), incoming)| {
+                *peer == from && incoming.id == Some(id) && incoming.awaiting_application
+            })
+            .map(|(key, _)| *key);
+        let Some(key) = key else { return };
+        if accepted {
+            self.complete_incoming(now, key, id);
+            self.incoming.get_mut(&key).expect("completed above").ack_at = Some(now);
+            return;
+        }
+        self.incoming.remove(&key);
+        self.closes.insert(
+            key,
+            (
+                Close {
+                    reason: if retry_after == 0 {
+                        CloseReason::Refused
+                    } else {
+                        CloseReason::Busy
+                    },
+                    retry_after,
+                },
+                now,
+            ),
+        );
     }
 
     fn send_due_acks(&mut self, now: Millis, out: &mut Vec<Output<Event>>) {
@@ -1264,6 +1334,12 @@ impl Machine for Xfer {
                 object,
                 precedence,
             }) => self.enqueue(now, to, object, precedence, out),
+            Input::Command(Command::Accept {
+                from,
+                id,
+                accepted,
+                retry_after,
+            }) => self.application_verdict(now, from, id, accepted, retry_after),
             Input::Frame { port, data } if port == self.cfg.port => self.on_frame(now, &data, out),
             Input::Frame { .. } => {}
         }

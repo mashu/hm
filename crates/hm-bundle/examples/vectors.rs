@@ -6,12 +6,12 @@
 //! signatures are deterministic.
 
 use hm_bearer::{ax25, kiss};
-use hm_bundle::{Address, Bundle, Kind, Precedence};
+use hm_bundle::{Address, Body, Bundle, Codec, Kind, Precedence, ZSTD_DICTIONARY};
 use hm_core::{DetRng, Input, Machine, Millis, Output};
 use hm_ident::{Attestation, BindingRecord, Identity, BINDING, BUNDLE};
 use hm_wire::{
-    Ack, Callsign, Close, CloseReason, Dest, FrameHeader, FrameType, Heard, Locator, CTRL_CLOSE, CTRL_OFFER,
-    CTRL_OPEN, FLAG_MAILBOX,
+    Ack, Callsign, Close, CloseReason, ContactAdvert, ContactBearer, Dest, FrameHeader, FrameType, Heard,
+    Locator, ObjectId, SyncFilter, SyncOffer, SyncWant, CTRL_CLOSE, CTRL_OFFER, CTRL_OPEN, FLAG_MAILBOX,
 };
 use hm_xfer::beacon::beacon_frame;
 use hm_xfer::{object_id, Command, Config, Xfer};
@@ -67,6 +67,56 @@ fn main() {
     };
     println!("{}", hex(&a.to_vec().unwrap()));
 
+    println!("\n## Body codec 1 (hm-net v0 Zstandard dictionary)");
+    println!("dictionary_blake3 {}", blake3::hash(ZSTD_DICTIONARY).to_hex());
+    let codec_text = "Net control calling all stations. Check in with callsign, location, and traffic. \
+        Net control calling all stations. Please acknowledge receipt.";
+    let compressed = Body::text(codec_text);
+    assert_eq!(compressed.codec, Codec::Zstd);
+    println!("text {:?}", codec_text);
+    println!("compressed {}", hex(&compressed.data));
+    println!("plain_size {}", codec_text.len());
+    println!("compressed_size {}", compressed.data.len());
+
+    println!("\n## Phase 2 SYNC");
+    let sender = Identity::from_secret([7; 32]);
+    let mut contact = ContactAdvert {
+        origin: call("SA0KAM"),
+        sequence: 7,
+        start: 1_790_000_000,
+        end: 1_790_003_600,
+        peer: call("SO5KM-1"),
+        bearer: ContactBearer::Radio,
+        success_permyriad: 8_750,
+        rate_bps: 9_600,
+        capacity_bytes: 32_768,
+        flags: FLAG_MAILBOX,
+        signature: [0; 64],
+    };
+    contact.signature = sender.sign(&contact.signing_statement().unwrap());
+    println!("contact {}", hex(&contact.encode().unwrap()));
+    let present = ObjectId(*blake3::hash(b"present").as_bytes());
+    let mut filter = SyncFilter::new(0, 5, 0x1234_5678, 8).unwrap();
+    filter.insert(&present).unwrap();
+    println!("filter  {}", hex(&filter.encode().unwrap()));
+    println!(
+        "offer   {}",
+        hex(&SyncOffer {
+            scope: 0,
+            prefixes: vec![present.prefix8()]
+        }
+        .encode()
+        .unwrap())
+    );
+    println!(
+        "want    {}",
+        hex(&SyncWant {
+            prefixes: vec![present.prefix8()]
+        }
+        .encode()
+        .unwrap())
+    );
+
     let me = Identity::from_secret([11; 32]);
     let club = Identity::from_secret([21; 32]);
     println!("\n## Binding record (secret 0x0b x 32, attested by Q0CLUB with secret 0x15 x 32)");
@@ -85,7 +135,6 @@ fn main() {
     println!("wire {}", hex(&signed.to_vec()));
     assert_eq!(signed.envelope().id(&BINDING), signed.id());
 
-    let sender = Identity::from_secret([7; 32]);
     println!("\n## Chat bundle (secret 0x07 x 32)");
     println!("public key {}", hex(&sender.public().0));
     let chat = Bundle::new(call("SA0KAM"), Kind::Chat, 1_790_000_000, 3600)
