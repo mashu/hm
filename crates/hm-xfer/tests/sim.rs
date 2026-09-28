@@ -535,3 +535,131 @@ fn a_silent_station_does_not_hold_up_the_others() {
         "within minutes, not after the silent transfer's rounds"
     );
 }
+
+/// One 2 kB transfer on a 300 bd HF path fading at `spread` Hz around
+/// `snr_db`, with `cfg` at both ends: (delivered, latency, airtime of both).
+fn hf_run(seed: u64, cfg: &dyn Fn(&str) -> Config, snr_db: f64, spread: f64) -> (bool, Millis, Millis) {
+    let mut sim = XferSim::new(seed, RadioParams::HF_300);
+    let [ra, rb] = [sim.machine_rng(0), sim.machine_rng(1)];
+    let make = |me: &str, rng, peer: &str| {
+        let mut x = Xfer::new(cfg(me), identity(me), rng).unwrap();
+        x.trust(call(peer), identity(peer).public());
+        x
+    };
+    let a = sim.add_node(make("SA0KAM", ra, "SO5KM-1"));
+    let b = sim.add_node(make("SO5KM-1", rb, "SA0KAM"));
+    sim.link(
+        a,
+        b,
+        Loss::Fading {
+            curve: &hm_sim::afsk_1200::CURVE,
+            mean_snr_db: snr_db,
+            doppler_spread_hz: spread,
+            rician_k: 0.0,
+        },
+    );
+    sim.command_at(
+        Millis(0),
+        a,
+        Command::Send {
+            to: call("SO5KM-1"),
+            object: object(2000, seed),
+            precedence: 0,
+        },
+    );
+    sim.run_until(Millis::from_secs(3 * 3600));
+    let done = sim.events().iter().find_map(|(t, n, e)| match e {
+        Event::Delivered { .. } if *n == a => Some(*t),
+        _ => None,
+    });
+    let air = Millis(sim.report().channels[0].airtime_ms);
+    (done.is_some(), done.unwrap_or(Millis::ZERO), air)
+}
+
+/// On a 300 bd HF path fading with a 0.5 Hz Doppler spread (CCIR 520
+/// "moderate") at 20 dB, the link sizing of [`Config::hf_300`] (64-byte
+/// symbols, overs up to 60 s) delivers everything, sooner and with less
+/// airtime than the VHF 1200 sizes the daemon used at 300 bd before (200-byte
+/// symbols).
+#[test]
+fn hf_link_sizing_on_a_fading_path() {
+    let hf = |me: &str| Config::hf_300(call(me));
+    let vhf_sized = |me: &str| {
+        let mut c = Config::vhf_1200(call(me));
+        c.bitrate_bps = 300;
+        c.max_over = Millis::from_secs(120);
+        c
+    };
+    let measure = |cfg: &dyn Fn(&str) -> Config| {
+        let runs: Vec<_> = (0..20).map(|s| hf_run(s, cfg, 20.0, 0.5)).collect();
+        let delivered = runs.iter().filter(|r| r.0).count();
+        let mut latency: Vec<u64> = runs.iter().filter(|r| r.0).map(|r| r.1 .0).collect();
+        latency.sort_unstable();
+        let airtime = runs.iter().map(|r| r.2 .0).sum::<u64>() / runs.len() as u64;
+        (delivered, latency[latency.len() / 2], airtime)
+    };
+    let (hf_ok, hf_p50, hf_air) = measure(&hf);
+    let (vhf_ok, vhf_p50, vhf_air) = measure(&vhf_sized);
+    eprintln!(
+        "2 kB at 300 bd, 0.5 Hz fading, 20 dB: hf_300 {hf_ok}/20, p50 {:.0} s, airtime {:.0} s; \
+         VHF-sized {vhf_ok}/20, p50 {:.0} s, airtime {:.0} s",
+        hf_p50 as f64 / 1e3,
+        hf_air as f64 / 1e3,
+        vhf_p50 as f64 / 1e3,
+        vhf_air as f64 / 1e3
+    );
+    assert_eq!(hf_ok, 20);
+    assert!(hf_p50 < vhf_p50 && hf_air * 10 < vhf_air * 9);
+}
+
+#[test]
+#[ignore = "exploration: HF link parameters on fading channels"]
+fn explore_hf_parameters_on_fading() {
+    for spread in [0.1, 0.5, 1.0] {
+        for snr in [17.0, 20.0, 24.0] {
+            for symbol in [64u16, 128, 200] {
+                for over in [20u64, 60, 120] {
+                    let cfg = |me: &str| {
+                        let mut c = Config::hf_300(call(me));
+                        c.symbol_size = symbol;
+                        c.max_over = Millis::from_secs(over);
+                        c
+                    };
+                    let runs: Vec<_> = (0..30).map(|s| hf_run(s, &cfg, snr, spread)).collect();
+                    let ok: Vec<_> = runs.iter().filter(|r| r.0).collect();
+                    let mut lat: Vec<u64> = ok.iter().map(|r| r.1 .0).collect();
+                    lat.sort();
+                    let air: u64 = runs.iter().map(|r| r.2 .0).sum::<u64>() / runs.len() as u64;
+                    eprintln!(
+                        "spread {spread:>3} Hz snr {snr} dB symbol {symbol:>3} over {over:>3} s: {:>2}/30, p50 {:>5.0} s, airtime {:>4.0} s",
+                        ok.len(),
+                        lat.get(lat.len() / 2).copied().unwrap_or(0) as f64 / 1e3,
+                        air as f64 / 1e3
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// An object that needs more overs than `max_rounds` still gets through:
+/// only overs that bring no progress count against a transfer. 50 kB is
+/// 250 symbols, 16 overs at the most symbols one over carries.
+#[test]
+fn an_object_needing_many_overs_is_not_abandoned() {
+    let o = run(
+        7,
+        50_000,
+        Loss::Bernoulli(0.02),
+        Loss::Bernoulli(0.02),
+        0.0,
+        Millis::from_secs(3600),
+    );
+    assert!(
+        o.delivered && !o.failed,
+        "delivered {} failed {}",
+        o.delivered,
+        o.failed
+    );
+    assert_eq!(o.received, 1);
+}

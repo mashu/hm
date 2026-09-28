@@ -1266,6 +1266,7 @@ fn an_over_never_lasts_longer_than_max_over() {
     let mut cfg = Config::hf_300(call("SA0KAM"));
     cfg.sessions = false;
     cfg.duty_cycle_permille = 1000;
+    cfg.max_over = Millis::from_secs(20);
     let mut a = Xfer::new(cfg.clone(), identity("SA0KAM"), DetRng::from_seed(1)).unwrap();
     let burst = frames(&send(&mut a, Millis(0), "SO5KM-1", vec![3; 4000]));
     let on_air = cfg.txdelay

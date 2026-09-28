@@ -79,7 +79,7 @@ pub const SLOW_FRAME_SECS: u64 = 3;
 /// Smallest symbol a slow link is given.
 const MIN_SLOW_SYMBOL: usize = 32;
 /// Longest over on a link below 1200 bit/s.
-pub const SLOW_MAX_OVER: Millis = Millis::from_secs(20);
+pub const SLOW_MAX_OVER: Millis = Millis::from_secs(60);
 
 /// `P[X >= k]` for `X ~ Binomial(n, q)`.
 fn prob_at_least(n: u32, k: u32, q: f64) -> f64 {
@@ -190,14 +190,18 @@ pub struct Config {
     /// Most DATA frames in one over.
     pub max_burst: u8,
     /// Longest over, key-up to key-down, OPEN and OFFER included (an over
-    /// always carries at least one symbol). A long over costs little on a
-    /// clean channel, but a fade takes more of it and it holds the channel
-    /// from everyone else; on a slow HF link this, not `max_burst`, sets the
-    /// size of an over.
+    /// always carries at least one symbol). Long overs spread the key-up and
+    /// the ACK's round trip over more symbols, and with fountain coding a fade
+    /// costs only the frames it overlaps however long the over is; the limit
+    /// keeps one station from holding a shared channel too long.
     pub max_over: Millis,
     /// Frame loss assumed at least, per mille, when sizing bursts.
     pub redundancy_permille: u32,
-    /// Overs per object before giving up.
+    /// Overs in a row that bring no progress (no ACK, or an ACK that asks for
+    /// no fewer symbols than the one before) before a transfer fails. Overs
+    /// that do bring progress never count against it, so a large object, or
+    /// a slow link that needs many overs, is not abandoned while it gets
+    /// through.
     pub max_rounds: u8,
     /// Slack added to every predicted end of an over.
     pub ack_guard: Millis,
@@ -255,11 +259,16 @@ impl Config {
     /// A link at `bitrate_bps` with key-up delay `txdelay`, starting from the
     /// VHF 1200 parameters. Below 1200 bit/s whatever is measured in airtime
     /// scales with the rate: symbols are sized so a DATA frame takes about
-    /// [`SLOW_FRAME_SECS`] on air (HF packet at 300 bd traditionally sends
-    /// frames of 64 to 128 bytes), overs are held to [`SLOW_MAX_OVER`], more
+    /// [`SLOW_FRAME_SECS`] on air, overs may last up to [`SLOW_MAX_OVER`], more
     /// loss is assumed before any is measured, and a receiver keeps a partial
     /// transfer longer, because a sender backing off after missed ACKs goes
     /// quiet for longer on a slow link.
+    ///
+    /// On a simulated 300 bd path with Watterson-style fading (0.5 to 1 Hz
+    /// Doppler spread, `hm-sim`'s `Loss::Fading`), 64-byte symbols delivered
+    /// more, sooner and with less airtime than 128 or 200 bytes: a shorter
+    /// frame is less likely to meet a fade. Overs of up to 60 s did better
+    /// than 20 s: fewer key-ups and ACK round trips for the same symbols.
     pub fn for_link(me: Callsign, bitrate_bps: u32, txdelay: Millis) -> Config {
         let mut cfg = Config::vhf_1200(me);
         cfg.bitrate_bps = bitrate_bps.max(1);
@@ -279,7 +288,7 @@ impl Config {
 
     /// HF packet at 300 bd through a KISS TNC (Direwolf's `MODEM 300` or a
     /// hardware HF TNC): 64-byte symbols, about 2.9 s per DATA frame, and
-    /// overs of at most 20 s.
+    /// overs of up to 60 s.
     pub fn hf_300(me: Callsign) -> Config {
         Config::for_link(me, 300, Millis(300))
     }
@@ -345,7 +354,7 @@ pub enum Command {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Failure {
-    /// No complete acknowledgement within `max_rounds` overs.
+    /// `max_rounds` overs in a row brought no progress.
     NoAnswer,
     TooLarge,
     Empty,
@@ -415,7 +424,11 @@ struct Outgoing {
     source: Vec<EncodingPacket>,
     k: u32,
     next_esi: u32,
+    /// Overs sent (saturating).
     rounds: u8,
+    /// Overs in a row with no progress: counted when an over goes out, cleared
+    /// by an ACK that asks for fewer symbols.
+    stalls: u8,
     offer_next: bool,
     /// The next over starts with our OPEN (the peer has none from us lately).
     open_next: bool,
@@ -803,6 +816,7 @@ impl Xfer {
             k,
             next_esi: 0,
             rounds: 0,
+            stalls: 0,
             offer_next: true,
             open_next: !p.broadcast && self.cfg.sessions && !self.knows(p.to, now),
             need: k,
@@ -877,7 +891,7 @@ impl Xfer {
                 && if o.broadcast {
                     o.rounds >= BROADCAST_MAX_ROUNDS
                 } else {
-                    o.rounds >= max_rounds
+                    o.stalls >= max_rounds
                 };
             if done {
                 ended.push(if o.broadcast {
@@ -1003,7 +1017,8 @@ impl Xfer {
         let ack_wait = self.cfg.ack_guard + ack_air + self.cfg.ack_guard + jitter;
         let o = &mut self.active[i];
         o.next_esi += n;
-        o.rounds += 1;
+        o.rounds = o.rounds.saturating_add(1);
+        o.stalls = o.stalls.saturating_add(1);
         o.offer_next = false;
         o.open_next = false;
         o.opened = open;
@@ -1085,6 +1100,9 @@ impl Xfer {
             o.offer_next = true;
         } else {
             let new_need = ack.need as u32;
+            if new_need < o.need {
+                o.stalls = 0; // the over got something through
+            }
             let sent = o.sent_last_round;
             if sent > 0 && new_need <= o.need {
                 let got = (o.need - new_need).min(sent);

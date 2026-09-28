@@ -242,7 +242,9 @@ nothing about who received it.
   symbols as the largest allowed size would: every symbol is sent whole, so
   padding is airtime. A 119-byte bundle travels as one 120-byte symbol.
 - On links slower than 1200 bit/s, size symbols so a DATA frame takes about
-  3 s on air (64 bytes at 300 bit/s), and keep overs to 20 s (30 s otherwise).
+  3 s on air (64 bytes at 300 bit/s): a short frame is less likely to meet a
+  fade. Keep overs to 60 s there and 30 s otherwise: long overs spread the
+  key-up and ACK over more symbols, and a fade costs only the frames it hits.
 - Size each over as the smallest n for which P[at least `need` of n frames
   arrive] ≥ 0.9 at the estimated loss rate, capped by the congestion window
   and the longest over.
