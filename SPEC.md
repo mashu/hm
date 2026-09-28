@@ -238,18 +238,32 @@ nothing about who received it.
 
 **Sender behaviour** (recommended; peers do not depend on it):
 
-- Size each over as the smallest n for which P[at least `need` of n frames arrive] ≥ 0.9, at the estimated loss rate.
-- Update the loss estimate from each ACK.
+- Choose T as the smallest multiple of 8 that keeps the object in as few
+  symbols as the largest allowed size would: every symbol is sent whole, so
+  padding is airtime. A 119-byte bundle travels as one 120-byte symbol.
+- On links slower than 1200 bit/s, size symbols so a DATA frame takes about
+  3 s on air (64 bytes at 300 bit/s), and keep overs to 20 s (30 s otherwise).
+- Size each over as the smallest n for which P[at least `need` of n frames
+  arrive] ≥ 0.9 at the estimated loss rate, capped by the congestion window
+  and the longest over.
+- Update the loss estimate only from what ACKs report an over delivered. A
+  missing ACK is not loss: the channel may have been busy or colliding, where
+  larger overs make things worse. It halves the congestion window (to no less
+  than 2 symbols); each ACK that arrives grows it by one symbol.
 - Count an ACK as late only after the time the over, a guard, the peer's key-up
   and ACK, and another guard would take. Predict airtime with the link's
   per-frame overhead (19 bytes for AX.25 UI) and an allowance for bit stuffing.
-- The link may hold an over back while the channel is busy. While waiting for
-  an ACK, on hearing any frame other than the peer's to us, wait at least until
-  that traffic could have ended (for DATA, the frames it says remain), followed
-  by our whole over and the peer's answer.
+- The link may hold an over back while the channel is busy. When it can tell
+  when the over actually left the air, start the wait for the ACK there.
+  Otherwise, while waiting for an ACK, on hearing any frame other than the
+  peer's to us, wait at least until that traffic could have ended (for DATA,
+  the frames it says remain), followed by our whole over and the peer's answer.
 - With no ACK in time, wait a random backoff drawn uniformly from
   [0, (last over's airtime + guard) · 2^min(misses, 5)]. Then send an OFFER and
   at most two symbols as a probe.
+- A transfer that is backing off does not hold up the others: transfers to
+  other peers may send their overs meanwhile, one over awaiting an ACK at a
+  time. Never use session 0 (a CLOSE with session 0 covers every transfer).
 - Keep a long-run airtime budget (duty cycle with a burst allowance), and never
   send an over larger than the allowance.
 
@@ -636,11 +650,11 @@ wire 82585ea90000014600004f8af6fb028282004600000207586b82036f71736c406578616d706
 ax25 909a9c8aa840e0a6826096829a6103f00000004f8af6fb001b97cbd86bbeef01234568656c6c6f
 kiss c000909a9c8aa840e0a6826096829a6103f00000004f8af6fb001b97cbd86bbeef01234568656c6c6fc0
 
-## Transfer of the chat bundle (SA0KAM -> SO5KM-1, symbol size 200, first over, opening the session)
+## Transfer of the chat bundle (SA0KAM -> SO5KM-1, symbols of up to 200 bytes: one of 120, first over, opening the session)
 object_id 26a90b587084a213a812a105b23553637c1afd5c125fc66381203f4583e09807
 open  0300004f8af6fb001b97cbd86bf2b4000000020000000000040000fff802
-offer 0300004f8af6fb001b97cbd86bf2b40000000126a90b587084a213a812a105b23553637c1afd5c125fc66381203f4583e0980700007700c80001
-data  0000004f8af6fb001b97cbd86bf2b400000000007700825832a70000014600004f8af6fb028182004600000207586b0301051a6ab13b8006190e100882004c3733206465205341304b414d5840ce3c7adc856375a2ce7cbb47011edcbbfa93ff43bf4346232367268be9e35cf86d01b31ab2408b6ba8954f5088b430c211eca59261c6d9805cd446f9773aa602000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+offer 0300004f8af6fb001b97cbd86bf2b40000000126a90b587084a213a812a105b23553637c1afd5c125fc66381203f4583e0980700007700780001
+data  0000004f8af6fb001b97cbd86bf2b400000000007700825832a70000014600004f8af6fb028182004600000207586b0301051a6ab13b8006190e100882004c3733206465205341304b414d5840ce3c7adc856375a2ce7cbb47011edcbbfa93ff43bf4346232367268be9e35cf86d01b31ab2408b6ba8954f5088b430c211eca59261c6d9805cd446f9773aa60200
 
 ## Receipt ACK from SO5KM-1 (secret 0x0c x 32) for that transfer, after its OPEN reply
 public key 0b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e39f2d

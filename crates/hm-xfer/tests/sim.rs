@@ -477,3 +477,61 @@ fn transfers_over_the_measured_modem() {
         report.join("\n  ")
     );
 }
+
+/// A station that does not answer holds up only the traffic to itself: while
+/// that transfer backs off, the one queued behind it, to a station that does
+/// answer, goes ahead instead of waiting for all its rounds to run out.
+#[test]
+fn a_silent_station_does_not_hold_up_the_others() {
+    let mut delivered = 0;
+    let mut times = Vec::new();
+    for seed in 0..20 {
+        let mut sim = XferSim::new(seed, RadioParams::VHF_1200);
+        let [r0, r1, r2] = [sim.machine_rng(0), sim.machine_rng(1), sim.machine_rng(2)];
+        let a = sim.add_node(station("SA0KAM", r0, &["SO5KM-1", "SP5DDD"]));
+        let b = sim.add_node(station("SO5KM-1", r1, &["SA0KAM"]));
+        let d = sim.add_node(station("SP5DDD", r2, &["SA0KAM"]));
+        sim.link(a, b, Loss::Bernoulli(0.02));
+        sim.link(a, d, Loss::Bernoulli(0.02));
+        sim.set_up_at(Millis(0), d, false);
+        for (to, len) in [("SP5DDD", 3000), ("SO5KM-1", 1000)] {
+            sim.command_at(
+                Millis(0),
+                a,
+                Command::Send {
+                    to: call(to),
+                    object: object(len, seed),
+                    precedence: 0,
+                },
+            );
+        }
+        sim.run_until(Millis::from_secs(3600));
+        let live = sim.events().iter().find_map(|(t, node, e)| match e {
+            Event::Delivered { to, .. } if *node == a && *to == call("SO5KM-1") => Some(t.0),
+            _ => None,
+        });
+        let dead_failed = sim.events().iter().find_map(|(t, node, e)| match e {
+            Event::Failed { to, .. } if *node == a && *to == call("SP5DDD") => Some(t.0),
+            _ => None,
+        });
+        if let (Some(live), Some(dead)) = (live, dead_failed) {
+            assert!(
+                live < dead,
+                "seed {seed}: delivered at {live} ms, after giving up at {dead} ms"
+            );
+            delivered += 1;
+            times.push(live);
+        }
+    }
+    let p = Percentiles::of(&times).unwrap();
+    eprintln!(
+        "1 kB to a live station queued behind 3 kB to a silent one: delivered first in {delivered}/20; p50 {:.0} s, max {:.0} s",
+        p.p50 as f64 / 1e3,
+        p.max as f64 / 1e3
+    );
+    assert_eq!(delivered, 20);
+    assert!(
+        p.max < 300_000,
+        "within minutes, not after the silent transfer's rounds"
+    );
+}

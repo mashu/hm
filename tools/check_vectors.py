@@ -109,7 +109,9 @@ def check(text: str) -> None:
         print(f"ok  {title[3:].lower()} (id, signature)")
 
     # Transfer: OFFER fields, DATA preamble, and the RaptorQ systematic property
-    # (source symbol 0 is the first 200 bytes of the object, zero-padded).
+    # (source symbol 0 is the start of the object, zero-padded to the symbol
+    # size). The object fits one symbol, so the sender sizes the symbol to the
+    # object rounded up to 8 bytes, not to its 200-byte maximum.
     chat_wire, _ = wire_and_id(text, "## Chat bundle")
     s_x = section(text, "## Transfer of the chat bundle")
     xid = re.search(r"object_id ([0-9a-f]{64})", s_x).group(1)
@@ -120,13 +122,15 @@ def check(text: str) -> None:
     body = offer[18:]
     assert body[0] == 0x01 and body[1:33].hex() == xid
     assert int.from_bytes(body[33:36], "big") == len(chat_wire)
-    assert int.from_bytes(body[36:38], "big") == 200 and body[38] == 0 and body[39] == len(datas)
+    t = int.from_bytes(body[36:38], "big")
+    assert t == -(-len(chat_wire) // 8) * 8, f"symbol size {t} fits the {len(chat_wire)}-byte object"
+    assert body[38] == 0 and body[39] == len(datas)
     for n, d in enumerate(datas):
         assert d[0] == 0x00 and d[13:15] == offer[13:15], "DATA type and session"
         esi = int.from_bytes(d[15:18], "big")
         assert int.from_bytes(d[18:21], "big") == len(chat_wire) and d[21] == len(datas) - 1 - n
         if esi == 0:
-            assert d[22:] == chat_wire.ljust(200, b"\x00"), "systematic source symbol"
+            assert d[22:] == chat_wire.ljust(t, b"\x00"), "systematic source symbol"
     print(f"ok  transfer OFFER and {len(datas)} DATA frame(s), systematic symbol")
 
     # The first over to a new peer opens the session: OPEN before the OFFER,

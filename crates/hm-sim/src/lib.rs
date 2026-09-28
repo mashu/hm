@@ -1239,9 +1239,25 @@ where
                 self.apply(r, out);
             }
         }
+        self.drained(from, ch, end);
         let horizon = self.max_airtime;
         let now = self.now;
         self.txs.retain(|t| t.end + horizon > now);
+    }
+
+    /// Tell `node` when its radio on `ch` has sent everything it was asked
+    /// to: the frame that just ended was the last of its key-up and nothing
+    /// waits for the channel.
+    fn drained(&mut self, node: NodeId, ch: ChannelId, end: Millis) {
+        let n = &mut self.nodes[node];
+        let Some(port) = n.port_on(ch) else { return };
+        let r = &n.radios[&port];
+        if !n.up || r.free_at > end || !r.waiting.is_empty() {
+            return;
+        }
+        let local = n.clock.local(end);
+        n.machine.transmitted(local, port);
+        self.reschedule_timer(node);
     }
 }
 

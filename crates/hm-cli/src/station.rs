@@ -91,9 +91,9 @@ impl Message {
 impl Station<'_> {
     /// Transfer engine for this station, trusting every trusted key.
     pub fn engine(&self) -> io::Result<Xfer> {
-        let mut cfg = Config::vhf_1200(self.me);
-        cfg.bitrate_bps = self.timing.bitrate_bps;
-        cfg.txdelay = Millis(self.timing.txdelay_ms);
+        // Symbols and overs sized for the link's rate: an HF link at 300 bd
+        // gets small symbols and short overs, not the VHF 1200 ones.
+        let mut cfg = Config::for_link(self.me, self.timing.bitrate_bps, Millis(self.timing.txdelay_ms));
         cfg.ack_guard = Millis(self.timing.guard_ms);
         cfg.max_rounds = self.timing.max_rounds;
         let mut xfer = Xfer::new(cfg, Identity::from_secret(self.key.identity.secret()), rng())

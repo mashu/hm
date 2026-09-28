@@ -413,6 +413,12 @@ pub(crate) fn radio_session(
         if stop.load(Ordering::Relaxed) {
             return Ok(Ended::Stopped);
         }
+        if let Some(at) = link.drained() {
+            x.transmitted(
+                Millis(at.saturating_duration_since(start).as_millis() as u64),
+                port,
+            );
+        }
         let t = now();
         match x.next_deadline() {
             Some(d) if d <= t => x.on_deadline(t, &mut out),

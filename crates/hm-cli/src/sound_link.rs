@@ -88,6 +88,13 @@ const CAPTURE_WAIT: Duration = Duration::from_millis(20);
 /// A frame to send, and whether it goes in IL2P.
 type Outgoing = (Vec<u8>, bool);
 
+/// What has gone out on air: frames in all, and when the last key-up ended.
+#[derive(Default)]
+struct Aired {
+    frames: u64,
+    at: Option<Instant>,
+}
+
 pub struct SoundLink {
     me: Callsign,
     framing: Framing,
@@ -95,6 +102,11 @@ pub struct SoundLink {
     il2p_peers: BTreeSet<Callsign>,
     to_air: Option<Sender<Outgoing>>,
     from_air: Receiver<Vec<u8>>,
+    /// Frames given to the modem thread so far, and what it has sent of them.
+    handed: u64,
+    aired: Arc<Mutex<Aired>>,
+    /// The end of the key-up [`Link::drained`] last reported.
+    reported: Option<Instant>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     failure: Arc<Mutex<Option<String>>>,
@@ -125,7 +137,8 @@ impl SoundLink {
         let (opened_tx, opened_rx) = mpsc::channel::<io::Result<()>>();
         let stop = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
-        let (st, fail) = (stop.clone(), failure.clone());
+        let aired = Arc::new(Mutex::new(Aired::default()));
+        let (st, fail, sent) = (stop.clone(), failure.clone(), aired.clone());
         let thread = thread::Builder::new().name("modem".into()).spawn(move || {
             let port = match audio() {
                 Ok(p) => {
@@ -137,7 +150,7 @@ impl SoundLink {
                     return;
                 }
             };
-            if let Err(e) = run(port, ptt.as_mut(), csma, air_in, air_out, &st) {
+            if let Err(e) = run(port, ptt.as_mut(), csma, air_in, air_out, &sent, &st) {
                 *fail.lock().expect("lock") = Some(e.to_string());
             }
         })?;
@@ -150,6 +163,9 @@ impl SoundLink {
             il2p_peers: BTreeSet::new(),
             to_air: Some(to_air),
             from_air,
+            handed: 0,
+            aired,
+            reported: None,
             stop,
             thread: Some(thread),
             failure,
@@ -190,7 +206,18 @@ impl Link for SoundLink {
             },
         };
         let tx = self.to_air.as_ref().expect("open until dropped");
-        tx.send((ui, il2p)).map_err(|_| self.failed())
+        tx.send((ui, il2p)).map_err(|_| self.failed())?;
+        self.handed += 1;
+        Ok(())
+    }
+
+    fn drained(&mut self) -> Option<Instant> {
+        let aired = self.aired.lock().expect("lock");
+        if aired.frames < self.handed || aired.at == self.reported {
+            return None;
+        }
+        self.reported = aired.at;
+        aired.at
     }
 
     fn peer_features(&mut self, peer: Callsign, features: u32) {
@@ -226,6 +253,7 @@ fn run(
     csma: Csma,
     air_in: Receiver<Outgoing>,
     air_out: Sender<Vec<u8>>,
+    aired: &Mutex<Aired>,
     stop: &AtomicBool,
 ) -> io::Result<()> {
     let fs = port.sample_rate();
@@ -290,5 +318,8 @@ fn run(
         let keyed = Keyed(ptt);
         port.play(&samples)?;
         drop(keyed);
+        let mut sent = aired.lock().expect("lock");
+        sent.frames += batch.len() as u64;
+        sent.at = Some(Instant::now());
     }
 }

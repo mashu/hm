@@ -165,7 +165,7 @@ fn main() {
     println!("ax25 {}", hex(&ui));
     println!("kiss {}", hex(&kiss::data_frame(0, &ui)));
 
-    println!("\n## Transfer of the chat bundle (SA0KAM -> SO5KM-1, symbol size 200, first over, opening the session)");
+    println!("\n## Transfer of the chat bundle (SA0KAM -> SO5KM-1, symbols of up to 200 bytes: one of 120, first over, opening the session)");
     let object = chat.to_vec();
     println!("object_id {}", object_id(&object));
     let mut cfg = Config::vhf_1200(call("SA0KAM"));
