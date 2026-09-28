@@ -1001,7 +1001,18 @@ fn trusted_stations_change_while_the_node_runs() {
             now["live"]["relay"]["max_hops"].as_u64(),
             now["live"]["radio"]["max_rounds"].as_u64(),
         ),
-        (Some(0.5), Some(7), Some(3600), Some(7200), Some(9), Some(1800), Some(true), Some(true), Some(4), Some(5))
+        (
+            Some(0.5),
+            Some(7),
+            Some(3600),
+            Some(7200),
+            Some(9),
+            Some(1800),
+            Some(true),
+            Some(true),
+            Some(4),
+            Some(5)
+        )
     );
     let c = Config::load(&trust_file).unwrap();
     assert_eq!((c.delivery.internet_cost, c.delivery.retry_attempts), (0.5, 7));

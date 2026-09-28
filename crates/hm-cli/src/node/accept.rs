@@ -251,10 +251,7 @@ pub(crate) fn accept(
                         bundle.from
                     )),
                     Ok(hm_store::ReclaimOutcome::Ignored) => {}
-                    Err(error) => log(format!(
-                        "could not apply custody-fail {}: {error}",
-                        short(&m.id)
-                    )),
+                    Err(error) => log(format!("could not apply custody-fail {}: {error}", short(&m.id))),
                 }
             }
         }

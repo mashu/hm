@@ -201,8 +201,7 @@ impl Record {
 
     pub fn is_active_holding(&self) -> bool {
         self.state == State::Queued
-            || (self.state == State::InTransit
-                && self.shadow_until.is_some_and(|until| until > 0))
+            || (self.state == State::InTransit && self.shadow_until.is_some_and(|until| until > 0))
     }
 
     pub fn in_shadow(&self, now: u64) -> bool {
@@ -582,13 +581,7 @@ impl Store {
             inserted = messages.get(received.id.0)?.is_none();
             if inserted {
                 let seq = Store::next_seq(&mut tx.open_table(META)?)?;
-                let mut record = Store::blank_record(
-                    received.id,
-                    Direction::In,
-                    received.from,
-                    now,
-                    seq,
-                );
+                let mut record = Store::blank_record(received.id, Direction::In, received.from, now, seq);
                 record.state = State::Unread;
                 record.verified = received.verified;
                 record.wire_seq = received.wire_seq;

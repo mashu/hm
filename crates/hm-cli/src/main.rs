@@ -343,14 +343,24 @@ impl NodeArgs {
             set(&mut c.internet.listen, Some(None), "internet.listen", o);
             set(&mut c.internet.peers, Some(Vec::new()), "internet.peers", o);
         }
-        set(&mut c.delivery.radio_cost, self.radio_cost, "delivery.radio_cost", o);
+        set(
+            &mut c.delivery.radio_cost,
+            self.radio_cost,
+            "delivery.radio_cost",
+            o,
+        );
         set(
             &mut c.delivery.internet_cost,
             self.internet_cost,
             "delivery.internet_cost",
             o,
         );
-        set(&mut c.delivery.modem_cost, self.modem_cost, "delivery.modem_cost", o);
+        set(
+            &mut c.delivery.modem_cost,
+            self.modem_cost,
+            "delivery.modem_cost",
+            o,
+        );
         set(
             &mut c.delivery.retry_first_secs,
             self.retry_first_secs,
@@ -425,12 +435,7 @@ impl NodeArgs {
         set(&mut c.modem.kind, self.modem_kind.clone(), "modem.kind", o);
         set(&mut c.modem.host, self.modem_host.clone(), "modem.host", o);
         set(&mut c.modem.port, self.modem_port, "modem.port", o);
-        set(
-            &mut c.modem.bandwidth,
-            self.modem_bandwidth,
-            "modem.bandwidth",
-            o,
-        );
+        set(&mut c.modem.bandwidth, self.modem_bandwidth, "modem.bandwidth", o);
         set(&mut c.modem.ptt, self.modem_ptt.clone(), "modem.ptt", o);
         set(
             &mut c.radio.beacon_minutes,
@@ -618,8 +623,8 @@ fn send(
     } else {
         None
     };
-    let bundle = station::build_bundle(&key, me, to, text, subject, prec.into(), seq)
-        .map_err(|e| e.to_string())?;
+    let bundle =
+        station::build_bundle(&key, me, to, text, subject, prec.into(), seq).map_err(|e| e.to_string())?;
     let object = bundle.to_vec();
     let (mut link, _) = open_kiss(c, me)?;
     eprintln!("{me} -> {to}: {} bytes, bundle {}", object.len(), bundle.id());

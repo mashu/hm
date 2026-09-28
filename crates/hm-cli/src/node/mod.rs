@@ -325,8 +325,8 @@ mod tests {
             Precedence::Routine,
             Some(1),
         )
-            .unwrap()
-            .to_vec();
+        .unwrap()
+        .to_vec();
         let trust = Trust::default();
         let accepted = accept(
             AcceptanceGate {

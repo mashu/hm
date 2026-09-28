@@ -55,7 +55,10 @@ fn enqueue_custody_fail(
     {
         Ok(sealed) => sealed,
         Err(error) => {
-            log(format!("cannot build custody-fail for {}: {error}", short(&holding)));
+            log(format!(
+                "cannot build custody-fail for {}: {error}",
+                short(&holding)
+            ));
             return;
         }
     };
@@ -71,10 +74,7 @@ fn enqueue_custody_fail(
             expires_at: Some(now.saturating_add(u64::from(ttl))),
         },
     ) {
-        Ok(true) => log(format!(
-            "queued custody-fail for {} to {prior}",
-            short(&holding)
-        )),
+        Ok(true) => log(format!("queued custody-fail for {} to {prior}", short(&holding))),
         Ok(false) => {}
         Err(error) => log(format!("store: {error}")),
     }
@@ -93,11 +93,7 @@ fn on_gave_up_receipt(store: &Store, receipt_id: ObjectId, now: u64) {
     let Some(original) = opened.bundle.reply_to else {
         return;
     };
-    match store.delivered_unconfirmed(
-        original,
-        "end-to-end receipt could not be delivered",
-        now,
-    ) {
+    match store.delivered_unconfirmed(original, "end-to-end receipt could not be delivered", now) {
         Ok(true) => log(format!(
             "{} marked delivered-unconfirmed (receipt gave up)",
             short(&original)
@@ -265,12 +261,7 @@ pub(crate) async fn coordinator(
                 let r = if permanent {
                     store.abandon(id, &reason).map(|notify| (Retry::GaveUp, notify))
                 } else {
-                    store.attempt_failed(
-                        id,
-                        &format!("{reason} ({})", bearer.name()),
-                        policy,
-                        now,
-                    )
+                    store.attempt_failed(id, &format!("{reason} ({})", bearer.name()), policy, now)
                 };
                 match r {
                     Ok((Retry::At(t), _)) => log(format!(
@@ -283,15 +274,7 @@ pub(crate) async fn coordinator(
                         log(format!("gave up on {} to {peer}: {reason}", short(&id)));
                         on_gave_up_receipt(store, id, now);
                         if let Some(prior) = notify {
-                            enqueue_custody_fail(
-                                store,
-                                cfg.me,
-                                &cfg.key.identity,
-                                id,
-                                prior,
-                                &reason,
-                                now,
-                            );
+                            enqueue_custody_fail(store, cfg.me, &cfg.key.identity, id, prior, &reason, now);
                         }
                     }
                     Ok((Retry::Inactive, _)) => {}

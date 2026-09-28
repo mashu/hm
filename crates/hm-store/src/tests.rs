@@ -181,14 +181,17 @@ fn relay_custody_moves_without_claiming_final_delivery() {
     assert_eq!(s.holding_ids(relay, true, 100).unwrap(), vec![id(1)]);
     assert!(s.set_next_hop(id(1), relay).unwrap());
     assert!(s
-        .custody_transferred(id(1), CustodyHandoff {
-            next_hop: relay,
-            receipt_verified: true,
-            by: "radio",
-            now: 110,
-            grace_secs: 3600,
-            suspect_secs: 86_400,
-        })
+        .custody_transferred(
+            id(1),
+            CustodyHandoff {
+                next_hop: relay,
+                receipt_verified: true,
+                by: "radio",
+                now: 110,
+                grace_secs: 3600,
+                suspect_secs: 86_400,
+            }
+        )
         .unwrap());
     let record = s.record(id(1)).unwrap().unwrap();
     assert_eq!(record.state, State::InTransit);
@@ -216,24 +219,30 @@ fn active_custody_is_l_one_normally_and_l_two_only_when_urgent() {
     assert!(store.set_next_hop(id(2), second).unwrap());
     assert!(!store.set_next_hop(id(2), third).unwrap());
     assert!(store
-        .custody_transferred(id(2), CustodyHandoff {
-            next_hop: first,
-            receipt_verified: true,
-            by: "radio",
-            now: 20,
-            grace_secs: 3600,
-            suspect_secs: 86_400,
-        })
+        .custody_transferred(
+            id(2),
+            CustodyHandoff {
+                next_hop: first,
+                receipt_verified: true,
+                by: "radio",
+                now: 20,
+                grace_secs: 3600,
+                suspect_secs: 86_400,
+            }
+        )
         .unwrap());
     assert!(store
-        .custody_transferred(id(2), CustodyHandoff {
-            next_hop: second,
-            receipt_verified: true,
-            by: "internet",
-            now: 21,
-            grace_secs: 3600,
-            suspect_secs: 86_400,
-        })
+        .custody_transferred(
+            id(2),
+            CustodyHandoff {
+                next_hop: second,
+                receipt_verified: true,
+                by: "internet",
+                now: 21,
+                grace_secs: 3600,
+                suspect_secs: 86_400,
+            }
+        )
         .unwrap());
     let record = store.record(id(2)).unwrap().unwrap();
     assert_eq!(record.custody_copies.as_deref(), Some(&[first, second][..]));
@@ -248,14 +257,17 @@ fn unverified_receipt_does_not_transfer_custody() {
     s.enqueue(id(1), b"one", destination, 0, 10).unwrap();
     assert!(s.set_next_hop(id(1), relay).unwrap());
     assert!(!s
-        .custody_transferred(id(1), CustodyHandoff {
-            next_hop: relay,
-            receipt_verified: false,
-            by: "radio",
-            now: 20,
-            grace_secs: 3600,
-            suspect_secs: 86_400,
-        })
+        .custody_transferred(
+            id(1),
+            CustodyHandoff {
+                next_hop: relay,
+                receipt_verified: false,
+                by: "radio",
+                now: 20,
+                grace_secs: 3600,
+                suspect_secs: 86_400,
+            }
+        )
         .unwrap());
     let record = s.record(id(1)).unwrap().unwrap();
     assert_eq!(record.state, State::Queued);
@@ -272,14 +284,17 @@ fn cancellation_ignores_late_receipt_and_e2e_requires_destination() {
     assert!(s.set_next_hop(id(1), relay).unwrap());
     assert!(s.cancel(id(1)).unwrap());
     assert!(!s
-        .custody_transferred(id(1), CustodyHandoff {
-            next_hop: relay,
-            receipt_verified: true,
-            by: "radio",
-            now: 20,
-            grace_secs: 3600,
-            suspect_secs: 86_400,
-        })
+        .custody_transferred(
+            id(1),
+            CustodyHandoff {
+                next_hop: relay,
+                receipt_verified: true,
+                by: "radio",
+                now: 20,
+                grace_secs: 3600,
+                suspect_secs: 86_400,
+            }
+        )
         .unwrap());
     assert_eq!(s.record(id(1)).unwrap().unwrap().state, State::Cancelled);
 
@@ -309,14 +324,17 @@ fn deletion_cancels_first_and_never_removes_active_custody() {
     store.enqueue(id(2), b"active", destination, 0, 20).unwrap();
     assert!(store.set_next_hop(id(2), relay).unwrap());
     assert!(store
-        .custody_transferred(id(2), CustodyHandoff {
-            next_hop: relay,
-            receipt_verified: true,
-            by: "radio",
-            now: 21,
-            grace_secs: 3600,
-            suspect_secs: 86_400,
-        })
+        .custody_transferred(
+            id(2),
+            CustodyHandoff {
+                next_hop: relay,
+                receipt_verified: true,
+                by: "radio",
+                now: 21,
+                grace_secs: 3600,
+                suspect_secs: 86_400,
+            }
+        )
         .unwrap());
     assert_eq!(store.delete(id(2)).unwrap(), DeleteOutcome::Active);
     assert_eq!(store.record(id(2)).unwrap().unwrap().state, State::InTransit);
@@ -331,14 +349,17 @@ fn suspect_reclaims_then_delivered_unconfirmed_when_expired() {
     s.enqueue(id(1), b"one", destination, 0, 10).unwrap();
     assert!(s.set_next_hop(id(1), relay).unwrap());
     assert!(s
-        .custody_transferred(id(1), CustodyHandoff {
-            next_hop: relay,
-            receipt_verified: true,
-            by: "radio",
-            now: 100,
-            grace_secs: 50,
-            suspect_secs: 30,
-        })
+        .custody_transferred(
+            id(1),
+            CustodyHandoff {
+                next_hop: relay,
+                receipt_verified: true,
+                by: "radio",
+                now: 100,
+                grace_secs: 50,
+                suspect_secs: 30,
+            }
+        )
         .unwrap());
     assert!(s.suspect_due(120).unwrap().is_empty());
     assert_eq!(s.suspect_due(130).unwrap().len(), 1);
@@ -365,14 +386,17 @@ fn suspect_reclaims_then_delivered_unconfirmed_when_expired() {
     .unwrap();
     assert!(s.set_next_hop(id(2), relay).unwrap());
     assert!(s
-        .custody_transferred(id(2), CustodyHandoff {
-            next_hop: relay,
-            receipt_verified: true,
-            by: "radio",
-            now: 200,
-            grace_secs: 10,
-            suspect_secs: 5,
-        })
+        .custody_transferred(
+            id(2),
+            CustodyHandoff {
+                next_hop: relay,
+                receipt_verified: true,
+                by: "radio",
+                now: 200,
+                grace_secs: 10,
+                suspect_secs: 5,
+            }
+        )
         .unwrap());
     // suspect_at is min(205, expires 220) = 205
     assert_eq!(
@@ -394,18 +418,20 @@ fn custody_fail_notice_reclaims() {
     s.enqueue(id(1), b"one", destination, 0, 10).unwrap();
     assert!(s.set_next_hop(id(1), relay).unwrap());
     assert!(s
-        .custody_transferred(id(1), CustodyHandoff {
-            next_hop: relay,
-            receipt_verified: true,
-            by: "radio",
-            now: 20,
-            grace_secs: 3600,
-            suspect_secs: 86_400,
-        })
+        .custody_transferred(
+            id(1),
+            CustodyHandoff {
+                next_hop: relay,
+                receipt_verified: true,
+                by: "radio",
+                now: 20,
+                grace_secs: 3600,
+                suspect_secs: 86_400,
+            }
+        )
         .unwrap());
     assert_eq!(
-        s.apply_custody_fail(id(1), relay, 50, "relay abandoned")
-            .unwrap(),
+        s.apply_custody_fail(id(1), relay, 50, "relay abandoned").unwrap(),
         ReclaimOutcome::Requeued
     );
     assert_eq!(s.record(id(1)).unwrap().unwrap().state, State::Queued);

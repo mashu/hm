@@ -354,10 +354,7 @@ fn annotate_seq_gaps(messages: &mut [MessageView]) {
             continue;
         };
         let _ = wire;
-        let from = message
-            .from
-            .clone()
-            .unwrap_or_else(|| message.peer.clone());
+        let from = message.from.clone().unwrap_or_else(|| message.peer.clone());
         let to = message
             .to
             .first()

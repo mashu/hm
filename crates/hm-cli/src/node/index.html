@@ -541,7 +541,7 @@
             <h2>Station</h2>
             <p>Your grid square goes out in beacons so others can see distance and bearing.</p>
           </header>
-          <label for="locator">Grid locator</label>
+          <label for="locator">Grid locator <span class="hint">(empty = not sent in beacons)</span></label>
           <div class="locator-row">
             <input id="locator" maxlength="6" spellcheck="false" pattern="[A-Ra-r]{2}[0-9]{2}([A-Xa-x]{2})?" placeholder="AA00aa" autocomplete="off">
             <button class="btn quiet" type="button" id="locator-gps">Use my location</button>
@@ -575,46 +575,51 @@
             </span>
           </label>
           <div id="radio-fields">
-            <div class="block">
-              <h3 class="block-title">Interface</h3>
-              <label for="r-kiss">KISS TNC</label>
-              <input id="r-kiss" spellcheck="false" placeholder="127.0.0.1:8001 or serial:/dev/ttyUSB0:9600">
-              <label for="r-audio">Sound card <span class="hint">(empty = use the TNC above)</span></label>
-              <input id="r-audio" spellcheck="false" placeholder="default">
-              <label for="r-ptt">PTT</label>
-              <input id="r-ptt" spellcheck="false" placeholder="vox, rigctld, rts:…, cm108:…">
-              <div class="pair">
-                <div>
-                  <label for="r-framing">Framing</label>
-                  <select id="r-framing">
-                    <option value="ax25">AX.25 — widest compatibility</option>
-                    <option value="auto">Auto — IL2P when the peer supports it</option>
-                    <option value="il2p">IL2P — more robust in noise</option>
-                  </select>
-                </div>
-                <div>
-                  <label for="beacon_minutes">Beacon every <span class="hint">(minutes; 0 = off)</span></label>
-                  <input id="beacon_minutes" type="number" min="0" step="1" required>
-                </div>
+          <div class="block">
+            <h3 class="block-title">Interface</h3>
+            <label for="r-kiss">KISS TNC</label>
+            <input id="r-kiss" spellcheck="false" value="127.0.0.1:8001" placeholder="127.0.0.1:8001 or serial:/dev/ttyUSB0:9600">
+            <label for="r-audio">Sound card <span class="hint">(empty = use the TNC above, not the sound card)</span></label>
+            <input id="r-audio" spellcheck="false" placeholder="empty = KISS TNC" value="">
+            <label for="r-ptt">PTT</label>
+            <select id="r-ptt">
+              <option value="vox">VOX / none (soft PTT)</option>
+              <option value="rigctld">rigctld (Hamlib)</option>
+              <option value="custom">Custom device…</option>
+            </select>
+            <input id="r-ptt-custom" spellcheck="false" hidden placeholder="rts:/dev/ttyUSB0, dtr:…, cm108:/dev/hidraw0">
+            <div class="pair">
+              <div>
+                <label for="r-framing">Framing</label>
+                <select id="r-framing">
+                  <option value="ax25">AX.25 — widest compatibility</option>
+                  <option value="auto">Auto — IL2P when the peer supports it</option>
+                  <option value="il2p">IL2P — more robust in noise</option>
+                </select>
+              </div>
+              <div>
+                <label for="beacon_minutes">Beacon every <span class="hint">(minutes; 0 = off)</span></label>
+                <input id="beacon_minutes" type="number" min="0" step="1" value="10" required>
               </div>
             </div>
-            <div class="block">
-              <h3 class="block-title">Timing</h3>
-              <div class="pair">
-                <div><label for="r-txdelay_ms">Key-up delay <span class="hint">(ms)</span></label><input id="r-txdelay_ms" type="number" min="0" step="10"></div>
-                <div><label for="r-tnc_port">TNC port</label><input id="r-tnc_port" type="number" min="0" max="15" step="1"></div>
-              </div>
+          </div>
+          <div class="block">
+            <h3 class="block-title">Timing</h3>
+            <div class="pair">
+              <div><label for="r-txdelay_ms">Key-up delay <span class="hint">(ms)</span></label><input id="r-txdelay_ms" type="number" min="0" step="10" value="300"></div>
+              <div><label for="r-tnc_port">TNC port</label><input id="r-tnc_port" type="number" min="0" max="15" step="1" value="0"></div>
             </div>
-            <details class="advanced">
-              <summary>Channel access <span class="hint">CSMA, bitrate, handoff rounds</span></summary>
-              <div class="pair">
-                <div><label for="r-persist">Persistence <span class="hint">(0–255)</span></label><input id="r-persist" type="number" min="0" max="255" step="1"></div>
-                <div><label for="r-slottime_ms">Slot time <span class="hint">(ms)</span></label><input id="r-slottime_ms" type="number" min="0" step="10"></div>
-                <div><label for="r-bitrate">Bit rate <span class="hint">(bd)</span></label><input id="r-bitrate" type="number" min="1" step="1"></div>
-                <div><label for="r-guard_ms">Guard <span class="hint">(ms)</span></label><input id="r-guard_ms" type="number" min="0" step="10"></div>
-                <div><label for="r-max_rounds">Max rounds <span class="hint">(handoff attempts)</span></label><input id="r-max_rounds" type="number" min="1" step="1"></div>
-              </div>
-            </details>
+          </div>
+          <details class="advanced">
+            <summary>Channel access <span class="hint">CSMA, bitrate, handoff rounds</span></summary>
+            <div class="pair">
+              <div><label for="r-persist">Persistence <span class="hint">(0–255)</span></label><input id="r-persist" type="number" min="0" max="255" step="1" value="63"></div>
+              <div><label for="r-slottime_ms">Slot time <span class="hint">(ms)</span></label><input id="r-slottime_ms" type="number" min="0" step="10" value="100"></div>
+              <div><label for="r-bitrate">Bit rate <span class="hint">(bd)</span></label><input id="r-bitrate" type="number" min="1" step="1" value="1200"></div>
+              <div><label for="r-guard_ms">Guard <span class="hint">(ms)</span></label><input id="r-guard_ms" type="number" min="0" step="10" value="1500"></div>
+              <div><label for="r-max_rounds">Max rounds <span class="hint">(handoff attempts)</span></label><input id="r-max_rounds" type="number" min="1" step="1" value="12"></div>
+            </div>
+          </details>
           </div>
           <p class="lede" id="radio-note" style="margin-top: 0.85rem"></p>
         </section>
@@ -632,9 +637,9 @@
           </div>
           <div class="block">
             <h3 class="block-title">Listening</h3>
-            <p class="lede">Accept inbound QUIC links. Saved now; used the next time you start the node.</p>
-            <label for="f-internet_listen">Address <span class="hint">(empty to stop listening)</span></label>
-            <input id="f-internet_listen" spellcheck="false" placeholder="0.0.0.0:4433">
+            <p class="lede">Accept inbound QUIC links. Empty address means not listening. Saved now; used the next time you start the node.</p>
+            <label for="f-internet_listen">Address <span class="hint">(empty = do not listen)</span></label>
+            <input id="f-internet_listen" spellcheck="false" placeholder="empty = off · e.g. 0.0.0.0:4433">
             <label class="check">
               <input id="f-open_hub" type="checkbox">
               <span class="check-body">Open hub
@@ -647,12 +652,12 @@
         <section class="settings-panel" id="panel-modem" role="tabpanel" data-panel="modem" hidden>
           <header>
             <h2>ARQ modem</h2>
-            <p>An external modem program (VARA, Mercury, or ARDOP) — not Direwolf or the built-in AFSK path. Saved now; used the next time you start the node.</p>
+            <p>An external modem program (VARA, Mercury, or ARDOP) — not Direwolf or the built-in AFSK path. Off until enabled; saved values are kept for when you turn it on. Used the next time you start the node.</p>
           </header>
           <label class="check">
             <input id="f-modem-enabled" type="checkbox">
             <span class="check-body">Enable ARQ modem
-              <span class="hint">Saved now; takes effect on the next start</span>
+              <span class="hint">When off, host/port below are stored but not used</span>
             </span>
           </label>
           <div id="modem-fields">
@@ -666,19 +671,32 @@
               </div>
               <div>
                 <label for="f-modem-port">Command port</label>
-                <input id="f-modem-port" type="number" min="1" max="65534" step="1">
+                <input id="f-modem-port" type="number" min="1" max="65534" step="1" value="8300">
               </div>
             </div>
             <label for="f-modem-host">Host</label>
-            <input id="f-modem-host" spellcheck="false" placeholder="127.0.0.1">
+            <input id="f-modem-host" spellcheck="false" value="127.0.0.1" placeholder="127.0.0.1">
             <div class="pair">
               <div>
-                <label for="f-modem-bandwidth">Bandwidth <span class="hint">(Hz; 0 = modem default)</span></label>
-                <input id="f-modem-bandwidth" type="number" min="0" step="1">
+                <label for="f-modem-bandwidth">Bandwidth</label>
+                <select id="f-modem-bandwidth">
+                  <option value="0">Modem default</option>
+                  <option value="500">500 Hz</option>
+                  <option value="2300">2300 Hz</option>
+                  <option value="2750">2750 Hz</option>
+                  <option value="custom">Custom…</option>
+                </select>
+                <input id="f-modem-bandwidth-custom" type="number" min="0" step="1" hidden placeholder="Hz">
               </div>
               <div>
                 <label for="f-modem-ptt">PTT</label>
-                <input id="f-modem-ptt" spellcheck="false" placeholder="none">
+                <select id="f-modem-ptt">
+                  <option value="none">None (modem keys the radio)</option>
+                  <option value="vox">VOX</option>
+                  <option value="rigctld">rigctld</option>
+                  <option value="custom">Custom device…</option>
+                </select>
+                <input id="f-modem-ptt-custom" spellcheck="false" hidden placeholder="rts:/dev/ttyUSB0, cm108:…">
               </div>
             </div>
           </div>
@@ -693,27 +711,27 @@
             <h3 class="block-title">Path preference</h3>
             <p class="lede">Lower cost is tried first when more than one path can reach a station.</p>
             <div class="trio">
-              <div><label for="radio_cost">Packet radio</label><input id="radio_cost" type="number" min="0.01" step="0.01" required></div>
-              <div><label for="internet_cost">Internet</label><input id="internet_cost" type="number" min="0.01" step="0.01" required></div>
-              <div><label for="modem_cost">ARQ modem</label><input id="modem_cost" type="number" min="0.01" step="0.01" required></div>
+              <div><label for="radio_cost">Packet radio</label><input id="radio_cost" type="number" min="0.01" step="0.01" value="1" required></div>
+              <div><label for="internet_cost">Internet</label><input id="internet_cost" type="number" min="0.01" step="0.01" value="2" required></div>
+              <div><label for="modem_cost">ARQ modem</label><input id="modem_cost" type="number" min="0.01" step="0.01" value="1.5" required></div>
             </div>
           </div>
           <div class="block">
             <h3 class="block-title">Retries</h3>
             <div class="trio">
-              <div><label for="retry_first_secs">First retry <span class="hint">(s)</span></label><input id="retry_first_secs" type="number" min="1" step="1" required></div>
-              <div><label for="retry_max_secs">Longest wait <span class="hint">(s)</span></label><input id="retry_max_secs" type="number" min="1" step="1" required></div>
-              <div><label for="retry_attempts">Attempts</label><input id="retry_attempts" type="number" min="1" step="1" required></div>
+              <div><label for="retry_first_secs">First retry <span class="hint">(s)</span></label><input id="retry_first_secs" type="number" min="1" step="1" value="60" required></div>
+              <div><label for="retry_max_secs">Longest wait <span class="hint">(s)</span></label><input id="retry_max_secs" type="number" min="1" step="1" value="3600" required></div>
+              <div><label for="retry_attempts">Attempts</label><input id="retry_attempts" type="number" min="1" step="1" value="12" required></div>
             </div>
           </div>
           <details class="advanced">
             <summary>Custody &amp; confirmation <span class="hint">shadow retain, reclaim, receipts</span></summary>
             <p class="lede">After a hop handoff the prior station keeps a shadow copy, then may reclaim if the destination never confirms.</p>
             <div class="pair">
-              <div><label for="custody_grace_secs">Shadow grace <span class="hint">(s)</span></label><input id="custody_grace_secs" type="number" min="1" step="1" required></div>
-              <div><label for="custody_suspect_secs">Suspect after <span class="hint">(s)</span></label><input id="custody_suspect_secs" type="number" min="1" step="1" required></div>
-              <div><label for="receipt_retry_attempts">Receipt attempts</label><input id="receipt_retry_attempts" type="number" min="1" step="1" required></div>
-              <div><label for="evidence_half_life_secs">Evidence half-life <span class="hint">(s)</span></label><input id="evidence_half_life_secs" type="number" min="1" step="1" required></div>
+              <div><label for="custody_grace_secs">Shadow grace <span class="hint">(s)</span></label><input id="custody_grace_secs" type="number" min="1" step="1" value="21600" required></div>
+              <div><label for="custody_suspect_secs">Suspect after <span class="hint">(s)</span></label><input id="custody_suspect_secs" type="number" min="1" step="1" value="86400" required></div>
+              <div><label for="receipt_retry_attempts">Receipt attempts</label><input id="receipt_retry_attempts" type="number" min="1" step="1" value="24" required></div>
+              <div><label for="evidence_half_life_secs">Evidence half-life <span class="hint">(s)</span></label><input id="evidence_half_life_secs" type="number" min="1" step="1" value="3600" required></div>
             </div>
           </details>
         </section>
@@ -721,7 +739,7 @@
         <section class="settings-panel" id="panel-relay" role="tabpanel" data-panel="relay" hidden>
           <header>
             <h2>Relay</h2>
-            <p>Forward traffic for other stations, or hold it until they check in.</p>
+            <p>Forward traffic for other stations, or hold it until they check in. Limits below are stored always; they apply only while relay or mailbox is on.</p>
           </header>
           <label class="check">
             <input id="relay_enabled" type="checkbox">
@@ -738,12 +756,12 @@
           <details class="advanced">
             <summary>Limits &amp; airtime <span class="hint">storage, hops, control share</span></summary>
             <div class="pair">
-              <div><label for="relay_max_holdings">Max holdings</label><input id="relay_max_holdings" type="number" min="1" step="1" required></div>
-              <div><label for="relay_max_bytes">Max bytes</label><input id="relay_max_bytes" type="number" min="1" step="1" required></div>
-              <div><label for="relay_max_hops">Max hops</label><input id="relay_max_hops" type="number" min="1" max="16" step="1" required></div>
-              <div><label for="relay_airtime_budget_secs">Airtime budget <span class="hint">(s)</span></label><input id="relay_airtime_budget_secs" type="number" min="1" step="1" required></div>
-              <div><label for="relay_urgent_min_gain">Urgent dual-copy gain</label><input id="relay_urgent_min_gain" type="number" min="0" max="0.999" step="0.01" required></div>
-              <div><label for="relay_control_airtime_fraction">Control airtime fraction</label><input id="relay_control_airtime_fraction" type="number" min="0" max="1" step="0.001" required></div>
+              <div><label for="relay_max_holdings">Max holdings</label><input id="relay_max_holdings" type="number" min="1" step="1" value="256" required></div>
+              <div><label for="relay_max_bytes">Max bytes</label><input id="relay_max_bytes" type="number" min="1" step="1" value="16777216" required></div>
+              <div><label for="relay_max_hops">Max hops</label><input id="relay_max_hops" type="number" min="1" max="16" step="1" value="8" required></div>
+              <div><label for="relay_airtime_budget_secs">Airtime budget <span class="hint">(s)</span></label><input id="relay_airtime_budget_secs" type="number" min="1" step="1" value="300" required></div>
+              <div><label for="relay_urgent_min_gain">Urgent dual-copy gain</label><input id="relay_urgent_min_gain" type="number" min="0" max="0.999" step="0.01" value="0.05" required></div>
+              <div><label for="relay_control_airtime_fraction">Control airtime fraction</label><input id="relay_control_airtime_fraction" type="number" min="0" max="1" step="0.001" value="0.02" required></div>
             </div>
           </details>
         </section>
@@ -754,9 +772,9 @@
             <p>Where the web page listens and where messages are stored. Saved now; used the next time you start the node.</p>
           </header>
           <label for="f-http">Web address</label>
-          <input id="f-http" spellcheck="false" required placeholder="127.0.0.1:8080">
+          <input id="f-http" spellcheck="false" required value="127.0.0.1:8080" placeholder="127.0.0.1:8080">
           <label for="f-store">Store path</label>
-          <input id="f-store" spellcheck="false" required placeholder="station.db">
+          <input id="f-store" spellcheck="false" required value="station.db" placeholder="station.db">
           <p class="lede" id="settings-file-meta" style="margin-top: 1rem"></p>
         </section>
 
@@ -1677,7 +1695,7 @@ $("trust-form").addEventListener("submit", async (ev) => {
 });
 
 // ---- Settings ----------------------------------------------------------
-const radioText = ["kiss", "audio", "ptt", "framing"];
+const radioText = ["kiss", "audio", "framing"];
 const radioNumbers = ["txdelay_ms", "tnc_port", "persist", "slottime_ms", "bitrate", "guard_ms", "max_rounds"];
 const liveFields = [
   "beacon_minutes", "radio_cost", "internet_cost", "modem_cost",
@@ -1685,13 +1703,86 @@ const liveFields = [
   "custody_grace_secs", "custody_suspect_secs", "receipt_retry_attempts",
   "evidence_half_life_secs",
 ];
+const liveDefaults = {
+  beacon_minutes: 10,
+  radio_cost: 1,
+  internet_cost: 2,
+  modem_cost: 1.5,
+  retry_first_secs: 60,
+  retry_max_secs: 3600,
+  retry_attempts: 12,
+  custody_grace_secs: 21600,
+  custody_suspect_secs: 86400,
+  receipt_retry_attempts: 24,
+  evidence_half_life_secs: 3600,
+};
 const relayNumbers = [
   "max_holdings", "max_bytes", "max_hops", "airtime_budget_secs",
   "urgent_min_gain", "control_airtime_fraction",
 ];
-const modemText = ["kind", "host", "ptt"];
-const modemNumbers = ["port", "bandwidth"];
+const relayDefaults = {
+  max_holdings: 256,
+  max_bytes: 16777216,
+  max_hops: 8,
+  airtime_budget_secs: 300,
+  urgent_min_gain: 0.05,
+  control_airtime_fraction: 0.02,
+};
+const radioDefaults = {
+  kiss: "127.0.0.1:8001",
+  audio: "",
+  framing: "ax25",
+  txdelay_ms: 300,
+  tnc_port: 0,
+  persist: 63,
+  slottime_ms: 100,
+  bitrate: 1200,
+  guard_ms: 1500,
+  max_rounds: 12,
+};
 let settingsFile = null;
+
+function setSelectOrCustom(selectId, customId, value, known) {
+  const sel = $(selectId);
+  const custom = $(customId);
+  const v = (value ?? "").toString();
+  if (known.includes(v)) {
+    sel.value = v;
+    custom.hidden = true;
+    custom.value = "";
+  } else if (!v && known.includes("")) {
+    sel.value = "";
+    custom.hidden = true;
+  } else {
+    sel.value = "custom";
+    custom.hidden = false;
+    custom.value = v;
+  }
+}
+
+function valueSelectOrCustom(selectId, customId) {
+  const sel = $(selectId);
+  if (sel.value === "custom") return customId ? $(customId).value.trim() : "";
+  return sel.value;
+}
+
+function bindSelectCustom(selectId, customId) {
+  $(selectId).addEventListener("change", () => {
+    const custom = $(customId);
+    const on = $(selectId).value === "custom";
+    custom.hidden = !on;
+    if (on) custom.focus();
+  });
+}
+
+function setNum(id, value, fallback) {
+  const n = value == null || value === "" ? fallback : Number(value);
+  $(id).value = Number.isFinite(n) ? n : fallback;
+}
+
+function setText(id, value, fallback) {
+  $(id).value = value == null ? (fallback ?? "") : String(value);
+}
 
 const LOCATOR_RE = /^[A-R]{2}[0-9]{2}([A-X]{2})?$/i;
 
@@ -1940,48 +2031,54 @@ function showSettingsPanel(name) {
 }
 
 function settingsBusy() {
-  const form = $("settings-form");
   const ae = document.activeElement;
-  if (form.contains(ae) && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.tagName === "SELECT" || ae.tagName === "BUTTON")) {
-    return true;
-  }
-  return !!(locatorMap && locatorMap.getContainer().contains(ae));
+  if (!ae || !$("settings-form").contains(ae)) return false;
+  // Only skip refresh while the operator is typing — not when a nav button has focus.
+  return ae.tagName === "INPUT" || ae.tagName === "TEXTAREA";
 }
 
 function showSettings(v, force) {
   settingsFile = v.file;
   if (!force && settingsBusy()) return;
-  for (const k of liveFields) $(k).value = v.live[k];
-  $("locator").value = v.live.locator || "";
+  const live = v.live || {};
+  for (const k of liveFields) setNum(k, live[k], liveDefaults[k]);
+  setText("locator", live.locator, "");
   locatorAnchor = null;
   $("locator-reroll").hidden = true;
   syncLocatorMap($("locator").value, true);
-  const r = v.live.radio;
-  $("r-enabled").checked = r.enabled;
-  for (const k of radioText.concat(radioNumbers)) $("r-" + k).value = r[k];
-  setGroupEnabled("radio-fields", r.enabled);
+  const r = live.radio || {};
+  $("r-enabled").checked = r.enabled !== false;
+  for (const k of radioText) setText("r-" + k, r[k], radioDefaults[k]);
+  for (const k of radioNumbers) setNum("r-" + k, r[k], radioDefaults[k]);
+  setSelectOrCustom("r-ptt", "r-ptt-custom", r.ptt || "vox", ["vox", "rigctld"]);
+  setGroupEnabled("radio-fields", $("r-enabled").checked);
   $("radio-note").textContent = v.radio_applies_now
     ? "Radio changes open the new link at once."
     : "Radio changes are saved and take a restart of the node.";
-  const relay = v.live.relay;
+  const relay = live.relay || {};
   $("relay_enabled").checked = !!relay.enabled;
   $("relay_mailbox").checked = !!relay.mailbox;
-  for (const k of relayNumbers) $("relay_" + k).value = relay[k];
-  $("peers").replaceChildren(...v.live.peers.map(peerRow));
-  const fixed = v.restart_to_change;
-  $("f-internet_listen").value = fixed.internet_listen || "";
+  for (const k of relayNumbers) setNum("relay_" + k, relay[k], relayDefaults[k]);
+  $("peers").replaceChildren(...(live.peers || []).map(peerRow));
+  const fixed = v.restart_to_change || {};
+  setText("f-internet_listen", fixed.internet_listen, "");
   $("f-open_hub").checked = !!fixed.open_hub;
-  $("f-http").value = fixed.http || "";
-  $("f-store").value = fixed.store || "";
+  setText("f-http", fixed.http, "127.0.0.1:8080");
+  setText("f-store", fixed.store, "station.db");
   const modem = fixed.modem || {};
   $("f-modem-enabled").checked = !!modem.enabled;
-  for (const k of modemText) $("f-modem-" + k).value = modem[k] || "";
-  for (const k of modemNumbers) $("f-modem-" + k).value = modem[k] ?? "";
-  setGroupEnabled("modem-fields", !!modem.enabled);
+  $("f-modem-kind").value = modem.kind === "ardop" ? "ardop" : "vara";
+  setText("f-modem-host", modem.host, "127.0.0.1");
+  setNum("f-modem-port", modem.port, modem.kind === "ardop" ? 8515 : 8300);
+  const bw = modem.bandwidth == null ? 0 : Number(modem.bandwidth);
+  setSelectOrCustom("f-modem-bandwidth", "f-modem-bandwidth-custom", String(bw), ["0", "500", "2300", "2750"]);
+  if ($("f-modem-bandwidth").value === "custom") $("f-modem-bandwidth-custom").value = bw;
+  setSelectOrCustom("f-modem-ptt", "f-modem-ptt-custom", modem.ptt || "none", ["none", "vox", "rigctld"]);
+  setGroupEnabled("modem-fields", $("f-modem-enabled").checked);
   const meta = [];
   if (v.file) meta.push("Saved to " + v.file);
   else meta.push("No settings file — changes last until restart");
-  if (v.overridden.length) {
+  if ((v.overridden || []).length) {
     meta.push("Command-line overrides for this run: " + v.overridden.join(", "));
   }
   $("settings-file-meta").textContent = meta.join(". ") + ".";
@@ -1996,7 +2093,11 @@ function showSettings(v, force) {
 
 async function loadSettings(force) {
   const r = await api("/api/settings");
-  if (r.ok) showSettings(await r.json(), force);
+  if (!r.ok) {
+    settingsNote("Could not load settings: " + r.statusText, "bad");
+    return;
+  }
+  showSettings(await r.json(), force);
 }
 
 $("settings-nav").addEventListener("click", (ev) => {
@@ -2009,13 +2110,21 @@ function setGroupEnabled(id, on) {
   const root = $(id);
   root.hidden = !on;
   for (const el of root.querySelectorAll("input, select, textarea, button")) {
-    if (el.id === "add-peer") continue;
     el.disabled = !on;
   }
 }
 
+bindSelectCustom("r-ptt", "r-ptt-custom");
+bindSelectCustom("f-modem-ptt", "f-modem-ptt-custom");
+bindSelectCustom("f-modem-bandwidth", "f-modem-bandwidth-custom");
+
 $("r-enabled").addEventListener("change", (ev) => { setGroupEnabled("radio-fields", ev.target.checked); });
 $("f-modem-enabled").addEventListener("change", (ev) => { setGroupEnabled("modem-fields", ev.target.checked); });
+$("f-modem-kind").addEventListener("change", () => {
+  if (!$("f-modem-port").value || $("f-modem-port").value === "8300" || $("f-modem-port").value === "8515") {
+    $("f-modem-port").value = $("f-modem-kind").value === "ardop" ? 8515 : 8300;
+  }
+});
 
 $("add-peer").addEventListener("click", () => {
   const row = peerRow({ station: "", address: "" });
@@ -2079,39 +2188,130 @@ $("locator-gps").addEventListener("click", () => {
 $("settings-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const form = ev.currentTarget;
-  const bad = [...form.elements].find((el) => el.willValidate && !el.disabled && !el.checkValidity());
-  if (bad) {
-    const panel = bad.closest(".settings-panel[data-panel]");
+  const fail = (el, msg) => {
+    const panel = el.closest(".settings-panel[data-panel]");
     if (panel) showSettingsPanel(panel.dataset.panel);
-    bad.reportValidity();
+    if (el.setCustomValidity) {
+      el.setCustomValidity(msg);
+      el.reportValidity();
+      el.setCustomValidity("");
+    } else {
+      settingsNote(msg, "bad");
+    }
+  };
+  const num = (id) => Number($(id).value);
+  const requireFinite = (id, label, min, max) => {
+    const el = $(id);
+    if (el.disabled) return true;
+    const v = Number(el.value);
+    if (!Number.isFinite(v)) { fail(el, label + " must be a number"); return false; }
+    if (min != null && v < min) { fail(el, label + " must be at least " + min); return false; }
+    if (max != null && v > max) { fail(el, label + " must be at most " + max); return false; }
+    return true;
+  };
+  for (const el of form.elements) {
+    if (el.willValidate && !el.disabled && !el.checkValidity()) {
+      const panel = el.closest(".settings-panel[data-panel]");
+      if (panel) showSettingsPanel(panel.dataset.panel);
+      el.reportValidity();
+      return;
+    }
+  }
+  const loc = $("locator").value.trim();
+  if (loc && !formatLocator(loc)) {
+    fail($("locator"), "Not a Maidenhead locator (e.g. JO89 or JO89xi)");
     return;
   }
+  if ($("r-enabled").checked) {
+    if (!$("r-kiss").value.trim() && !$("r-audio").value.trim()) {
+      fail($("r-kiss"), "Set a KISS TNC or a sound card");
+      return;
+    }
+    const ptt = valueSelectOrCustom("r-ptt", "r-ptt-custom");
+    if (!ptt) { fail($("r-ptt-custom").hidden ? $("r-ptt") : $("r-ptt-custom"), "PTT is required (use VOX if unsure)"); return; }
+    for (const [id, label, min] of [
+      ["r-bitrate", "Bit rate", 1], ["r-max_rounds", "Max rounds", 1],
+    ]) if (!requireFinite(id, label, min)) return;
+  }
+  for (const [id, label, min] of [
+    ["radio_cost", "Packet radio cost", 0.01],
+    ["internet_cost", "Internet cost", 0.01],
+    ["modem_cost", "ARQ cost", 0.01],
+    ["retry_first_secs", "First retry", 1],
+    ["retry_max_secs", "Longest wait", 1],
+    ["retry_attempts", "Attempts", 1],
+    ["custody_grace_secs", "Shadow grace", 1],
+    ["custody_suspect_secs", "Suspect after", 1],
+    ["receipt_retry_attempts", "Receipt attempts", 1],
+    ["evidence_half_life_secs", "Evidence half-life", 1],
+  ]) if (!requireFinite(id, label, min)) return;
+  if (num("retry_max_secs") < num("retry_first_secs")) {
+    fail($("retry_max_secs"), "Longest wait must be ≥ first retry");
+    return;
+  }
+  for (const [id, label, min, max] of [
+    ["relay_max_holdings", "Max holdings", 1],
+    ["relay_max_bytes", "Max bytes", 1],
+    ["relay_max_hops", "Max hops", 1, 16],
+    ["relay_airtime_budget_secs", "Airtime budget", 1],
+    ["relay_urgent_min_gain", "Urgent dual-copy gain", 0, 0.999],
+    ["relay_control_airtime_fraction", "Control airtime fraction", 0, 1],
+  ]) if (!requireFinite(id, label, min, max)) return;
+  if ($("f-modem-enabled").checked) {
+    if (!$("f-modem-host").value.trim()) { fail($("f-modem-host"), "Modem host is required when enabled"); return; }
+    if (!requireFinite("f-modem-port", "Modem port", 1, 65534)) return;
+    const bw = valueSelectOrCustom("f-modem-bandwidth", "f-modem-bandwidth-custom");
+    if (bw === "" || !Number.isFinite(Number(bw)) || Number(bw) < 0) {
+      fail($("f-modem-bandwidth-custom").hidden ? $("f-modem-bandwidth") : $("f-modem-bandwidth-custom"), "Bandwidth must be 0 or a positive Hz value");
+      return;
+    }
+    const mptt = valueSelectOrCustom("f-modem-ptt", "f-modem-ptt-custom");
+    if (!mptt) { fail($("f-modem-ptt-custom").hidden ? $("f-modem-ptt") : $("f-modem-ptt-custom"), "Modem PTT is required (use None if the modem keys the radio)"); return; }
+  }
+  if (!$("f-http").value.trim()) { fail($("f-http"), "Web address is required"); return; }
+  if (!$("f-store").value.trim()) { fail($("f-store"), "Store path is required"); return; }
+  const listen = $("f-internet_listen").value.trim();
+  if (listen && !listen.includes(":")) {
+    fail($("f-internet_listen"), "Listen address needs a port (host:port)");
+    return;
+  }
+
   const body = {};
-  for (const k of liveFields) body[k] = Number($(k).value);
-  body.locator = $("locator").value.trim();
-  body.radio = { enabled: $("r-enabled").checked };
+  for (const k of liveFields) body[k] = num(k);
+  body.locator = loc ? formatLocator(loc) : "";
+  body.radio = {
+    enabled: $("r-enabled").checked,
+    ptt: valueSelectOrCustom("r-ptt", "r-ptt-custom") || "vox",
+  };
   for (const k of radioText) body.radio[k] = $("r-" + k).value.trim();
-  for (const k of radioNumbers) body.radio[k] = Number($("r-" + k).value);
+  for (const k of radioNumbers) body.radio[k] = num("r-" + k);
   body.relay = {
     enabled: $("relay_enabled").checked,
     mailbox: $("relay_mailbox").checked,
   };
-  for (const k of relayNumbers) body.relay[k] = Number($("relay_" + k).value);
+  for (const k of relayNumbers) body.relay[k] = num("relay_" + k);
   body.peers = [...document.querySelectorAll("#peers .peer")]
     .map((row) => { const [c, a] = row.querySelectorAll("input"); return { station: c.value.trim().toUpperCase(), address: a.value.trim() }; })
     .filter((p) => p.station || p.address);
+  for (const p of body.peers) {
+    if (!p.station || !p.address.includes(":")) {
+      settingsNote("Each internet peer needs a callsign and host:port", "bad");
+      showSettingsPanel("internet");
+      return;
+    }
+  }
   body.restart_to_change = {
-    internet_listen: $("f-internet_listen").value.trim(),
+    internet_listen: listen,
     open_hub: $("f-open_hub").checked,
     http: $("f-http").value.trim(),
     store: $("f-store").value.trim(),
     modem: {
       enabled: $("f-modem-enabled").checked,
       kind: $("f-modem-kind").value.trim(),
-      host: $("f-modem-host").value.trim(),
-      port: Number($("f-modem-port").value),
-      bandwidth: Number($("f-modem-bandwidth").value),
-      ptt: $("f-modem-ptt").value.trim() || "none",
+      host: $("f-modem-host").value.trim() || "127.0.0.1",
+      port: Number($("f-modem-port").value) || 8300,
+      bandwidth: Number(valueSelectOrCustom("f-modem-bandwidth", "f-modem-bandwidth-custom")) || 0,
+      ptt: valueSelectOrCustom("f-modem-ptt", "f-modem-ptt-custom") || "none",
     },
   };
   const r = await api("/api/settings", Object.assign({ method: "PATCH" }, json(body)));

@@ -398,7 +398,8 @@ impl LiveConfig {
             .as_deref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no settings file to save to"))?;
         if let Some(m) = &patch.modem {
-            m.check().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            m.check()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         }
         if let Some(http) = &patch.http {
             if http.trim().is_empty() {
