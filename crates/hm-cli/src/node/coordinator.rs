@@ -445,9 +445,16 @@ pub(crate) async fn coordinator(
                         for hop in &flight.route.hops {
                             let _ = graph.release(hop.contact, flight.object_bytes);
                         }
+                        let now = unix_now();
                         match result {
                             Ok(()) => {
-                                match store.delivered(id, false, "internet", unix_now()) {
+                                chooser.record(peer, flight.bearer, true, now);
+                                let (key, evidence) =
+                                    graph.record_delivery(cfg.me, peer, route_bearer(flight.bearer), true, now);
+                                if let Err(error) = store.save_contact_evidence(key, evidence) {
+                                    log(format!("store: {error}"));
+                                }
+                                match store.delivered(id, false, "internet", now) {
                                     Ok(()) => log(format!(
                                         "published bulletin {} to {peer} over the internet",
                                         short(&id)
@@ -456,6 +463,12 @@ pub(crate) async fn coordinator(
                                 }
                             }
                             Err(e) => {
+                                chooser.record(peer, flight.bearer, false, now);
+                                let (key, evidence) =
+                                    graph.record_delivery(cfg.me, peer, route_bearer(flight.bearer), false, now);
+                                if let Err(error) = store.save_contact_evidence(key, evidence) {
+                                    log(format!("store: {error}"));
+                                }
                                 let reason = match e {
                                     NetError::Busy {
                                         retry_after,
@@ -474,12 +487,12 @@ pub(crate) async fn coordinator(
                                         id,
                                         &format!("{reason} (internet)"),
                                         live.get().retry,
-                                        unix_now(),
+                                        now,
                                     ) {
                                         Ok(Retry::At(t)) => log(format!(
                                             "bulletin {}; next try in {} s",
                                             short(&id),
-                                            t.saturating_sub(unix_now())
+                                            t.saturating_sub(now)
                                         )),
                                         Ok(Retry::GaveUp) => {
                                             log(format!("gave up on bulletin {}", short(&id)))
@@ -491,6 +504,7 @@ pub(crate) async fn coordinator(
                             }
                         }
                         notify.send("message");
+                        notify.send("status");
                     }
                 } else {
                     let outcome = match result {

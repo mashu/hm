@@ -96,6 +96,20 @@ enum Cmd {
         #[command(flatten)]
         station: StationArgs,
     },
+    /// Show live node status (links, reachability) via the local web API.
+    Status,
+    /// List stored messages (chat, mail, bulletin) from the message store.
+    Messages {
+        /// in, out, relay, or all [default: in].
+        #[arg(long, default_value = "in")]
+        direction: String,
+        /// chat, mail, bulletin, or all [default: all].
+        #[arg(long, default_value = "all")]
+        kind: String,
+        /// Max rows [default: 20].
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -164,6 +178,9 @@ struct NodeArgs {
     /// Run without a radio [radio.enabled = false].
     #[arg(long)]
     no_radio: bool,
+    /// Run without internet listen or dial peers [internet.listen cleared, peers empty].
+    #[arg(long)]
+    no_internet: bool,
     /// Accept internet links from trusted stations here [internet.listen].
     #[arg(long)]
     listen: Option<String>,
@@ -240,6 +257,13 @@ impl NodeArgs {
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             set(&mut c.internet.peers, Some(peers), "internet.peers", o);
+        }
+        if self.no_internet {
+            if self.listen.is_some() || !self.peers.is_empty() {
+                return Err("--no-internet cannot be combined with --listen or --peer".into());
+            }
+            set(&mut c.internet.listen, Some(None), "internet.listen", o);
+            set(&mut c.internet.peers, Some(Vec::new()), "internet.peers", o);
         }
         set(
             &mut c.delivery.radio_cost,
@@ -513,6 +537,190 @@ fn listen(c: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// GET a JSON path on the running node's local HTTP API.
+fn api_get(c: &Config, path: &str) -> Result<serde_json::Value, String> {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpStream;
+
+    let addr = c
+        .station
+        .http
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| format!("station.http {}: {e}", c.station.http))?;
+    let token = api_token(&c.station.store)?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .map_err(|e| format!("node API at {addr}: {e} (is `hm node` running?)"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&buf);
+    let body = text
+        .split_once("\r\n\r\n")
+        .or_else(|| text.split_once("\n\n"))
+        .map(|(_, b)| b.trim_start_matches('\u{feff}'))
+        .ok_or_else(|| "node API: malformed HTTP response".to_string())?;
+    // Drop a possible chunked framing first line length if present — prefer finding JSON.
+    let json_start = body.find(['{', '[']).ok_or_else(|| {
+        format!("node API: not JSON ({})", body.chars().take(80).collect::<String>())
+    })?;
+    serde_json::from_str(&body[json_start..]).map_err(|e| format!("node API JSON: {e}"))
+}
+
+/// Live status from the running node (needs local HTTP; SSH in if 8080 is not public).
+fn status(c: &Config) -> Result<(), String> {
+    let v = api_get(c, "/api/status")?;
+    println!("call           {}", v["call"].as_str().unwrap_or("?"));
+    println!("locator        {}", v["locator"].as_str().unwrap_or("-"));
+    println!(
+        "packet radio   {}",
+        match v["radio"].as_bool() {
+            Some(true) => format!("up{}", v["radio_via"].as_str().map(|s| format!(" ({s})")).unwrap_or_default()),
+            Some(false) => "down".into(),
+            None => "off".into(),
+        }
+    );
+    let listen = v["internet_listen"].as_str().unwrap_or("-");
+    let peers = v["internet_peers"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "none".into());
+    println!("internet       listen {listen}; peers: {peers}");
+    println!(
+        "arq            {}",
+        match v["modem"].as_bool() {
+            Some(true) => {
+                let peer = v["modem_peer"].as_str().unwrap_or("-");
+                format!("ready (peer {peer})")
+            }
+            Some(false) => "down".into(),
+            None => "off".into(),
+        }
+    );
+    if let Some(rows) = v["estimates"].as_array() {
+        if !rows.is_empty() {
+            println!("reachability:");
+            for row in rows {
+                let station = row["station"].as_str().unwrap_or("?");
+                let bearer = match row["bearer"].as_str() {
+                    Some("radio") => "packet-radio",
+                    Some("modem") => "arq",
+                    Some(other) => other,
+                    None => "?",
+                };
+                let success = row["success"].as_f64().unwrap_or(0.0);
+                println!("  {station:9} {bearer:12} {:>3}%", (success * 100.0).round() as i64);
+            }
+        }
+    }
+    if let Some(heard) = v["heard"].as_array() {
+        if !heard.is_empty() {
+            println!("heard on packet radio:");
+            for h in heard.iter().take(20) {
+                let call = h["call"].as_str().unwrap_or("?");
+                let when = h["at"].as_u64().unwrap_or(0);
+                println!("  {call}  (last at {when})");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// List stored messages without needing the web UI (reads the store on disk).
+fn messages(c: &Config, direction: &str, kind: &str, limit: usize) -> Result<(), String> {
+    use hm_bundle::{Kind, Opened};
+    use hm_store::{Direction, Store};
+
+    let dirs: &[Direction] = match direction {
+        "in" => &[Direction::In],
+        "out" => &[Direction::Out],
+        "relay" => &[Direction::Relay],
+        "all" => &[Direction::In, Direction::Out, Direction::Relay],
+        other => return Err(format!("direction must be in, out, relay or all, not {other:?}")),
+    };
+    let want_kind = match kind {
+        "all" => None,
+        "chat" => Some(Kind::Chat),
+        "mail" => Some(Kind::Mail),
+        "bulletin" => Some(Kind::Bulletin),
+        other => return Err(format!("kind must be chat, mail, bulletin or all, not {other:?}")),
+    };
+
+    let store = Store::open(&c.station.store).map_err(|e| e.to_string())?;
+    let mut rows = Vec::new();
+    for d in dirs {
+        for r in store.list(*d, 500).map_err(|e| e.to_string())? {
+            rows.push(r);
+        }
+    }
+    rows.sort_by(|a, b| b.at.cmp(&a.at).then(b.seq.cmp(&a.seq)));
+
+    let mut shown = 0usize;
+    for r in rows {
+        let object = store.object(r.id).map_err(|e| e.to_string())?;
+        let Some(bytes) = object else { continue };
+        let opened = match Opened::decode(&bytes) {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        if want_kind.is_some_and(|k| opened.bundle.kind != k) {
+            continue;
+        }
+        let dir = match r.direction {
+            Direction::In => "in",
+            Direction::Out => "out",
+            Direction::Relay => "relay",
+        };
+        let subject = opened
+            .bundle
+            .subject
+            .as_deref()
+            .map(|s| format!(" [{s}]"))
+            .unwrap_or_default();
+        let text = opened
+            .bundle
+            .body
+            .as_ref()
+            .and_then(|b| b.as_text().ok())
+            .map(|t| t.into_owned())
+            .unwrap_or_else(|| "<no text>".into());
+        let text = if text.len() > 120 {
+            format!("{}…", &text[..117])
+        } else {
+            text
+        };
+        let by = r.by.as_deref().unwrap_or("-");
+        println!(
+            "{} {dir:5} {:?} {} ↔ {}  {:?}{subject}  by={by}  {}",
+            station::utc_clock(r.at),
+            opened.bundle.kind,
+            opened.bundle.from,
+            r.peer,
+            r.state,
+            text
+        );
+        shown += 1;
+        if shown >= limit {
+            break;
+        }
+    }
+    if shown == 0 {
+        println!("(no messages)");
+    }
+    Ok(())
+}
+
 /// The API token beside the store, created on first start (owner-only on Unix).
 fn api_token(store: &Path) -> Result<String, String> {
     let path = store.with_extension("token");
@@ -685,6 +893,12 @@ fn main() -> ExitCode {
         } => with_overrides(path, station, None)
             .and_then(|(c, _)| send(&c, to, text, subject.as_deref(), *precedence, *timeout)),
         Cmd::Listen { station } => with_overrides(path, station, None).and_then(|(c, _)| listen(&c)),
+        Cmd::Status => load_config(path).and_then(|c| status(&c)),
+        Cmd::Messages {
+            direction,
+            kind,
+            limit,
+        } => load_config(path).and_then(|c| messages(&c, direction, kind, *limit)),
         Cmd::AudioDevices => audio_devices(),
         Cmd::Node { station, node: n } => {
             let (s2, n2) = (station.clone(), n.clone());

@@ -48,6 +48,7 @@
   .chip::before { content: ""; width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--muted); }
   .chip.ok::before { background: var(--ok); } .chip.warn::before { background: var(--warn); } .chip.bad::before { background: var(--bad); }
   .chip.plain::before { display: none; }
+  .chip[title], .bearer[title] { cursor: help; }
   nav.tabs { display: flex; gap: 0.15rem; margin-top: 0.35rem; overflow-x: auto; }
   nav.tabs a {
     padding: 0.4rem 0.75rem; color: var(--muted); text-decoration: none; font-weight: 700;
@@ -275,9 +276,9 @@
     <h1 id="call">…</h1>
     <div class="chips" aria-live="polite">
       <span class="chip plain" id="chip-grid" hidden></span>
-      <span class="chip" id="chip-radio">Radio</span>
-      <span class="chip" id="chip-net" hidden>Internet</span>
-      <span class="chip" id="chip-modem" hidden>Modem</span>
+      <span class="chip" id="chip-radio" title="Packet radio: KISS/Direwolf or the built-in AFSK sound-card path — hm's own transfer engine">Packet radio</span>
+      <span class="chip" id="chip-net" hidden title="QUIC link to another station over the internet">Internet</span>
+      <span class="chip" id="chip-modem" hidden title="External ARQ program (VARA, ARDOP, Mercury) — not Direwolf/AFSK">ARQ</span>
       <span class="chip" id="chip-live" title="Updates arrive as they happen">Connecting…</span>
     </div>
   </div>
@@ -395,6 +396,7 @@
       </div>
       <div class="card wide">
         <h2>Reachability</h2>
+        <p class="hint">Estimated delivery success per path. Hover a path name for what it means.</p>
         <div id="network-estimates"></div>
       </div>
       <div class="card" id="heard-section">
@@ -443,8 +445,8 @@
         <p id="locator-hint" role="status">Click the map or use your location; a nearby square is chosen within the range. Or type one.</p>
       </fieldset>
       <fieldset>
-        <legend>Radio</legend>
-        <label class="check"><input id="r-enabled" type="checkbox"> Use a radio</label>
+        <legend>Packet radio</legend>
+        <label class="check"><input id="r-enabled" type="checkbox"> Use packet radio <span class="hint">(KISS/Direwolf or built-in AFSK)</span></label>
         <div id="radio-fields">
           <label for="r-kiss">KISS TNC <span class="hint">(Direwolf <code>127.0.0.1:8001</code>, or <code>serial:/dev/ttyUSB0:9600</code>)</span></label>
           <input id="r-kiss" spellcheck="false">
@@ -479,11 +481,11 @@
       <fieldset>
         <legend>Delivery</legend>
         <div class="pair">
-          <div><label for="radio_cost">Radio cost</label><input id="radio_cost" type="number" min="0.01" step="0.01" required></div>
-          <div><label for="internet_cost">Internet cost</label><input id="internet_cost" type="number" min="0.01" step="0.01" required></div>
-          <div><label for="modem_cost">Modem cost <span class="hint">(VARA, ARDOP)</span></label><input id="modem_cost" type="number" min="0.01" step="0.01" required></div>
+          <div><label for="radio_cost">Packet radio cost <span class="hint">(KISS / AFSK)</span></label><input id="radio_cost" type="number" min="0.01" step="0.01" required></div>
+          <div><label for="internet_cost">Internet cost <span class="hint">(QUIC)</span></label><input id="internet_cost" type="number" min="0.01" step="0.01" required></div>
+          <div><label for="modem_cost">ARQ cost <span class="hint">(VARA, ARDOP, Mercury — not Direwolf)</span></label><input id="modem_cost" type="number" min="0.01" step="0.01" required></div>
         </div>
-        <p class="hint">The cheaper way that reaches a station is tried first.</p>
+        <p class="hint">The cheaper path that reaches a station is tried first. Packet radio is hm's AX.25/AFSK stack; ARQ is an external modem program.</p>
         <div class="pair">
           <div><label for="retry_first_secs">First retry <span class="hint">(s)</span></label><input id="retry_first_secs" type="number" min="1" step="1" required></div>
           <div><label for="retry_max_secs">Longest wait <span class="hint">(s)</span></label><input id="retry_max_secs" type="number" min="1" step="1" required></div>
@@ -525,7 +527,8 @@
 const el = (tag, cls, text) => {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
-  if (text !== undefined && text !== null) n.textContent = text;
+  if (text instanceof Node) n.append(text);
+  else if (text !== undefined && text !== null) n.textContent = text;
   return n;
 };
 const $ = (id) => document.getElementById(id);
@@ -562,6 +565,31 @@ const api = async (path, opts = {}) => {
 const json = (body) => ({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 const chip = (id, text, cls) => { const c = $(id); c.textContent = text; c.className = "chip " + (cls || ""); };
 const quietly = (p) => p.catch(() => {});
+
+/** API bearer ids → labels people can tell apart (Direwolf/AFSK ≠ VARA ARQ). */
+const BEARERS = {
+  radio: {
+    label: "Packet radio",
+    tip: "KISS/Direwolf or the built-in AFSK sound-card path. hm runs its own packet transfers on this path.",
+  },
+  internet: {
+    label: "Internet",
+    tip: "Authenticated QUIC link to another station (UDP).",
+  },
+  modem: {
+    label: "ARQ",
+    tip: "External ARQ program: VARA, ARDOP or Mercury. Not Direwolf or the built-in AFSK modem.",
+  },
+};
+function bearerInfo(id) {
+  return BEARERS[id] || { label: id, tip: "" };
+}
+function bearerChip(id) {
+  const info = bearerInfo(id);
+  const span = el("span", "bearer", info.label);
+  if (info.tip) span.title = info.tip;
+  return span;
+}
 
 // ---- Views -------------------------------------------------------------
 const VIEWS = ["chat", "mail", "bulletin", "network", "settings"];
@@ -643,7 +671,7 @@ function estimatesFor(call) {
 function pathHint(call) {
   const rows = estimatesFor(call);
   if (!rows.length) return "";
-  return rows.map((e) => e.bearer + " ~" + pct(e.success)).join(" · ");
+  return rows.map((e) => bearerInfo(e.bearer).label + " ~" + pct(e.success)).join(" · ");
 }
 
 async function loadChats() {
@@ -1214,23 +1242,30 @@ function renderLinks() {
     dl.append(el("dt", null, "Status"), el("dd", null, "Waiting for the node…"));
     return;
   }
-  const add = (k, v) => { dl.append(el("dt", null, k), el("dd", null, v)); };
-  if (status.radio === null) add("Radio", "not configured");
-  else add("Radio", (status.radio ? "up" : "down") + (status.radio_via ? " · " + status.radio_via : ""));
+  const add = (id, v) => {
+    const info = bearerInfo(id);
+    const dt = el("dt", "bearer", info.label);
+    if (info.tip) dt.title = info.tip;
+    dl.append(dt, el("dd", null, v));
+  };
+  if (status.radio === null) add("radio", "not configured");
+  else add("radio", (status.radio ? "up" : "down") + (status.radio_via ? " · " + status.radio_via : ""));
   if (status.internet_listen || status.internet_peers.length) {
     const parts = [];
     if (status.internet_listen) parts.push("listening on " + status.internet_listen);
     parts.push(status.internet_peers.length ? "peers: " + status.internet_peers.join(", ") : "no dialled peers linked");
-    add("Internet", parts.join(" · "));
+    add("internet", parts.join(" · "));
   } else {
-    add("Internet", "not configured");
+    add("internet", "not configured");
   }
-  if (status.modem === null) add("Modem", "none");
+  if (status.modem === null) add("modem", "none");
   else {
     const peer = status.modem_peer ? " · linked to " + status.modem_peer : "";
-    add("Modem", (!status.modem ? "down" : "ready") + peer + (status.modem_via ? " · " + status.modem_via : ""));
+    add("modem", (!status.modem ? "down" : "ready") + peer + (status.modem_via ? " · " + status.modem_via : ""));
   }
-  if (status.locator) add("Our grid", status.locator);
+  if (status.locator) {
+    dl.append(el("dt", null, "Our grid"), el("dd", null, status.locator));
+  }
 }
 
 function renderEstimates() {
@@ -1244,7 +1279,7 @@ function renderEstimates() {
   const table = el("table", "data");
   const thead = el("thead");
   const hr = el("tr");
-  for (const h of ["Station", "Bearer", "Success"]) hr.append(el("th", null, h));
+  for (const h of ["Station", "Path", "Success"]) hr.append(el("th", null, h));
   thead.append(hr);
   table.append(thead);
   const tbody = el("tbody");
@@ -1254,7 +1289,7 @@ function renderEstimates() {
     const a = el("a", null, e.station);
     a.href = "#chat/" + encodeURIComponent(e.station);
     call.append(a);
-    tr.append(call, el("td", null, e.bearer), el("td", "num", pct(e.success)));
+    tr.append(call, el("td", null, bearerChip(e.bearer)), el("td", "num", pct(e.success)));
     tbody.append(tr);
   }
   table.append(tbody);
@@ -1633,7 +1668,7 @@ function showSettings(v, force) {
   $("peers").replaceChildren(...v.live.peers.map(peerRow));
   const fixed = v.restart_to_change;
   const rows = [["Internet", fixed.internet_listen ? "listening on " + fixed.internet_listen : "not listening"],
-    ["Modem", fixed.modem || "none"],
+    ["ARQ modem", fixed.modem || "none"],
     ["Web page", fixed.http], ["Store", fixed.store], ["Saved to", v.file || "nowhere: changes last until restart"]];
   if (v.overridden.length) {
     rows.push(["For this run", "set on the command line: " + v.overridden.join(", ") + " (changes to these are saved, and used once the node runs without them)"]);
@@ -1741,15 +1776,16 @@ async function loadStatus() {
     document.title = s.call + " · hm-net";
     $("chip-grid").hidden = !s.locator;
     $("chip-grid").textContent = s.locator || "";
-    if (s.radio === null) chip("chip-radio", "No radio", "");
-    else chip("chip-radio", s.radio ? "Radio up" : "Radio down", s.radio ? "ok" : "bad");
-    $("chip-radio").title = s.radio_via || "";
+    if (s.radio === null) chip("chip-radio", "No packet radio", "");
+    else chip("chip-radio", s.radio ? "Packet radio up" : "Packet radio down", s.radio ? "ok" : "bad");
+    $("chip-radio").title = (s.radio_via ? s.radio_via + " — " : "") + bearerInfo("radio").tip;
     $("chip-net").hidden = !s.internet_listen && s.internet_peers.length === 0;
     chip("chip-net", s.internet_peers.length ? "Internet: " + s.internet_peers.join(", ") : "Internet: no links", s.internet_peers.length ? "ok" : "warn");
+    $("chip-net").title = bearerInfo("internet").tip;
     $("chip-modem").hidden = s.modem === null;
     if (s.modem !== null) {
-      chip("chip-modem", !s.modem ? "Modem down" : s.modem_peer ? "Modem: " + s.modem_peer : "Modem ready", s.modem ? "ok" : "bad");
-      $("chip-modem").title = s.modem_via || "";
+      chip("chip-modem", !s.modem ? "ARQ down" : s.modem_peer ? "ARQ: " + s.modem_peer : "ARQ ready", s.modem ? "ok" : "bad");
+      $("chip-modem").title = (s.modem_via ? s.modem_via + " — " : "") + bearerInfo("modem").tip;
     }
     $("my-line").textContent = s.trust_line;
     renderRailHeard();
