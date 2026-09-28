@@ -377,9 +377,7 @@ fn bayesian_contact_evidence_survives_restart() {
 fn read_only_open_works_while_a_writer_holds_the_store() {
     let db = TempDb::new("read-only-concurrent");
     let writer = Store::open(&db.0).unwrap();
-    writer
-        .enqueue(id(9), b"hello", call("M0BBB"), 0, 10)
-        .unwrap();
+    writer.enqueue(id(9), b"hello", call("M0BBB"), 0, 10).unwrap();
     let reader = Store::open_read_only(&db.0).unwrap();
     let list = reader.list(Direction::Out, 10).unwrap();
     assert_eq!(list.len(), 1);
@@ -396,9 +394,7 @@ fn read_only_open_works_when_no_writer_holds_the_store() {
     let db = TempDb::new("read-only-alone");
     {
         let writer = Store::open(&db.0).unwrap();
-        writer
-            .enqueue(id(9), b"hello", call("M0BBB"), 0, 10)
-            .unwrap();
+        writer.enqueue(id(9), b"hello", call("M0BBB"), 0, 10).unwrap();
     }
     let reader = Store::open_read_only(&db.0).unwrap();
     let list = reader.list(Direction::Out, 10).unwrap();

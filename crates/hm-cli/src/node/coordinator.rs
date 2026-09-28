@@ -88,13 +88,7 @@ pub(crate) async fn coordinator(
                         RouteBearer::Internet => Bearer::Internet,
                         RouteBearer::Modem => Bearer::Modem,
                     };
-                    chooser.restore(
-                        key.to,
-                        bearer,
-                        evidence.successes,
-                        evidence.failures,
-                        evidence.at,
-                    );
+                    chooser.restore(key.to, bearer, evidence.successes, evidence.failures, evidence.at);
                 }
             }
         }

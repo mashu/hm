@@ -567,7 +567,10 @@ fn api_get(c: &Config, path: &str) -> Result<serde_json::Value, String> {
         .ok_or_else(|| "node API: malformed HTTP response".to_string())?;
     // Drop a possible chunked framing first line length if present — prefer finding JSON.
     let json_start = body.find(['{', '[']).ok_or_else(|| {
-        format!("node API: not JSON ({})", body.chars().take(80).collect::<String>())
+        format!(
+            "node API: not JSON ({})",
+            body.chars().take(80).collect::<String>()
+        )
     })?;
     serde_json::from_str(&body[json_start..]).map_err(|e| format!("node API JSON: {e}"))
 }
@@ -580,7 +583,13 @@ fn status(c: &Config) -> Result<(), String> {
     println!(
         "packet radio   {}",
         match v["radio"].as_bool() {
-            Some(true) => format!("up{}", v["radio_via"].as_str().map(|s| format!(" ({s})")).unwrap_or_default()),
+            Some(true) => format!(
+                "up{}",
+                v["radio_via"]
+                    .as_str()
+                    .map(|s| format!(" ({s})"))
+                    .unwrap_or_default()
+            ),
             Some(false) => "down".into(),
             None => "off".into(),
         }
@@ -588,12 +597,7 @@ fn status(c: &Config) -> Result<(), String> {
     let listen = v["internet_listen"].as_str().unwrap_or("-");
     let peers = v["internet_peers"]
         .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "none".into());
     println!("internet       listen {listen}; peers: {peers}");
@@ -620,7 +624,10 @@ fn status(c: &Config) -> Result<(), String> {
                     None => "?",
                 };
                 let success = row["success"].as_f64().unwrap_or(0.0);
-                println!("  {station:9} {bearer:12} {:>3}%", (success * 100.0).round() as i64);
+                println!(
+                    "  {station:9} {bearer:12} {:>3}%",
+                    (success * 100.0).round() as i64
+                );
             }
         }
     }
@@ -723,11 +730,7 @@ fn messages(c: &Config, direction: &str, kind: &str, limit: usize) -> Result<(),
                 text
             }
         };
-        let by = r
-            .by
-            .as_deref()
-            .map(|b| format!("  by={b}"))
-            .unwrap_or_default();
+        let by = r.by.as_deref().map(|b| format!("  by={b}")).unwrap_or_default();
         println!(
             "{} {dir:5} {:?} {} ↔ {}  {:?}{subject}{by}  {}",
             station::utc_clock(r.at),
