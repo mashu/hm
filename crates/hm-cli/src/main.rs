@@ -1026,7 +1026,6 @@ fn node(
         radio_builder: Some(std::sync::Arc::new(hm_cli::node::radio_config)),
         internet,
         modem,
-        relay: c.relay.clone(),
         schedules: c.contacts()?,
         store: store.clone(),
         http: c.http()?,

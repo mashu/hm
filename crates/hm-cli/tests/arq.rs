@@ -41,6 +41,10 @@ struct Station {
 #[derive(Default)]
 struct Air {
     stations: Mutex<Vec<Station>>,
+    /// How long the called station's modem takes to report CONNECTED. The
+    /// caller may send at once, so its first data can reach the called host
+    /// before that line does: command and data are separate streams.
+    callee_delay: Mutex<Duration>,
 }
 
 impl Air {
@@ -136,25 +140,34 @@ fn serve_commands(air: &Arc<Air>, me: usize, c: TcpStream, kind: Kind) {
         air.say(me, on);
         thread::sleep(Duration::from_millis(100));
         air.say(me, off);
-        let found = {
-            let st = air.stations.lock().unwrap();
-            st.iter()
+        // Both ends free, checked and taken in one step: when two stations
+        // call each other at once, exactly one call connects.
+        let connected = {
+            let mut st = air.stations.lock().unwrap();
+            let other = st
+                .iter()
                 .position(|s| s.call == to && s.listening && s.peer.is_none())
+                .filter(|&other| other != me && st[me].peer.is_none());
+            other.map(|other| {
+                st[me].peer = Some(other);
+                st[other].peer = Some(me);
+                (other, st[me].call.clone())
+            })
         };
-        match found {
-            Some(other) if other != me => {
-                let mine = {
-                    let mut st = air.stations.lock().unwrap();
-                    st[me].peer = Some(other);
-                    st[other].peer = Some(me);
-                    st[me].call.clone()
-                };
+        match connected {
+            Some((other, mine)) => {
                 air.say(me, &connected_line(kind, &mine, &to, &to));
+                thread::sleep(*air.callee_delay.lock().unwrap());
                 air.say(other, &connected_line(kind, &mine, &to, &mine));
             }
-            _ => {
+            None => {
                 thread::sleep(Duration::from_millis(500));
-                air.say(me, "DISCONNECTED");
+                // A call that lost to one coming in is dropped quietly, as a
+                // real modem does: this station is connected now, and a
+                // DISCONNECTED would end that connection instead.
+                if air.stations.lock().unwrap()[me].peer.is_none() {
+                    air.say(me, "DISCONNECTED");
+                }
             }
         }
     }
@@ -286,7 +299,6 @@ fn start(
             bandwidth: 2300,
             ptt,
         }),
-        relay: Default::default(),
         schedules: vec![],
         store: db.0.clone(),
         http: "127.0.0.1:0".parse().unwrap(),
@@ -392,6 +404,52 @@ fn exchange_through(kind: Kind, tag: &str) {
     // A keyed the radio when its modem asked, and let go again.
     let k = keyed.0.lock().unwrap().clone();
     assert!(k.contains(&true) && k.last() == Some(&false), "{k:?}");
+    a.stop().unwrap();
+    b.stop().unwrap();
+}
+
+/// The called station's host reads the caller's first bundle before the
+/// modem's CONNECTED line: it keeps the data for the connection instead of
+/// dropping it (which left the caller waiting minutes for its receipt).
+#[test]
+fn data_before_the_connected_line_is_kept() {
+    let air = Arc::new(Air::default());
+    *air.callee_delay.lock().unwrap() = Duration::from_millis(700);
+    let (pa, pb) = (fake_modem(&air, Kind::Vara), fake_modem(&air, Kind::Vara));
+    let alice = KeyFile::generate(call("SA0KAM")).unwrap();
+    let bob = KeyFile::generate(call("SO5KM-1")).unwrap();
+    let dir = std::env::temp_dir();
+    let (da, db) = (
+        Tmp(dir.join(format!("hm-arq-early-a-{}.db", std::process::id()))),
+        Tmp(dir.join(format!("hm-arq-early-b-{}.db", std::process::id()))),
+    );
+    let a = start(&alice, "SA0KAM", &bob, pa, Kind::Vara, &da, None);
+    let b = start(&bob, "SO5KM-1", &alice, pb, Kind::Vara, &db, None);
+    wait_for(Duration::from_secs(10), "the modems up", || {
+        (get(a.http_addr, "/api/status")["modem"] == true && get(b.http_addr, "/api/status")["modem"] == true)
+            .then_some(())
+    });
+    let (st, body) = http(
+        a.http_addr,
+        "POST",
+        "/api/send",
+        Some(&json!({"to": "SO5KM-1", "text": "first data wins"})),
+    );
+    assert_eq!(st, 201, "{body}");
+    let got = wait_for(
+        Duration::from_secs(30),
+        "the bundle at the called station",
+        || {
+            let inbox = get(b.http_addr, "/api/messages?direction=in");
+            inbox
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["text"] == "first data wins")
+                .cloned()
+        },
+    );
+    assert_eq!(got["verified"], true);
     a.stop().unwrap();
     b.stop().unwrap();
 }

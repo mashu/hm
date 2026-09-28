@@ -434,10 +434,10 @@ impl ControlPlane {
                 let mut actions = Vec::new();
                 let bulletin_dest = Callsign::parse("ALL").expect("ALL is a valid callsign");
                 for prefix in want.prefixes {
-                    if !self
+                    if self
                         .offered
                         .get(&(from, prefix))
-                        .is_some_and(|expires| *expires > now)
+                        .is_none_or(|expires| *expires <= now)
                     {
                         continue;
                     }

@@ -1390,10 +1390,10 @@ impl Xfer {
             // Believed only when the peer's own OPEN agrees; otherwise the
             // CLOSE answered a corrupted OFFER, so offer again.
             CloseReason::TooLarge
-                if !self
+                if self
                     .peers
                     .get(&from)
-                    .is_some_and(|(open, _)| o.len > open.max_object) =>
+                    .is_none_or(|(open, _)| o.len <= open.max_object) =>
             {
                 o.offer_next = true;
                 o.open_next = true;

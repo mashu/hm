@@ -124,8 +124,12 @@ pub(crate) fn advertised_flags(has_internet: bool, relay: &crate::config::RelayS
     flags
 }
 
+/// Our signed claim for one of our own scheduled contacts. The flags come from
+/// the relay settings in use (`relay`), so a change made while the node runs is
+/// advertised the next time the schedules are published.
 pub(crate) fn scheduled_advert(
     cfg: &NodeConfig,
+    relay: &crate::config::RelaySettings,
     schedule: ScheduledContact,
     sequence: u32,
 ) -> Result<Option<ContactAdvert>, String> {
@@ -146,7 +150,7 @@ pub(crate) fn scheduled_advert(
         success_permyriad: schedule.success_permyriad.unwrap_or(5_000),
         rate_bps: schedule.rate_bps,
         capacity_bytes,
-        flags: schedule.flags | advertised_flags(cfg.internet.is_some(), &cfg.relay),
+        flags: schedule.flags | advertised_flags(cfg.internet.is_some(), relay),
         signature: [0; 64],
     };
     sign_contact(&cfg.key.identity, advert)

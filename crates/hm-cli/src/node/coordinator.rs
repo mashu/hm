@@ -25,7 +25,8 @@ use super::live::LiveConfig;
 use super::radio::{RadioCmd, RadioEvt};
 use super::rf_policy;
 use super::sync::{
-    apply_sync_actions, broadcast_sync, live_advert, receive_sync, scheduled_advert, send_sync,
+    advertised_flags, apply_sync_actions, broadcast_sync, live_advert, receive_sync, scheduled_advert,
+    send_sync,
 };
 use super::types::{log, route_bearer, short, NodeConfig, Notify, Status};
 use crate::station::unix_now;
@@ -117,6 +118,30 @@ fn retry_policy_for(store: &Store, id: ObjectId, live: &super::live::Live) -> hm
     }
 }
 
+/// Publish signed claims for our own scheduled contacts, numbered from `base`.
+/// Peers keep the claim with the newest sequence number, so republishing with
+/// a higher base replaces what they hold, for example after the relay or
+/// mailbox flags changed.
+fn advertise_schedules(
+    cfg: &NodeConfig,
+    relay: &crate::config::RelaySettings,
+    control: &mut ControlPlane,
+    base: u32,
+    now: u64,
+) {
+    for (index, schedule) in cfg.schedules.iter().copied().enumerate() {
+        match scheduled_advert(cfg, relay, schedule, base.wrapping_add(index as u32)) {
+            Ok(Some(advert)) => {
+                if let Err(error) = control.observe_local(advert, now.saturating_mul(1_000)) {
+                    log(format!("ignored local CONTACT advert: {error}"));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => log(format!("ignored local CONTACT advert: {error}")),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn coordinator(
     cfg: &NodeConfig,
@@ -149,17 +174,11 @@ pub(crate) async fn coordinator(
     }
     let startup = unix_now();
     let mut control = ControlPlane::default();
-    for (index, schedule) in cfg.schedules.iter().copied().enumerate() {
-        match scheduled_advert(cfg, schedule, (startup as u32).wrapping_add(index as u32)) {
-            Ok(Some(advert)) => {
-                if let Err(error) = control.observe_local(advert, startup.saturating_mul(1_000)) {
-                    log(format!("ignored local CONTACT advert: {error}"));
-                }
-            }
-            Ok(None) => {}
-            Err(error) => log(format!("ignored local CONTACT advert: {error}")),
-        }
-    }
+    // The flags our adverts carry, from the relay settings in use; when they
+    // change while running, the schedules are advertised again.
+    let mut advertised = advertised_flags(cfg.internet.is_some(), &live.get().relay);
+    let mut schedule_base = startup as u32;
+    advertise_schedules(cfg, &live.get().relay, &mut control, schedule_base, startup);
     match store.contact_evidence() {
         Ok(saved) => {
             for (key, evidence) in saved {
@@ -688,6 +707,17 @@ pub(crate) async fn coordinator(
                     if let Some(n) = net.as_ref() {
                         n.set_trust(&snapshot.trust.iter().collect::<Vec<_>>());
                         n.set_dial(snapshot.peers.clone());
+                    }
+                    let flags = advertised_flags(cfg.internet.is_some(), &snapshot.relay);
+                    if flags != advertised {
+                        advertised = flags;
+                        let now = unix_now();
+                        // Above every sequence number used so far, even within one second.
+                        schedule_base = (now as u32)
+                            .max(schedule_base.wrapping_add(cfg.schedules.len().max(1) as u32));
+                        advertise_schedules(cfg, &snapshot.relay, &mut control, schedule_base, now);
+                        // Live contacts are claimed again at once, with the new flags.
+                        advertised_live.clear();
                     }
                 }
                 let now = unix_now();
