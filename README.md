@@ -1,12 +1,80 @@
 # hm-net
 
-A federated store-and-forward network for amateur radio mail, chat, forms and
-bulletins over VHF/UHF and HF. Written in Rust; no central server; content in
-clear, identities signed.
+**hm-net** is an experimental research protocol and station software for
+delay-tolerant amateur-radio messaging: mail, chat, forms and group bulletins
+over VHF/UHF and HF, with optional authenticated Internet and ARQ-modem paths.
+It is written in Rust, runs without a central authority, keeps content in the
+clear, and authenticates every identity with Ed25519 signatures.
 
-`hm` is a working prefix until the project has a name.
+The project treats the radio channel as a scarce, half-duplex, lossy medium
+rather than as a transparent pipe. Custody, contact modelling and airtime
+discipline are first-class; flooding and anonymous relays are not. The wire
+format and the crates are still evolving (wire version 0) so that policy,
+routing and bearer behaviour can be changed without rewriting the station
+around a monolith.
 
-## Status: Phase 0 complete; Phase 1 hardware validation open; Phase 2 relay software implemented
+`hm` is a working command-line prefix until the project has a settled name.
+
+## Why this design
+
+Amateur packet networks often inherit TCP/IP assumptions—always-on links,
+end-to-end round trips, and best-effort flooding—that fit poorly on shared RF.
+hm-net instead combines store-and-forward custody with a **probabilistic
+contact graph** and **bearer selection under uncertainty**, so a station can
+decide *whether*, *when* and *over which medium* to spend airtime.
+
+| Strength | What it means in practice |
+| --- | --- |
+| **Signed custody, not blind relay** | Each hop moves durable custody only after a verified next-hop receipt; the origin marks **Delivered** only on a destination-signed end-to-end receipt. |
+| **Bayesian contacts** | Link success is a decaying Beta posterior from schedules, beacons, live links and handoff outcomes—not a single SNR snapshot. |
+| **Thompson-sampled bearers** | Radio, Internet and ARQ modems compete by discounted cost ÷ sampled success rate, so a failing radio yields to Internet and is retried as evidence fades. |
+| **Fountain-coded RF transfers** | RaptorQ symbol bursts with adaptive sizing absorb loss without stop-and-wait ACKs on every fragment. |
+| **Airtime as a budget** | Relays and control traffic (Trickle contacts, holdings SYNC) are capped; urgent traffic may use at most one extra edge-disjoint copy. |
+| **Federated trust** | Station keys authenticate Internet (QUIC/TLS 1.3) and verify bundles; optional public core hubs accept dial-ins without a directory of every home station. |
+| **Research-shaped codebase** | Protocol layers live in small, dependency-ordered crates (`hm-wire` → `hm-bundle` → `hm-xfer` / `hm-route` → `hm-cli`), so policies can be swapped or simulated in isolation. |
+
+## Bayesian pieces
+
+Two places use Bayesian reasoning explicitly:
+
+1. **Contact graph (`hm-route`)** — each directed edge
+   `(origin, peer, bearer, UTC hour)` keeps Beta evidence `(α, β)`. Successful
+   custody increments `α`, failures increment `β`, and evidence decays with
+   time. Route scoring uses a **conservative posterior quantile** (not a mean
+   and not a random draw), so plans prefer contacts that are both likely and
+   well-supported. Feasible routes must meet deadline, residual capacity,
+   airtime and hop limits; the node keeps a short failover list and activates
+   one custodian at a time for routine traffic.
+
+2. **Bearer choice (`hm-cli` chooser)** — for a neighbour that can be reached
+   on more than one medium, each `(station, bearer)` arm is a Beta belief
+   (optimistic prior). The node draws a success rate from each available arm
+   and picks the lowest expected cost `cost / rate` (**discounted Thompson
+   sampling**). Failures push traffic toward Internet or modem; as they fade,
+   radio is tried again.
+
+Payload routing itself stays deterministic given the graph; randomness is
+confined to bearer exploration so simulation and replay remain reproducible
+when the RNG seed is fixed.
+
+## Protocol layers
+
+| Layer | Responsibility | Crate(s) | Design note |
+| --- | --- | --- | --- |
+| **Identity & trust** | Callsigns, Ed25519 keys, signed envelopes, local trust lists | `hm-ident`, `hm-cli` config | Trust is explicit and local; keys are never learned from beacons. |
+| **Application objects** | Chat / mail / bulletin / receipt bundles, compression | `hm-bundle` | Content-addressed, sealed objects; cleartext by design for amateur service. |
+| **Custody & persistence** | Inbox, outbox, relay holdings, retries | `hm-store` | Crash-safe `redb` store; exactly-once semantics across restarts. |
+| **Contact & routing** | Bayesian graph, CGR-style plans, failover, urgent dual-path | `hm-route` | Policy lives here: change scoring or admission without touching RF framing. |
+| **Transfer** | Sessions, OFFER, RaptorQ bursts, ACKs, transfer receipts | `hm-xfer` | Sans-IO engine driven by `hm-core::Machine`; same logic on radio and in sim. |
+| **Wire framing** | 18-byte headers, ACK/OFFER/OPEN/CLOSE, beacons, SYNC | `hm-wire` | Compact, versioned; independent Python vectors in CI. |
+| **Bearers** | KISS/AX.25, built-in AFSK, QUIC Internet, ARQ modem hosts | `hm-bearer`, `hm-modem-afsk`, `hm-net`, `hm-rig`, modem glue in `hm-cli` | Bearers are interchangeable ports into the transfer engine. |
+| **Station orchestration** | Daemon, setup, web UI/API, live settings | `hm-cli` | Thin coordination over the libraries above—not a second protocol stack. |
+| **Validation** | Discrete-event RF/Internet simulation, baseline routing compare | `hm-sim` | Deterministic experiments before on-air trials. |
+
+Wire details and test vectors: [`SPEC.md`](SPEC.md). Bulletin channels:
+[`docs/bulletin-channels.md`](docs/bulletin-channels.md).
+
+## Crates at a glance
 
 | Crate | What it does |
 | --- | --- |
@@ -19,10 +87,12 @@ clear, identities signed.
 | `hm-bearer` | KISS framing (streaming decoder) and AX.25 UI encapsulation for Direwolf and hardware TNCs |
 | `hm-xfer` | Fountain-coded (RaptorQ) transfer engine: OFFER + symbol bursts, ACKs with the missing count, hash-verified delivery, signed delivery receipts, duplicate suppression, per-sender resource limits, sessions (OPEN with feature bits and limits, CLOSE for busy, refused or too large), loss-adaptive burst sizing, random exponential backoff, airtime budget |
 | `hm-store` | Persistent store on `redb` (pure Rust, crash-safe): content-addressed messages, inbox, outbox and relay holdings, custody records, cancellations, retries with exponential backoff, exactly-once across restarts |
-| `hm-net` | Internet links: QUIC with mutual TLS 1.3 on Ed25519 station keys (only trusted stations connect), automatic redial, one stream per bundle with a signed receipt |
+| `hm-net` | Internet links: QUIC with TLS 1.3 on Ed25519 station keys (mutual trust by default; optional `open_hub` for public cores), automatic redial, one stream per bundle with a signed receipt |
 | `hm-modem-afsk` | Our own AFSK 1200 modem (Bell 202), pure Rust and `no_std`: HDLC framing and CRC, multi-slicer demodulator with per-tone AGC and PLL clock recovery, carrier detect |
 | `hm-rig` | Radio hardware: sound cards through `cpal` (ALSA, CoreAudio, WASAPI); PTT by rigctld (Hamlib CAT), serial RTS/DTR, CM108 GPIO (AIOC, Digirig) or VOX; a virtual radio channel for tests |
 | `hm-cli` | The `hm` command: interactive first-run `setup`; `node` (the station daemon: packet radio, ARQ modems (VARA, Mercury, ARDOP) and/or Internet links, relay/mailbox, web interface, JSON API with access token, settings applied live); `keygen`, `whoami`, `trust`, `send` and `listen`; KISS links over TCP or a serial port, and a real-time driver |
+
+## Status: Phase 0 complete; Phase 1 hardware validation open; Phase 2 relay software implemented
 
 Phase 1's remaining gate is the on-air test ([plan](docs/on-air-test-plan.md)). The
 first-run setup wizard and the built-in modem's deterministic deep-noise target are
@@ -224,8 +294,10 @@ For a quick try the same works from the command line: `hm node --peer
 SO5KM=hm.example.org:4433`, or `hm node --no-radio --listen 0.0.0.0:4433`.
 
 Internet links are QUIC connections authenticated with the station keys themselves:
-only trusted stations can connect, and each link is bound to a callsign.
-There is no certificate authority and no central server; any node can listen, dial, or both.
+by default only mutually trusted stations connect, and each link is bound to a
+callsign. A listener may set `internet.open_hub = true` to accept any dialer that
+presents a valid station certificate (homes must still trust the hub). There is no
+certificate authority and no central server; any node can listen, dial, or both.
 
 For direct neighbours, recent delivery evidence still determines whether radio or
 internet is tried first. For a farther destination, the node builds a Bayesian contact
