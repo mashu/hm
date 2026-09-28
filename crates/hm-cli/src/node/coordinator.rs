@@ -82,6 +82,20 @@ pub(crate) async fn coordinator(
         Ok(saved) => {
             for (key, evidence) in saved {
                 graph.restore_evidence(key, evidence);
+                if key.from == cfg.me {
+                    let bearer = match key.bearer {
+                        RouteBearer::Radio => Bearer::Radio,
+                        RouteBearer::Internet => Bearer::Internet,
+                        RouteBearer::Modem => Bearer::Modem,
+                    };
+                    chooser.restore(
+                        key.to,
+                        bearer,
+                        evidence.successes,
+                        evidence.failures,
+                        evidence.at,
+                    );
+                }
             }
         }
         Err(error) => log(format!("could not restore contact evidence: {error}")),

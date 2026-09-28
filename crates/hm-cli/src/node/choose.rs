@@ -162,6 +162,21 @@ impl Chooser {
         self.arms.insert((peer, b), arm);
     }
 
+    /// Merge persisted Beta evidence (for example after restart). Older evidence
+    /// is faded to `at` before it is added.
+    pub fn restore(&mut self, peer: Callsign, b: Bearer, successes: f64, failures: f64, at: u64) {
+        if successes <= 0.0 && failures <= 0.0 {
+            return;
+        }
+        let (s, f) = self.faded(peer, b, at);
+        let arm = Arm {
+            successes: s + successes.max(0.0),
+            failures: f + failures.max(0.0),
+            at,
+        };
+        self.arms.insert((peer, b), arm);
+    }
+
     /// Posterior mean success rate, for display.
     pub fn estimate(&self, peer: Callsign, b: Bearer, now: u64) -> f64 {
         let (s, f) = self.faded(peer, b, now);
@@ -271,5 +286,14 @@ mod tests {
             c.record(peer, Bearer::Internet, true, t);
         }
         assert!(share(&mut c, peer, 30, Bearer::Internet) > 0.97);
+    }
+
+    #[test]
+    fn restored_evidence_survives_in_estimates() {
+        let peer = Callsign::parse("SO5KM").unwrap();
+        let mut c = Chooser::new(Costs::default(), 3600, DetRng::from_seed(9));
+        c.restore(peer, Bearer::Internet, 8.0, 0.0, 100);
+        assert!((c.estimate(peer, Bearer::Internet, 100) - 10.0 / 11.0).abs() < 1e-9);
+        assert_eq!(c.peers(), vec![peer]);
     }
 }

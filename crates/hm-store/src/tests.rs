@@ -374,6 +374,39 @@ fn bayesian_contact_evidence_survives_restart() {
 }
 
 #[test]
+fn read_only_open_works_while_a_writer_holds_the_store() {
+    let db = TempDb::new("read-only-concurrent");
+    let writer = Store::open(&db.0).unwrap();
+    writer
+        .enqueue(id(9), b"hello", call("M0BBB"), 0, 10)
+        .unwrap();
+    let reader = Store::open_read_only(&db.0).unwrap();
+    let list = reader.list(Direction::Out, 10).unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(reader.object(id(9)).unwrap().unwrap(), b"hello");
+    assert!(matches!(
+        reader.enqueue(id(8), b"nope", call("M0CCC"), 0, 11),
+        Err(Error::ReadOnly)
+    ));
+    drop(writer);
+}
+
+#[test]
+fn read_only_open_works_when_no_writer_holds_the_store() {
+    let db = TempDb::new("read-only-alone");
+    {
+        let writer = Store::open(&db.0).unwrap();
+        writer
+            .enqueue(id(9), b"hello", call("M0BBB"), 0, 10)
+            .unwrap();
+    }
+    let reader = Store::open_read_only(&db.0).unwrap();
+    let list = reader.list(Direction::Out, 10).unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(reader.object(id(9)).unwrap().unwrap(), b"hello");
+}
+
+#[test]
 fn final_delivery_and_e2e_receipt_queue_are_atomic_and_idempotent() {
     let db = TempDb::new("receive-reply");
     let store = Store::open(&db.0).unwrap();

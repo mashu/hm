@@ -103,8 +103,8 @@ enum Cmd {
         /// in, out, relay, or all [default: in].
         #[arg(long, default_value = "in")]
         direction: String,
-        /// chat, mail, bulletin, or all [default: all].
-        #[arg(long, default_value = "all")]
+        /// chat, mail, bulletin, receipt, or all [default: human = chat+mail+bulletin].
+        #[arg(long, default_value = "human")]
         kind: String,
         /// Max rows [default: 20].
         #[arg(long, default_value_t = 20)]
@@ -637,7 +637,7 @@ fn status(c: &Config) -> Result<(), String> {
     Ok(())
 }
 
-/// List stored messages without needing the web UI (reads the store on disk).
+/// List stored messages. Opens the store read-only so it works beside `hm node`.
 fn messages(c: &Config, direction: &str, kind: &str, limit: usize) -> Result<(), String> {
     use hm_bundle::{Kind, Opened};
     use hm_store::{Direction, Store};
@@ -649,15 +649,25 @@ fn messages(c: &Config, direction: &str, kind: &str, limit: usize) -> Result<(),
         "all" => &[Direction::In, Direction::Out, Direction::Relay],
         other => return Err(format!("direction must be in, out, relay or all, not {other:?}")),
     };
-    let want_kind = match kind {
+    let want_kind: Option<Vec<Kind>> = match kind {
+        "human" => Some(vec![Kind::Chat, Kind::Mail, Kind::Bulletin]),
         "all" => None,
-        "chat" => Some(Kind::Chat),
-        "mail" => Some(Kind::Mail),
-        "bulletin" => Some(Kind::Bulletin),
-        other => return Err(format!("kind must be chat, mail, bulletin or all, not {other:?}")),
+        "chat" => Some(vec![Kind::Chat]),
+        "mail" => Some(vec![Kind::Mail]),
+        "bulletin" => Some(vec![Kind::Bulletin]),
+        "receipt" => Some(vec![Kind::Receipt]),
+        other => {
+            return Err(format!(
+                "kind must be human, chat, mail, bulletin, receipt or all, not {other:?}"
+            ))
+        }
     };
 
-    let store = Store::open(&c.station.store).map_err(|e| e.to_string())?;
+    let store = Store::open_read_only(&c.station.store).or_else(|e| {
+        Store::open(&c.station.store).map_err(|open_err| {
+            format!("could not open store read-only ({e}); also failed write open: {open_err}")
+        })
+    })?;
     let mut rows = Vec::new();
     for d in dirs {
         for r in store.list(*d, 500).map_err(|e| e.to_string())? {
@@ -674,7 +684,10 @@ fn messages(c: &Config, direction: &str, kind: &str, limit: usize) -> Result<(),
             Ok(o) => o,
             Err(_) => continue,
         };
-        if want_kind.is_some_and(|k| opened.bundle.kind != k) {
+        if want_kind
+            .as_ref()
+            .is_some_and(|kinds| !kinds.contains(&opened.bundle.kind))
+        {
             continue;
         }
         let dir = match r.direction {
@@ -688,27 +701,41 @@ fn messages(c: &Config, direction: &str, kind: &str, limit: usize) -> Result<(),
             .as_deref()
             .map(|s| format!(" [{s}]"))
             .unwrap_or_default();
-        let text = opened
-            .bundle
-            .body
-            .as_ref()
-            .and_then(|b| b.as_text().ok())
-            .map(|t| t.into_owned())
-            .unwrap_or_else(|| "<no text>".into());
-        let text = if text.len() > 120 {
-            format!("{}…", &text[..117])
+        let detail = if opened.bundle.kind == Kind::Receipt {
+            match opened.bundle.reply_to {
+                Some(id) => {
+                    let s = id.to_string();
+                    format!("ACK {}", &s[..s.len().min(12)])
+                }
+                None => "ACK (no id)".into(),
+            }
         } else {
-            text
+            let text = opened
+                .bundle
+                .body
+                .as_ref()
+                .and_then(|b| b.as_text().ok())
+                .map(|t| t.into_owned())
+                .unwrap_or_else(|| "<no text>".into());
+            if text.len() > 120 {
+                format!("{}…", &text[..117])
+            } else {
+                text
+            }
         };
-        let by = r.by.as_deref().unwrap_or("-");
+        let by = r
+            .by
+            .as_deref()
+            .map(|b| format!("  by={b}"))
+            .unwrap_or_default();
         println!(
-            "{} {dir:5} {:?} {} ↔ {}  {:?}{subject}  by={by}  {}",
+            "{} {dir:5} {:?} {} ↔ {}  {:?}{subject}{by}  {}",
             station::utc_clock(r.at),
             opened.bundle.kind,
             opened.bundle.from,
             r.peer,
             r.state,
-            text
+            detail
         );
         shown += 1;
         if shown >= limit {

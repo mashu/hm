@@ -31,6 +31,8 @@ pub enum Error {
     /// A stored record could not be decoded (corrupt or from a newer version).
     Corrupt(String),
     NotFound,
+    /// This handle was opened with [`Store::open_read_only`].
+    ReadOnly,
 }
 
 impl std::fmt::Display for Error {
@@ -39,6 +41,7 @@ impl std::fmt::Display for Error {
             Error::Db(e) => write!(f, "store: {e}"),
             Error::Corrupt(m) => write!(f, "store: corrupt record: {m}"),
             Error::NotFound => f.write_str("store: no such message"),
+            Error::ReadOnly => f.write_str("store: opened read-only"),
         }
     }
 }
@@ -279,8 +282,13 @@ pub enum DeleteOutcome {
     Active,
 }
 
+enum Backend {
+    ReadWrite(Database),
+    ReadOnly(redb::ReadOnlyDatabase),
+}
+
 pub struct Store {
-    db: Database,
+    db: Backend,
 }
 
 fn encode(r: &Record) -> Vec<u8> {
@@ -374,9 +382,17 @@ fn decode_evidence_value(bytes: &[u8]) -> Result<Evidence> {
 }
 
 impl Store {
+    /// Builder shared by the node (writer) and CLI readers so they can share one file.
+    fn builder() -> redb::Builder {
+        let mut builder = redb::Builder::new();
+        // One writer (`hm node`) plus read-only CLI tools (`hm messages`, …).
+        builder.set_concurrency_mode(redb::ConcurrencyMode::SingleWriter);
+        builder
+    }
+
     /// Open the store at `path`, creating it if needed.
     pub fn open(path: impl AsRef<Path>) -> Result<Store> {
-        let db = Database::create(path)?;
+        let db = Self::builder().create(path)?;
         let tx = db.begin_write()?;
         {
             tx.open_table(OBJECTS)?;
@@ -387,7 +403,32 @@ impl Store {
             tx.open_table(CONTACT_EVIDENCE)?;
         }
         tx.commit()?;
-        Ok(Store { db })
+        Ok(Store {
+            db: Backend::ReadWrite(db),
+        })
+    }
+
+    /// Open an existing store for reads while another process holds the write lock
+    /// (for example `hm messages` beside a running `hm node`).
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Store> {
+        let db = Self::builder().open_read_only(path)?;
+        Ok(Store {
+            db: Backend::ReadOnly(db),
+        })
+    }
+
+    fn read_tx(&self) -> Result<redb::ReadTransaction> {
+        match &self.db {
+            Backend::ReadWrite(db) => Ok(db.begin_read()?),
+            Backend::ReadOnly(db) => Ok(db.begin_read()?),
+        }
+    }
+
+    fn write_tx(&self) -> Result<redb::WriteTransaction> {
+        match &self.db {
+            Backend::ReadWrite(db) => Ok(db.begin_write()?),
+            Backend::ReadOnly(_) => Err(Error::ReadOnly),
+        }
     }
 
     fn next_seq(meta: &mut redb::Table<&str, u64>) -> Result<u64> {
@@ -406,7 +447,7 @@ impl Store {
         verified: bool,
         now: u64,
     ) -> Result<bool> {
-        let tx = self.db.begin_write()?;
+        let tx = self.write_tx()?;
         {
             let mut messages = tx.open_table(MESSAGES)?;
             if messages.get(id.0)?.is_some() {
@@ -456,7 +497,7 @@ impl Store {
         if received.id == reply.id {
             return Err(Error::Corrupt("reply id equals received id".into()));
         }
-        let tx = self.db.begin_write()?;
+        let tx = self.write_tx()?;
         let inserted;
         {
             let mut messages = tx.open_table(MESSAGES)?;
@@ -540,7 +581,7 @@ impl Store {
         precedence: u8,
         now: u64,
     ) -> Result<bool> {
-        let tx = self.db.begin_write()?;
+        let tx = self.write_tx()?;
         {
             let mut messages = tx.open_table(MESSAGES)?;
             if messages.get(id.0)?.is_some() {
@@ -602,7 +643,7 @@ impl Store {
         {
             return Err(Error::Corrupt("invalid relay metadata".into()));
         }
-        let tx = self.db.begin_write()?;
+        let tx = self.write_tx()?;
         {
             let mut messages = tx.open_table(MESSAGES)?;
             if messages.get(id.0)?.is_some() {
@@ -646,7 +687,7 @@ impl Store {
 
     /// Queued outbound messages whose next attempt is due, in delivery order.
     pub fn due(&self, now: u64) -> Result<Vec<Record>> {
-        let tx = self.db.begin_read()?;
+        let tx = self.read_tx()?;
         let queue = tx.open_table(QUEUE)?;
         let messages = tx.open_table(MESSAGES)?;
         let mut out = Vec::new();
@@ -665,7 +706,7 @@ impl Store {
     }
 
     fn update<T>(&self, id: ObjectId, f: impl FnOnce(&mut Record) -> T) -> Result<T> {
-        let tx = self.db.begin_write()?;
+        let tx = self.write_tx()?;
         let result;
         {
             let mut messages = tx.open_table(MESSAGES)?;
@@ -857,7 +898,7 @@ impl Store {
     /// Cancelling is deliberately a separate first step: a late click cannot
     /// erase the operator's only indication that a queued message was stopped.
     pub fn delete(&self, id: ObjectId) -> Result<DeleteOutcome> {
-        let tx = self.db.begin_write()?;
+        let tx = self.write_tx()?;
         let record;
         let outcome;
         {
@@ -930,20 +971,22 @@ impl Store {
     }
 
     pub fn record(&self, id: ObjectId) -> Result<Option<Record>> {
-        let tx = self.db.begin_read()?;
+        let tx = self.read_tx()?;
         let messages = tx.open_table(MESSAGES)?;
-        messages.get(id.0)?.map(|b| decode(b.value())).transpose()
+        let decoded = messages.get(id.0)?.map(|b| decode(b.value())).transpose()?;
+        Ok(decoded)
     }
 
     pub fn object(&self, id: ObjectId) -> Result<Option<Vec<u8>>> {
-        let tx = self.db.begin_read()?;
+        let tx = self.read_tx()?;
         let objects = tx.open_table(OBJECTS)?;
-        Ok(objects.get(id.0)?.map(|b| b.value().to_vec()))
+        let bytes = objects.get(id.0)?.map(|b| b.value().to_vec());
+        Ok(bytes)
     }
 
     /// Every content id retained locally, for pairwise holdings filters.
     pub fn object_ids(&self) -> Result<Vec<ObjectId>> {
-        let tx = self.db.begin_read()?;
+        let tx = self.read_tx()?;
         let objects = tx.open_table(OBJECTS)?;
         objects
             .iter()?
@@ -953,7 +996,7 @@ impl Store {
 
     /// Active ids to advertise to `peer` during pairwise holdings sync.
     pub fn holding_ids(&self, peer: Callsign, relayable: bool, now: u64) -> Result<Vec<ObjectId>> {
-        let tx = self.db.begin_read()?;
+        let tx = self.read_tx()?;
         let messages = tx.open_table(MESSAGES)?;
         // Outbox peer for RF/group bulletins (`hm_xfer::broadcast_peer`).
         let bulletin_dest = Callsign::parse("ALL").expect("ALL is a valid callsign");
@@ -994,7 +1037,7 @@ impl Store {
 
     /// Current relay-custody pressure; local outbox items are not admission load.
     pub fn relay_usage(&self, now: u64) -> Result<HoldingUsage> {
-        let tx = self.db.begin_read()?;
+        let tx = self.read_tx()?;
         let messages = tx.open_table(MESSAGES)?;
         let objects = tx.open_table(OBJECTS)?;
         let mut usage = HoldingUsage { count: 0, bytes: 0 };
@@ -1018,7 +1061,7 @@ impl Store {
 
     /// Resolve an abbreviated WANT id only when it is unambiguous locally.
     pub fn object_with_prefix(&self, prefix: [u8; 8]) -> Result<Option<(ObjectId, Vec<u8>)>> {
-        let tx = self.db.begin_read()?;
+        let tx = self.read_tx()?;
         let objects = tx.open_table(OBJECTS)?;
         let mut found = None;
         for entry in objects.iter()? {
@@ -1044,7 +1087,7 @@ impl Store {
         {
             return Err(Error::Corrupt("invalid contact evidence".into()));
         }
-        let tx = self.db.begin_write()?;
+        let tx = self.write_tx()?;
         {
             tx.open_table(CONTACT_EVIDENCE)?
                 .insert(evidence_key(key), evidence_value(evidence).as_slice())?;
@@ -1054,7 +1097,7 @@ impl Store {
     }
 
     pub fn contact_evidence(&self) -> Result<Vec<(EdgeKey, Evidence)>> {
-        let tx = self.db.begin_read()?;
+        let tx = self.read_tx()?;
         let table = tx.open_table(CONTACT_EVIDENCE)?;
         let mut out = Vec::new();
         for entry in table.iter()? {
@@ -1070,7 +1113,7 @@ impl Store {
     /// The newest `limit` messages in one direction, newest first.
     pub fn list(&self, direction: Direction, limit: usize) -> Result<Vec<Record>> {
         let d = direction as u8;
-        let tx = self.db.begin_read()?;
+        let tx = self.read_tx()?;
         let by_time = tx.open_table(BY_TIME)?;
         let messages = tx.open_table(MESSAGES)?;
         let mut out = Vec::new();

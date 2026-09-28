@@ -10,4 +10,4 @@ license.workspace = true
 hm-wire = { path = "../hm-wire" }
 hm-route = { path = "../hm-route" }
 minicbor = { workspace = true, features = ["std"] }
-redb = "4"
+redb = { version = "4", features = ["experimental-multiprocess"] }
