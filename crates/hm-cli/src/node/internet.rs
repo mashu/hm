@@ -2,7 +2,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use hm_ident::Identity;
 use hm_net::{Net, NetConfig};
@@ -31,14 +31,15 @@ pub(crate) fn start_net(
         notify.clone(),
         cfg.relay.clone(),
     );
-    let net_slot: Arc<Mutex<Option<Arc<Net>>>> = Arc::new(Mutex::new(None));
+    // Weak so the accept gate does not keep Net (and the store) alive after stop.
+    let net_slot: Arc<Mutex<Weak<Net>>> = Arc::new(Mutex::new(Weak::new()));
     let gate_net = Arc::clone(&net_slot);
     let gate: hm_net::Accept = Arc::new(move |via, obj| {
         let current = gate_live.get();
         let peer_key = gate_net
             .lock()
             .expect("lock")
-            .as_ref()
+            .upgrade()
             .and_then(|n| n.public_key_of(via));
         accept(
             AcceptanceGate {
@@ -72,7 +73,7 @@ pub(crate) fn start_net(
         gate,
         control,
     )?;
-    *net_slot.lock().expect("lock") = Some(Arc::clone(&net));
+    *net_slot.lock().expect("lock") = Arc::downgrade(&net);
     Ok(net)
 }
 

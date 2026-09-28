@@ -3,8 +3,10 @@
 **hm-net** is an experimental research protocol and station software for
 delay-tolerant amateur-radio messaging: mail, chat, forms and group bulletins
 over VHF/UHF and HF, with optional authenticated Internet and ARQ-modem paths.
-It is written in Rust, runs without a central authority, keeps content in the
-clear, and authenticates every identity with Ed25519 signatures.
+It is a **federated** network of peer stations—each operator runs their own
+node and chooses whom to trust—not a client/server service or a central
+mailbox. Written in Rust, it keeps content in the clear and authenticates
+every identity with Ed25519 signatures.
 
 The project treats the radio channel as a scarce, half-duplex, lossy medium
 rather than as a transparent pipe. Custody, contact modelling and airtime
