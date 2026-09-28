@@ -596,6 +596,7 @@ fn node(
     let listen = c.listen()?;
     let internet = (listen.is_some() || !live.peers.is_empty()).then(|| hm_cli::node::InternetConfig {
         listen: listen.unwrap_or_else(|| "0.0.0.0:0".parse().expect("valid")),
+        open_hub: c.internet.open_hub,
     });
     let radio = hm_cli::node::radio_config(&c.radio)?;
     let modem = modem_config(c)?;

@@ -1,10 +1,10 @@
 //! Internet bearer: QUIC between stations.
 //!
 //! Each station authenticates with its own Ed25519 station key, carried in a
-//! self-signed certificate. Both sides verify the other's key against their
-//! trusted stations (mutual TLS 1.3, Ed25519 only), so only known stations connect,
-//! and every connection is bound to a callsign. There is no certificate
-//! authority and no central server.
+//! self-signed certificate that also names its callsign. Dialers always verify
+//! the listener against their trust list. Listeners do the same by default, or
+//! with [`NetConfig::open`] accept any dialer that presents a valid station
+//! certificate (a public core hub). There is no certificate authority.
 //!
 //! One endpoint both listens and dials; configured peers are redialled when
 //! their connection drops. In TLS 1.3 the dialer finishes its handshake before
@@ -112,10 +112,12 @@ pub struct NetConfig {
     /// Stations allowed to connect, and whose receipts we check.
     pub trust: Vec<(Callsign, PublicKey)>,
     pub listen: SocketAddr,
-    /// Stations to keep a connection to.
     /// Stations to keep a link to, as `host:port`; looked up again at every
     /// dial, so a changed address is followed. See also [`Net::set_dial`].
     pub dial: Vec<(Callsign, String)>,
+    /// When true, accept inbound links from any station with a valid certificate
+    /// (core hub). Outbound dials still require a trust entry for the peer.
+    pub open: bool,
 }
 
 const ED25519_SPKI_PREFIX: [u8; 12] = [
@@ -135,21 +137,51 @@ pub fn ed25519_key_in_cert(der: &[u8]) -> Option<[u8; 32]> {
     der.get(at + 12..at + 44)?.try_into().ok()
 }
 
-/// A self-signed certificate carrying the station key.
+/// A self-signed certificate carrying the station key and callsign (CN + SAN).
 pub fn station_certificate(
     secret: [u8; 32],
+    call: Callsign,
 ) -> io::Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
     let mut pkcs8 = ED25519_PKCS8_PREFIX.to_vec();
     pkcs8.extend_from_slice(&secret);
     let der = PrivatePkcs8KeyDer::from(pkcs8.clone());
     let kp =
         rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&der, &rcgen::PKCS_ED25519).map_err(io::Error::other)?;
-    let params = rcgen::CertificateParams::new(vec!["hm-net".to_string()]).map_err(io::Error::other)?;
+    let name = call.to_string();
+    let mut params = rcgen::CertificateParams::new(vec![name.clone()]).map_err(io::Error::other)?;
+    params.distinguished_name.push(rcgen::DnType::CommonName, &name);
     let cert = params.self_signed(&kp).map_err(io::Error::other)?;
     Ok((
         cert.der().clone(),
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8)),
     ))
+}
+
+/// Callsign from the certificate CN (written by [`station_certificate`]).
+pub fn callsign_in_cert(der: &[u8]) -> Option<Callsign> {
+    const CN_OID: &[u8] = &[0x06, 0x03, 0x55, 0x04, 0x03];
+    let mut i = 0;
+    while i + CN_OID.len() < der.len() {
+        let Some(rel) = der[i..].windows(CN_OID.len()).position(|window| window == CN_OID) else {
+            break;
+        };
+        let at = i + rel + CN_OID.len();
+        let tag = *der.get(at)?;
+        // UTF8String / PrintableString / IA5String
+        if matches!(tag, 0x0c | 0x13 | 0x16) {
+            let len = usize::from(*der.get(at + 1)?);
+            if len < 128 {
+                let bytes = der.get(at + 2..at + 2 + len)?;
+                if let Ok(text) = std::str::from_utf8(bytes) {
+                    if let Ok(call) = Callsign::parse(text) {
+                        return Some(call);
+                    }
+                }
+            }
+        }
+        i = at;
+    }
+    None
 }
 
 /// Trusted stations: callsign -> key, and key -> callsign to name peers.
@@ -175,15 +207,18 @@ impl TrustTable {
     }
 }
 
-/// Accepts exactly the station keys trusted, as they are right now.
+/// Verifies peer certificates. Dialed servers must be trusted; inbound clients
+/// must be trusted unless [`NetConfig::open`] is set.
 #[derive(Debug)]
 struct TrustVerifier {
     trust: Arc<RwLock<TrustTable>>,
     provider: Arc<CryptoProvider>,
+    /// Accept any inbound client with a valid station certificate.
+    open: bool,
 }
 
 impl TrustVerifier {
-    fn check(&self, cert: &CertificateDer<'_>) -> Result<(), rustls::Error> {
+    fn check_trusted(&self, cert: &CertificateDer<'_>) -> Result<(), rustls::Error> {
         let key = ed25519_key_in_cert(cert)
             .ok_or_else(|| rustls::Error::General("not an Ed25519 station key".into()))?;
         if self.trust.read().expect("lock").names.contains_key(&key) {
@@ -191,6 +226,20 @@ impl TrustVerifier {
         } else {
             Err(rustls::Error::General("station key not trusted".into()))
         }
+    }
+
+    fn check_client(&self, cert: &CertificateDer<'_>) -> Result<(), rustls::Error> {
+        let key = ed25519_key_in_cert(cert)
+            .ok_or_else(|| rustls::Error::General("not an Ed25519 station key".into()))?;
+        if self.trust.read().expect("lock").names.contains_key(&key) {
+            return Ok(());
+        }
+        if self.open {
+            callsign_in_cert(cert)
+                .ok_or_else(|| rustls::Error::General("station certificate has no callsign".into()))?;
+            return Ok(());
+        }
+        Err(rustls::Error::General("station key not trusted".into()))
     }
 
     fn tls13(
@@ -217,7 +266,8 @@ impl ServerCertVerifier for TrustVerifier {
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        self.check(end_entity).map(|_| ServerCertVerified::assertion())
+        self.check_trusted(end_entity)
+            .map(|_| ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -254,7 +304,8 @@ impl ClientCertVerifier for TrustVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-        self.check(end_entity).map(|_| ClientCertVerified::assertion())
+        self.check_client(end_entity)
+            .map(|_| ClientCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -294,9 +345,13 @@ pub struct Net {
     identity: Identity,
     /// Trusted stations, shared with the TLS verifier; see [`Net::set_trust`].
     trust: Arc<RwLock<TrustTable>>,
+    /// Keys learned from open-hub inbound links (for receipt checks).
+    session_keys: Mutex<BTreeMap<Callsign, PublicKey>>,
     conns: Mutex<BTreeMap<Callsign, Connection>>,
     /// Stations to keep a link to.
     dial: Mutex<Vec<(Callsign, String)>>,
+    /// Accept any inbound station certificate.
+    open: bool,
     accept: Accept,
     control: Control,
 }
@@ -315,8 +370,9 @@ impl Net {
         let verifier = Arc::new(TrustVerifier {
             trust: trust.clone(),
             provider: provider.clone(),
+            open: cfg.open,
         });
-        let (cert, key) = station_certificate(cfg.secret)?;
+        let (cert, key) = station_certificate(cfg.secret, cfg.me)?;
         let tls13 = &[&rustls::version::TLS13];
 
         let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())
@@ -351,8 +407,10 @@ impl Net {
             me: cfg.me.base(),
             identity: Identity::from_secret(cfg.secret),
             trust,
+            session_keys: Mutex::new(BTreeMap::new()),
             conns: Mutex::new(BTreeMap::new()),
             dial: Mutex::new(Vec::new()),
+            open: cfg.open,
             accept,
             control,
         });
@@ -389,15 +447,20 @@ impl Net {
             .collect()
     }
 
+    /// Public key bound to a live peer (trust list or an open-hub session).
+    pub fn public_key_of(&self, peer: Callsign) -> Option<PublicKey> {
+        self.trust
+            .read()
+            .expect("lock")
+            .key_for(peer)
+            .or_else(|| self.session_keys.lock().expect("lock").get(&peer).copied())
+            .or_else(|| self.session_keys.lock().expect("lock").get(&peer.base()).copied())
+    }
+
     /// Send `object` to `to` and wait for its verified receipt.
     pub async fn deliver(&self, to: Callsign, object: &[u8]) -> Result<(), NetError> {
         let conn = self.conn_for(to).ok_or(NetError::NotConnected)?;
-        let key = self
-            .trust
-            .read()
-            .expect("lock")
-            .key_for(to)
-            .ok_or(NetError::NotConnected)?;
+        let key = self.public_key_of(to).ok_or(NetError::NotConnected)?;
         let exchange = async {
             let (mut send, mut recv) = conn.open_bi().await.map_err(|e| NetError::Io(e.to_string()))?;
             let mut msg = Vec::with_capacity(8 + object.len());
@@ -487,8 +550,15 @@ impl Net {
             .peer_identity()?
             .downcast::<Vec<CertificateDer<'static>>>()
             .ok()?;
-        let key = ed25519_key_in_cert(certs.first()?)?;
-        self.trust.read().expect("lock").names.get(&key).copied()
+        let cert = certs.first()?;
+        let key = ed25519_key_in_cert(cert)?;
+        if let Some(call) = self.trust.read().expect("lock").names.get(&key).copied() {
+            return Some(call);
+        }
+        if self.open {
+            return callsign_in_cert(cert);
+        }
+        None
     }
 
     /// Replace the stations to keep a link to. Links to stations dropped from
@@ -499,9 +569,13 @@ impl Net {
 
     /// Replace the trusted stations. New connections are checked against the
     /// new list at once; a link whose key is no longer trusted, or now belongs
-    /// to another callsign, is closed (and redialled if configured).
+    /// to another callsign, is closed (and redialled if configured). Open hubs
+    /// keep inbound links; only the trust list used for dialling changes.
     pub fn set_trust(&self, trust: &[(Callsign, PublicKey)]) {
         *self.trust.write().expect("lock") = TrustTable::new(trust);
+        if self.open {
+            return;
+        }
         let mut conns = self.conns.lock().expect("lock");
         conns.retain(|name, conn| {
             let still = self.peer_of(conn) == Some(*name);
@@ -513,10 +587,23 @@ impl Net {
     }
 
     fn register(self: &Arc<Self>, conn: Connection) {
+        let certs = conn
+            .peer_identity()
+            .and_then(|id| id.downcast::<Vec<CertificateDer<'static>>>().ok());
+        let key = certs
+            .as_ref()
+            .and_then(|c| c.first())
+            .and_then(|c| ed25519_key_in_cert(c));
         let Some(peer) = self.peer_of(&conn) else {
             conn.close(1u32.into(), b"unknown station");
             return;
         };
+        if let Some(key) = key {
+            self.session_keys
+                .lock()
+                .expect("lock")
+                .insert(peer, PublicKey(key));
+        }
         self.conns.lock().expect("lock").insert(peer, conn.clone());
         tokio::spawn(serve_connection(self.clone(), peer, conn));
     }

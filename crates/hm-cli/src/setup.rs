@@ -364,7 +364,8 @@ fn run_with_io<R: BufRead, W: Write>(
             config.radio.beacon_minutes = 0;
             config.relay.enabled = true;
             config.relay.mailbox = true;
-            "hub: radio off; relay and mailbox on".to_string()
+            config.internet.open_hub = true;
+            "hub: radio off; relay and mailbox on; accept any dialer".to_string()
         }
     };
 
@@ -482,9 +483,9 @@ fn run_with_io<R: BufRead, W: Write>(
             "  [[internet.peers]]\n  station = {:?}\n  address = \"YOUR.SERVER.HOST:4433\"",
             call.to_string()
         ))?;
-        wizard.say(format!(
-            "On this core node: trust each home station (`hm{config_flag} trust add` their whoami line)."
-        ))?;
+        wizard.say(
+            "This hub accepts any dialer (`open_hub`); home stations only need to trust and peer this node.",
+        )?;
         wizard.say(format!("Then run `hm{config_flag} node` here."))?;
     } else {
         wizard.say(format!(
@@ -607,6 +608,7 @@ mod tests {
         assert_eq!(config.internet.listen.as_deref(), Some("0.0.0.0:4433"));
         assert!(config.relay.enabled);
         assert!(config.relay.mailbox);
+        assert!(config.internet.open_hub);
         assert_eq!(config.internet.peers, vec![config::public_hub::peer()]);
         assert_eq!(config.trust, vec![config::public_hub::trust()]);
         assert!(

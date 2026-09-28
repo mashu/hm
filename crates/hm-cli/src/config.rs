@@ -225,6 +225,9 @@ pub struct InternetSettings {
     pub listen: Option<String>,
     /// Stations to keep a link to.
     pub peers: Vec<PeerEntry>,
+    /// Accept inbound internet links from any station with a valid certificate
+    /// (public core hub). Dialling out still requires a trust entry.
+    pub open_hub: bool,
 }
 
 impl Default for InternetSettings {
@@ -232,6 +235,7 @@ impl Default for InternetSettings {
         InternetSettings {
             listen: None,
             peers: vec![public_hub::peer()],
+            open_hub: false,
         }
     }
 }

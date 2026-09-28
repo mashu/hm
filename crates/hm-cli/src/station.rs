@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hm_bundle::{Address, Bundle, BundleError, Kind, Opened, Precedence, SignedBundle};
 use hm_core::{DetRng, Millis};
-use hm_ident::Identity;
+use hm_ident::{Identity, PublicKey};
 use hm_wire::{Callsign, ObjectId};
 use hm_xfer::{object_id, Command, Config, Event, Failure, Receipt, Xfer};
 
@@ -168,7 +168,7 @@ impl Station<'_> {
             timeout,
             stop,
             |_now, event| match event {
-                Event::Received { from, object, .. } => on_message(open_message(from, &object, trust)),
+                Event::Received { from, object, .. } => on_message(open_message(from, &object, trust, None)),
                 Event::Delivered { .. } | Event::Failed { .. } => Flow::Continue,
             },
         )?;
@@ -222,7 +222,9 @@ pub fn build_bulletin(
 }
 
 /// Decode `object` and check its signature against `trust`. `via` is who sent the frame.
-pub fn open_message(via: Callsign, object: &[u8], trust: &Trust) -> Message {
+/// When the sender is not in `trust`, `peer_key` (from an open-hub TLS session) may
+/// still verify messages that claim to be from `via`.
+pub fn open_message(via: Callsign, object: &[u8], trust: &Trust, peer_key: Option<&PublicKey>) -> Message {
     let opened = match Opened::decode(object) {
         Ok(opened) => opened,
         Err(e) => {
@@ -235,11 +237,18 @@ pub fn open_message(via: Callsign, object: &[u8], trust: &Trust) -> Message {
             };
         }
     };
-    let verification = match trust.key_for(opened.bundle.from) {
-        None => Verification::Unverified,
+    let from = opened.bundle.from;
+    let verification = match trust.key_for(from) {
         Some(key) => match opened.clone().verify(&key) {
             Ok(_) => Verification::Verified,
             Err(_) => Verification::BadSignature,
+        },
+        None => match peer_key {
+            Some(key) if from == via || from.base() == via.base() => match opened.clone().verify(key) {
+                Ok(_) => Verification::Verified,
+                Err(_) => Verification::BadSignature,
+            },
+            _ => Verification::Unverified,
         },
     };
     Message {
@@ -333,21 +342,25 @@ mod tests {
         assert_eq!(mail.bundle().kind, Kind::Mail);
 
         let wire = chat.to_vec();
-        let unknown = open_message(call("SA0KAM"), &wire, &Trust::default());
+        let unknown = open_message(call("SA0KAM"), &wire, &Trust::default(), None);
         assert_eq!(unknown.verification, Verification::Unverified);
         assert_eq!(unknown.text().as_deref(), Some("73"));
 
         let mut trust = Trust::default();
         trust.insert(alice.call, alice.identity.public());
-        let good = open_message(call("SA0KAM"), &wire, &trust);
+        let good = open_message(call("SA0KAM"), &wire, &trust, None);
         assert_eq!(good.verification, Verification::Verified);
         assert_eq!(good.id, chat.id());
 
         trust.insert(alice.call, bob.identity.public());
-        let bad = open_message(call("SA0KAM"), &wire, &trust);
+        let bad = open_message(call("SA0KAM"), &wire, &trust, None);
         assert_eq!(bad.verification, Verification::BadSignature);
 
-        let junk = open_message(call("SA0KAM"), b"not a bundle", &trust);
+        let peer = alice.identity.public();
+        let tofu = open_message(call("SA0KAM"), &wire, &Trust::default(), Some(&peer));
+        assert_eq!(tofu.verification, Verification::Verified);
+
+        let junk = open_message(call("SA0KAM"), b"not a bundle", &trust, None);
         assert!(junk.bundle.is_none());
         assert!(junk.error.is_some());
     }

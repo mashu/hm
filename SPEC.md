@@ -357,10 +357,14 @@ with TLS 1.3, ALPN `hm-net/1`, and mutual authentication by station key:
 
 - Each station presents a self-signed X.509 certificate whose subject public key
   is its Ed25519 station key. Only Ed25519 handshake signatures are used.
-- Each side accepts the other only if that key is one it trusts, and names the
+- Each station's certificate carries its callsign (CN/SAN) and Ed25519 station key.
+- A dialer accepts the listener only if that key is one it trusts, and names the
   peer by the callsign bound to the key (with its SSID, if the trust entry has one;
-  two stations sharing one callsign can link at once if each has its own key). Certificate names, issuers and validity
-  periods carry no meaning.
+  two stations sharing one callsign can link at once if each has its own key).
+- A listener does the same by default. With `internet.open_hub`, it accepts any
+  dialer that presents a valid station certificate and names the peer from the
+  certificate callsign (a public core hub). Issuers and validity periods carry
+  no meaning.
 - The dialer's TLS 1.3 handshake completes before the listener has checked the
   dialer's certificate. Once the listener has accepted the dialer, it opens a
   unidirectional stream and sends `"HMOK"`. The dialer counts the link as up

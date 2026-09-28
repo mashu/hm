@@ -66,8 +66,8 @@ scripted provisioning, `hm keygen --call SA0KAM-1` remains available.
 
 New stations trust and dial the public core hub **SA0KAM-0** at `34.51.161.47:4433` by
 default. Remove or replace that `[[trust]]` / `[[internet.peers]]` entry if you do not
-want it. The hub must still trust each home station (`hm trust add` on the server)
-before the link comes up.
+want it. A core hub sets `internet.open_hub = true` so home stations can dial in without
+being pre-listed in the hub's trust file (homes still must trust the hub).
 
 ### station.toml
 
@@ -311,6 +311,7 @@ beacon_minutes = 0
 
 [internet]
 listen = "0.0.0.0:4433"
+open_hub = true                 # any station may dial in; homes still trust this hub
 
 # Optional: a node this server dials. Accepted connections are bidirectional,
 # so a public listener does not need a peer entry for every client.

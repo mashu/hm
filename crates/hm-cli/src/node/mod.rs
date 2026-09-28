@@ -144,6 +144,8 @@ pub fn radio_config(r: &RadioSettings) -> Result<Option<RadioConfig>, String> {
 /// settings ([`Live::peers`]).
 pub struct InternetConfig {
     pub listen: SocketAddr,
+    /// Accept any inbound station certificate (core hub).
+    pub open_hub: bool,
 }
 
 pub struct NodeConfig {
@@ -383,7 +385,12 @@ fn inbound_bulletin_flood(store: &Store, origin: Callsign, now: u64) -> bool {
 }
 
 /// The one gate for final delivery and relay custody.
-fn accept(gate: AcceptanceGate<'_>, via: Callsign, object: &[u8]) -> Acceptance {
+fn accept(
+    gate: AcceptanceGate<'_>,
+    via: Callsign,
+    object: &[u8],
+    peer_key: Option<&hm_ident::PublicKey>,
+) -> Acceptance {
     let AcceptanceGate {
         store,
         notify,
@@ -401,7 +408,7 @@ fn accept(gate: AcceptanceGate<'_>, via: Callsign, object: &[u8]) -> Acceptance 
         Some(route) => (route.bundle, route.hop_count, route.visited.as_slice()),
         None => (object, 0, &[][..]),
     };
-    let m = open_message(via, inner, trust);
+    let m = open_message(via, inner, trust, peer_key);
     let Some(bundle) = &m.bundle else {
         return Acceptance::Rejected(format!("not a bundle: {}", m.error.unwrap_or_default()));
     };
@@ -698,6 +705,7 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                             },
                             via,
                             &obj,
+                            None,
                         )
                         .verdict()
                     });
@@ -958,8 +966,15 @@ fn start_net(
         notify.clone(),
         cfg.relay.clone(),
     );
+    let net_slot: Arc<Mutex<Option<Arc<Net>>>> = Arc::new(Mutex::new(None));
+    let gate_net = Arc::clone(&net_slot);
     let gate: hm_net::Accept = Arc::new(move |via, obj| {
         let current = gate_live.get();
+        let peer_key = gate_net
+            .lock()
+            .expect("lock")
+            .as_ref()
+            .and_then(|n| n.public_key_of(via));
         accept(
             AcceptanceGate {
                 store: &store,
@@ -972,6 +987,7 @@ fn start_net(
             },
             via,
             &obj,
+            peer_key.as_ref(),
         )
         .verdict()
     });
@@ -979,17 +995,20 @@ fn start_net(
         let _ = net_control_tx.send((from, payload));
     });
     let current = live.get();
-    Net::start_with_control(
+    let net = Net::start_with_control(
         NetConfig {
             me: cfg.me,
             secret: cfg.key.identity.secret(),
             trust: current.trust.iter().collect(),
             listen,
             dial: current.peers,
+            open: cfg.internet.as_ref().is_some_and(|i| i.open_hub),
         },
         gate,
         control,
-    )
+    )?;
+    *net_slot.lock().expect("lock") = Some(Arc::clone(&net));
+    Ok(net)
 }
 
 /// Open the internet stack when dial peers appear after a radio-only start.
@@ -1228,6 +1247,7 @@ async fn coordinator(
                         },
                         from,
                         &object,
+                        None,
                     );
                     let retry_after = if matches!(&acceptance, Acceptance::Busy(_)) {
                         60
@@ -2458,6 +2478,7 @@ mod tests {
             },
             sender.call,
             &bundle,
+            None,
         );
         assert!(matches!(
             rejected,
@@ -2478,6 +2499,7 @@ mod tests {
             },
             sender.call,
             &bundle,
+            None,
         );
         assert!(matches!(accepted, Acceptance::Stored));
         assert_eq!(store.list(Direction::Relay, 10).unwrap().len(), 1);
@@ -2510,6 +2532,7 @@ mod tests {
             },
             sender.call,
             &bundle,
+            None,
         );
         assert!(matches!(accepted, Acceptance::Stored));
         assert_eq!(store.list(Direction::In, 10).unwrap().len(), 1);
@@ -2544,6 +2567,7 @@ mod tests {
             },
             sender.call,
             &bundle,
+            None,
         );
         assert!(matches!(accepted, Acceptance::Stored));
         assert_eq!(store.list(Direction::In, 10).unwrap().len(), 1);

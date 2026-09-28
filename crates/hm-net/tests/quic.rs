@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use hm_ident::Identity;
 use hm_net::{
-    ed25519_key_in_cert, station_certificate, Accept, Control, Net, NetConfig, NetError, Verdict, MAX_CONTROL,
+    callsign_in_cert, ed25519_key_in_cert, station_certificate, Accept, Control, Net, NetConfig, NetError,
+    Verdict, MAX_CONTROL,
 };
 use hm_wire::Callsign;
 
@@ -35,6 +36,16 @@ fn recorder(verdict: Verdict) -> (Accept, Log) {
 }
 
 fn cfg(me: &str, s: u8, trust: &[(&str, u8)], dial: Vec<(Callsign, SocketAddr)>) -> NetConfig {
+    cfg_open(me, s, trust, dial, false)
+}
+
+fn cfg_open(
+    me: &str,
+    s: u8,
+    trust: &[(&str, u8)],
+    dial: Vec<(Callsign, SocketAddr)>,
+    open: bool,
+) -> NetConfig {
     NetConfig {
         me: call(me),
         secret: secret(s),
@@ -44,6 +55,7 @@ fn cfg(me: &str, s: u8, trust: &[(&str, u8)], dial: Vec<(Callsign, SocketAddr)>)
             .collect(),
         listen: any_port(),
         dial: dial.into_iter().map(|(c, a)| (c, a.to_string())).collect(),
+        open,
     }
 }
 
@@ -58,12 +70,35 @@ async fn wait_connected(net: &Net, peer: &str) -> bool {
 }
 
 #[test]
-fn certificate_carries_the_station_key() {
-    let (cert, _) = station_certificate(secret(7)).unwrap();
+fn certificate_carries_the_station_key_and_callsign() {
+    let (cert, _) = station_certificate(secret(7), call("SA0KAM-2")).unwrap();
     assert_eq!(
         ed25519_key_in_cert(&cert).unwrap(),
         Identity::from_secret(secret(7)).public().0
     );
+    assert_eq!(callsign_in_cert(&cert), Some(call("SA0KAM-2")));
+}
+
+/// A core hub with `open` accepts dialers it has never trusted.
+#[tokio::test]
+async fn open_hub_accepts_untrusted_dialers() {
+    let (hub_accept, hub_log) = recorder(Verdict::Stored);
+    let hub = Net::start(cfg_open("SO5KM", 2, &[], vec![], true), hub_accept).unwrap();
+    let addr = hub.local_addr().unwrap();
+    let (a_accept, _) = recorder(Verdict::Stored);
+    let a = Net::start(
+        cfg("SA0KAM", 1, &[("SO5KM", 2)], vec![(call("SO5KM"), addr)]),
+        a_accept,
+    )
+    .unwrap();
+    assert!(wait_connected(&a, "SO5KM").await, "home dials the open hub");
+    assert!(
+        hub.is_connected(call("SA0KAM")),
+        "hub names the dialer from its cert"
+    );
+    a.deliver(call("SO5KM"), b"via open hub").await.unwrap();
+    assert_eq!(hub_log.lock().unwrap().len(), 1);
+    assert_eq!(hub_log.lock().unwrap()[0].0, call("SA0KAM"));
 }
 
 #[tokio::test]
