@@ -30,7 +30,7 @@ use hm_store::{Direction, Record, State as MessageState, Store};
 use hm_wire::{Callsign, Locator, ObjectId};
 use serde::{Deserialize, Serialize};
 
-use super::live::{Change, LiveConfig};
+use super::live::{Change, LiveConfig, RestartChange};
 use super::{NodeConfig, Notify, Status};
 use crate::config::RadioSettings;
 use crate::files::Trust;
@@ -819,6 +819,7 @@ struct RadioView {
     bitrate: Option<u32>,
     txdelay_ms: Option<u64>,
     guard_ms: Option<u64>,
+    max_rounds: Option<u32>,
 }
 
 impl RadioView {
@@ -835,6 +836,7 @@ impl RadioView {
             bitrate: Some(r.bitrate),
             txdelay_ms: Some(r.txdelay_ms),
             guard_ms: Some(r.guard_ms),
+            max_rounds: Some(r.max_rounds),
         }
     }
 
@@ -857,12 +859,92 @@ impl RadioView {
             slottime_ms,
             bitrate,
             txdelay_ms,
-            guard_ms
+            guard_ms,
+            max_rounds
         );
         if let Some(a) = audio {
             r.audio = a;
         }
         r
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RelayView {
+    enabled: Option<bool>,
+    mailbox: Option<bool>,
+    max_holdings: Option<usize>,
+    max_bytes: Option<u64>,
+    max_hops: Option<u8>,
+    airtime_budget_secs: Option<u64>,
+    urgent_min_gain: Option<f64>,
+    control_airtime_fraction: Option<f64>,
+}
+
+impl RelayView {
+    fn of(r: &crate::config::RelaySettings) -> RelayView {
+        RelayView {
+            enabled: Some(r.enabled),
+            mailbox: Some(r.mailbox),
+            max_holdings: Some(r.max_holdings),
+            max_bytes: Some(r.max_bytes),
+            max_hops: Some(r.max_hops),
+            airtime_budget_secs: Some(r.airtime_budget_secs),
+            urgent_min_gain: Some(r.urgent_min_gain),
+            control_airtime_fraction: Some(r.control_airtime_fraction),
+        }
+    }
+
+    fn apply(self, r: &crate::config::RelaySettings) -> crate::config::RelaySettings {
+        let mut r = r.clone();
+        macro_rules! take {
+            ($($f:ident),*) => { $(if let Some(v) = self.$f { r.$f = v; })* };
+        }
+        take!(
+            enabled,
+            mailbox,
+            max_holdings,
+            max_bytes,
+            max_hops,
+            airtime_budget_secs,
+            urgent_min_gain,
+            control_airtime_fraction
+        );
+        r
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ModemView {
+    enabled: Option<bool>,
+    kind: Option<String>,
+    host: Option<String>,
+    port: Option<u16>,
+    bandwidth: Option<u32>,
+    ptt: Option<String>,
+}
+
+impl ModemView {
+    fn of(m: &crate::config::ModemSettings) -> ModemView {
+        ModemView {
+            enabled: Some(m.enabled),
+            kind: Some(m.kind.clone()),
+            host: Some(m.host.clone()),
+            port: Some(m.port),
+            bandwidth: Some(m.bandwidth),
+            ptt: Some(m.ptt.clone()),
+        }
+    }
+
+    fn apply(self, m: &crate::config::ModemSettings) -> crate::config::ModemSettings {
+        let mut m = m.clone();
+        macro_rules! take {
+            ($($f:ident),*) => { $(if let Some(v) = self.$f { m.$f = v; })* };
+        }
+        take!(enabled, kind, host, port, bandwidth, ptt);
+        m
     }
 }
 
@@ -877,20 +959,28 @@ struct LiveView {
     retry_first_secs: Option<u64>,
     retry_max_secs: Option<u64>,
     retry_attempts: Option<u32>,
+    custody_grace_secs: Option<u64>,
+    custody_suspect_secs: Option<u64>,
+    receipt_retry_attempts: Option<u32>,
+    evidence_half_life_secs: Option<u64>,
+    relay: Option<RelayView>,
     peers: Option<Vec<PeerView>>,
     /// A grid locator; "" removes it.
     locator: Option<String>,
     radio: Option<RadioView>,
+    /// Restart-bound settings: saved to the file, take effect on the next start.
+    restart_to_change: Option<FixedView>,
 }
 
 /// Settings read at start-up; changing them in the file takes a restart.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FixedView {
     internet_listen: Option<String>,
-    /// The ARQ modem, `[modem]`.
-    modem: Option<String>,
-    http: String,
-    store: String,
+    open_hub: Option<bool>,
+    modem: Option<ModemView>,
+    http: Option<String>,
+    store: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -906,6 +996,48 @@ struct SettingsView {
     restart_to_change: FixedView,
 }
 
+fn fixed_view(s: &AppState) -> FixedView {
+    match s.live.file_config() {
+        Some(Ok(c)) => FixedView {
+            internet_listen: Some(c.internet.listen.clone().unwrap_or_default()),
+            open_hub: Some(c.internet.open_hub),
+            modem: Some(ModemView::of(&c.modem)),
+            http: Some(c.station.http.clone()),
+            store: Some(c.station.store.display().to_string()),
+        },
+        _ => {
+            let modem = match &s.cfg.modem {
+                Some(m) => ModemView::of(&crate::config::ModemSettings {
+                    enabled: true,
+                    kind: match m.kind {
+                        super::arq::Kind::Vara => "vara".into(),
+                        super::arq::Kind::Ardop => "ardop".into(),
+                    },
+                    host: m.host.clone(),
+                    port: m.port,
+                    bandwidth: m.bandwidth,
+                    ..crate::config::ModemSettings::default()
+                }),
+                None => ModemView::of(&crate::config::ModemSettings::default()),
+            };
+            FixedView {
+                internet_listen: Some(
+                    s.status
+                        .lock()
+                        .expect("lock")
+                        .internet_listen
+                        .map(|a| a.to_string())
+                        .unwrap_or_default(),
+                ),
+                open_hub: Some(s.cfg.internet.as_ref().is_some_and(|i| i.open_hub)),
+                modem: Some(modem),
+                http: Some(s.cfg.http.to_string()),
+                store: Some(s.cfg.store.display().to_string()),
+            }
+        }
+    }
+}
+
 fn settings_view(s: &AppState) -> SettingsView {
     let l = s.live.get();
     SettingsView {
@@ -918,6 +1050,11 @@ fn settings_view(s: &AppState) -> SettingsView {
             retry_first_secs: Some(l.retry.first_delay_secs),
             retry_max_secs: Some(l.retry.max_delay_secs),
             retry_attempts: Some(l.retry.max_attempts),
+            custody_grace_secs: Some(l.custody_grace_secs),
+            custody_suspect_secs: Some(l.custody_suspect_secs),
+            receipt_retry_attempts: Some(l.receipt_retry.max_attempts),
+            evidence_half_life_secs: Some(l.evidence_half_life_secs),
+            relay: Some(RelayView::of(&l.relay)),
             peers: Some(
                 l.peers
                     .iter()
@@ -929,20 +1066,11 @@ fn settings_view(s: &AppState) -> SettingsView {
             ),
             locator: Some(l.locator.map(|g| g.to_string()).unwrap_or_default()),
             radio: Some(RadioView::of(&l.radio)),
+            restart_to_change: None,
         },
         radio_applies_now: s.cfg.radio_builder.is_some(),
         overridden: s.cfg.overridden.clone(),
-        restart_to_change: FixedView {
-            internet_listen: s
-                .status
-                .lock()
-                .expect("lock")
-                .internet_listen
-                .map(|a| a.to_string()),
-            modem: s.cfg.modem.as_ref().map(|m| m.describe()),
-            http: s.cfg.http.to_string(),
-            store: s.cfg.store.display().to_string(),
-        },
+        restart_to_change: fixed_view(s),
     }
 }
 
@@ -978,23 +1106,71 @@ async fn change_settings(
         )),
     };
     let radio = req.radio.map(|r| r.apply(&s.live.get().radio));
-    s.live
-        .change(Change {
-            radio,
-            locator,
-            beacon_minutes: req.beacon_minutes,
-            radio_cost: req.radio_cost,
-            internet_cost: req.internet_cost,
-            modem_cost: req.modem_cost,
-            retry_first_secs: req.retry_first_secs,
-            retry_max_secs: req.retry_max_secs,
-            retry_attempts: req.retry_attempts,
-            peers,
-        })
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::InvalidInput => bad(e.to_string()),
-            _ => internal(e),
-        })?;
-    super::log("settings changed (through the API)");
+    let relay = req.relay.map(|r| r.apply(&s.live.get().relay));
+    let has_live = radio.is_some()
+        || locator.is_some()
+        || peers.is_some()
+        || relay.is_some()
+        || req.beacon_minutes.is_some()
+        || req.radio_cost.is_some()
+        || req.internet_cost.is_some()
+        || req.modem_cost.is_some()
+        || req.retry_first_secs.is_some()
+        || req.retry_max_secs.is_some()
+        || req.retry_attempts.is_some()
+        || req.custody_grace_secs.is_some()
+        || req.custody_suspect_secs.is_some()
+        || req.receipt_retry_attempts.is_some()
+        || req.evidence_half_life_secs.is_some();
+    if has_live {
+        s.live
+            .change(Change {
+                radio,
+                locator,
+                beacon_minutes: req.beacon_minutes,
+                radio_cost: req.radio_cost,
+                internet_cost: req.internet_cost,
+                modem_cost: req.modem_cost,
+                retry_first_secs: req.retry_first_secs,
+                retry_max_secs: req.retry_max_secs,
+                retry_attempts: req.retry_attempts,
+                custody_grace_secs: req.custody_grace_secs,
+                custody_suspect_secs: req.custody_suspect_secs,
+                receipt_retry_attempts: req.receipt_retry_attempts,
+                evidence_half_life_secs: req.evidence_half_life_secs,
+                relay,
+                peers,
+            })
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::InvalidInput => bad(e.to_string()),
+                _ => internal(e),
+            })?;
+    }
+    let mut restarted = false;
+    if let Some(restart) = req.restart_to_change {
+        let base_modem = s
+            .live
+            .file_config()
+            .and_then(|r| r.ok())
+            .map(|c| c.modem)
+            .unwrap_or_default();
+        let modem = restart.modem.map(|m| m.apply(&base_modem));
+        s.live
+            .save_restart(RestartChange {
+                internet_listen: restart.internet_listen,
+                open_hub: restart.open_hub,
+                modem,
+                http: restart.http,
+                store: restart.store,
+            })
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::InvalidInput => bad(e.to_string()),
+                _ => internal(e),
+            })?;
+        restarted = true;
+    }
+    if has_live || restarted {
+        super::log("settings changed (through the API)");
+    }
     Ok(Json(settings_view(&s)))
 }

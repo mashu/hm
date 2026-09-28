@@ -80,7 +80,7 @@ pub(crate) fn receive_sync(
         (cfg.me, cfg.key.identity.public()),
         store,
         graph,
-        cfg.relay.enabled || cfg.relay.mailbox,
+        live.get().relay.enabled || live.get().relay.mailbox,
         unix_now(),
     ) {
         Ok(actions) => actions,
@@ -113,12 +113,12 @@ pub(crate) fn apply_sync_actions(
     }
 }
 
-pub(crate) fn advertised_flags(cfg: &NodeConfig) -> u8 {
-    let mut flags = if cfg.internet.is_some() { FLAG_INTERNET } else { 0 };
-    if cfg.relay.enabled {
+pub(crate) fn advertised_flags(has_internet: bool, relay: &crate::config::RelaySettings) -> u8 {
+    let mut flags = if has_internet { FLAG_INTERNET } else { 0 };
+    if relay.enabled {
         flags |= FLAG_RELAY;
     }
-    if cfg.relay.mailbox {
+    if relay.mailbox {
         flags |= FLAG_MAILBOX;
     }
     flags
@@ -146,7 +146,7 @@ pub(crate) fn scheduled_advert(
         success_permyriad: schedule.success_permyriad.unwrap_or(5_000),
         rate_bps: schedule.rate_bps,
         capacity_bytes,
-        flags: schedule.flags | advertised_flags(cfg),
+        flags: schedule.flags | advertised_flags(cfg.internet.is_some(), &cfg.relay),
         signature: [0; 64],
     };
     sign_contact(&cfg.key.identity, advert)
@@ -156,6 +156,7 @@ pub(crate) fn scheduled_advert(
 
 pub(crate) fn live_advert(
     cfg: &NodeConfig,
+    relay: &crate::config::RelaySettings,
     peer: Callsign,
     bearer: RouteBearer,
     rate_bps: u32,
@@ -181,7 +182,7 @@ pub(crate) fn live_advert(
             },
             rate_bps,
             capacity_bytes,
-            flags: advertised_flags(cfg),
+            flags: advertised_flags(cfg.internet.is_some(), relay),
             signature: [0; 64],
         },
     )

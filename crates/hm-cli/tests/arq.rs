@@ -262,6 +262,8 @@ fn start(
             },
             custody_grace_secs: 6 * 3600,
             custody_suspect_secs: 24 * 3600,
+            evidence_half_life_secs: 3600,
+            relay: Default::default(),
             beacon_secs: 0,
             peers: vec![],
             locator: None,

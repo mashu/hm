@@ -140,7 +140,11 @@ pub(crate) async fn coordinator(
     let seed = cfg
         .seed
         .unwrap_or_else(|| getrandom::u64().unwrap_or_else(|_| unix_now()));
-    let mut chooser = Chooser::new(live.get().costs, 3600, DetRng::from_seed(seed));
+    let mut chooser = Chooser::new(
+        live.get().costs,
+        live.get().evidence_half_life_secs,
+        DetRng::from_seed(seed),
+    );
     let mut graph = ContactGraph::new(GraphConfig::default()).expect("default contact graph");
     for schedule in &cfg.schedules {
         if let Err(error) = graph.add_schedule(*schedule) {
@@ -357,7 +361,7 @@ pub(crate) async fn coordinator(
                             me: cfg.me,
                             key_call: cfg.key.call,
                             identity: &cfg.key.identity,
-                            relay: &cfg.relay,
+                            relay: &current.relay,
                         },
                         from,
                         &object,
@@ -411,6 +415,7 @@ pub(crate) async fn coordinator(
                         if now.saturating_sub(advertised_at) >= 10 * 60 {
                             match live_advert(
                                 cfg,
+                                &live.get().relay,
                                 station.call,
                                 RouteBearer::Radio,
                                 rate,
@@ -446,7 +451,7 @@ pub(crate) async fn coordinator(
                             match control.filters(
                                 station.call,
                                 store,
-                                cfg.relay.enabled || cfg.relay.mailbox,
+                                live.get().relay.enabled || live.get().relay.mailbox,
                                 now,
                             ) {
                                 Ok(filters) => {
@@ -687,6 +692,7 @@ pub(crate) async fn coordinator(
                     notify.send("settings");
                     let snapshot = live.get();
                     chooser.set_costs(snapshot.costs);
+                    chooser.set_half_life(snapshot.evidence_half_life_secs);
                     ensure_internet(
                         cfg,
                         store,
@@ -724,6 +730,7 @@ pub(crate) async fn coordinator(
                     if now.saturating_sub(advertised_at) >= 10 * 60 {
                         match live_advert(
                             cfg,
+                            &live.get().relay,
                             *peer,
                             RouteBearer::Internet,
                             10_000_000,
@@ -765,7 +772,7 @@ pub(crate) async fn coordinator(
                         match control.filters(
                             *peer,
                             store,
-                            cfg.relay.enabled || cfg.relay.mailbox,
+                            live.get().relay.enabled || live.get().relay.mailbox,
                             now,
                         ) {
                             Ok(filters) => {
@@ -789,7 +796,7 @@ pub(crate) async fn coordinator(
                         match control.filters(
                             *peer,
                             store,
-                            cfg.relay.enabled || cfg.relay.mailbox,
+                            live.get().relay.enabled || live.get().relay.mailbox,
                             now,
                         ) {
                             Ok(filters) => {
@@ -1060,8 +1067,8 @@ pub(crate) async fn coordinator(
                     let route_destination = requested_peer.unwrap_or(destination);
                     let visited = r.visited.as_deref().unwrap_or(&[]);
                     let mut max_hops = r.max_hops.unwrap_or_else(|| bundle.max_hops());
-                    max_hops = max_hops.min(bundle.max_hops()).min(cfg.relay.max_hops);
-                    if r.direction == Direction::Relay && !cfg.relay.enabled {
+                    max_hops = max_hops.min(bundle.max_hops()).min(live.get().relay.max_hops);
+                    if r.direction == Direction::Relay && !live.get().relay.enabled {
                         max_hops = max_hops.min((visited.len() + 1) as u8);
                     }
                     let modem_up = modem.as_ref().is_some_and(|handle| handle.status().up);
@@ -1109,13 +1116,13 @@ pub(crate) async fn coordinator(
                         expires_at: bundle.expires_at(),
                         object_bytes: routed_len as u64,
                         max_hops: if requested_peer.is_some() { 1 } else { max_hops },
-                        airtime_budget_millis: cfg.relay.airtime_budget_secs.saturating_mul(1_000),
+                        airtime_budget_millis: live.get().relay.airtime_budget_secs.saturating_mul(1_000),
                         visited,
                         excluded_contacts: &excluded,
                         urgent: r.precedence >= 2,
                     };
                     let policy = RoutingPolicy {
-                        urgent_min_gain: cfg.relay.urgent_min_gain,
+                        urgent_min_gain: live.get().relay.urgent_min_gain,
                         ..RoutingPolicy::default()
                     };
                     let mut plan = plan_routes(&graph, &make_request(), policy);

@@ -170,6 +170,8 @@ fn start_routed(s: Setup, relay: RelaySettings, schedules: Vec<ScheduledContact>
             },
             custody_grace_secs: 6 * 3600,
             custody_suspect_secs: 24 * 3600,
+            evidence_half_life_secs: 3600,
+            relay: Default::default(),
             beacon_secs: s.beacon_every.map_or(0, |d| d.as_secs()),
             peers,
             locator: Locator::parse("JO89xi").ok(),
@@ -969,7 +971,17 @@ fn trusted_stations_change_while_the_node_runs() {
         hub.http_addr,
         "PATCH",
         "/api/settings",
-        Some(&json!({"internet_cost": 0.5, "retry_attempts": 7, "locator": "ko02md"})),
+        Some(&json!({
+            "internet_cost": 0.5,
+            "retry_attempts": 7,
+            "locator": "ko02md",
+            "custody_grace_secs": 3600,
+            "custody_suspect_secs": 7200,
+            "receipt_retry_attempts": 9,
+            "evidence_half_life_secs": 1800,
+            "relay": { "enabled": true, "mailbox": true, "max_hops": 4 },
+            "radio": { "max_rounds": 5 },
+        })),
         Some(TOKEN),
     );
     assert_eq!(status, 200, "{body}");
@@ -979,13 +991,60 @@ fn trusted_stations_change_while_the_node_runs() {
     assert_eq!(
         (
             now["live"]["internet_cost"].as_f64(),
-            now["live"]["retry_attempts"].as_u64()
+            now["live"]["retry_attempts"].as_u64(),
+            now["live"]["custody_grace_secs"].as_u64(),
+            now["live"]["custody_suspect_secs"].as_u64(),
+            now["live"]["receipt_retry_attempts"].as_u64(),
+            now["live"]["evidence_half_life_secs"].as_u64(),
+            now["live"]["relay"]["enabled"].as_bool(),
+            now["live"]["relay"]["mailbox"].as_bool(),
+            now["live"]["relay"]["max_hops"].as_u64(),
+            now["live"]["radio"]["max_rounds"].as_u64(),
         ),
-        (Some(0.5), Some(7))
+        (Some(0.5), Some(7), Some(3600), Some(7200), Some(9), Some(1800), Some(true), Some(true), Some(4), Some(5))
     );
     let c = Config::load(&trust_file).unwrap();
     assert_eq!((c.delivery.internet_cost, c.delivery.retry_attempts), (0.5, 7));
+    assert_eq!(
+        (
+            c.delivery.custody_grace_secs,
+            c.delivery.custody_suspect_secs,
+            c.delivery.receipt_retry_attempts,
+            c.delivery.evidence_half_life_secs,
+            c.relay.enabled,
+            c.relay.mailbox,
+            c.relay.max_hops,
+            c.radio.max_rounds,
+        ),
+        (3600, 7200, 9, 1800, true, true, 4, 5)
+    );
     assert_eq!(c.station.locator.as_deref(), Some("KO02md"));
+    let (status, body) = http(
+        hub.http_addr,
+        "PATCH",
+        "/api/settings",
+        Some(&json!({
+            "restart_to_change": {
+                "internet_listen": "127.0.0.1:9443",
+                "open_hub": true,
+                "modem": { "enabled": true, "kind": "ardop", "host": "127.0.0.1", "port": 8515, "bandwidth": 0, "ptt": "none" },
+            }
+        })),
+        Some(TOKEN),
+    );
+    assert_eq!(status, 200, "{body}");
+    let fixed = get(hub.http_addr, "/api/settings")["restart_to_change"].clone();
+    assert_eq!(fixed["internet_listen"], "127.0.0.1:9443");
+    assert_eq!(fixed["open_hub"], true);
+    assert_eq!(fixed["modem"]["enabled"], true);
+    assert_eq!(fixed["modem"]["kind"], "ardop");
+    assert_eq!(fixed["modem"]["port"], 8515);
+    let saved = Config::load(&trust_file).unwrap();
+    assert_eq!(saved.internet.listen.as_deref(), Some("127.0.0.1:9443"));
+    assert!(saved.internet.open_hub);
+    assert!(saved.modem.enabled);
+    assert_eq!(saved.modem.kind, "ardop");
+    assert_eq!(saved.modem.port, 8515);
     let (status, _) = http(
         hub.http_addr,
         "PATCH",

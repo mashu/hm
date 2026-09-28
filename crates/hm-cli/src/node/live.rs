@@ -13,7 +13,7 @@ use hm_store::RetryPolicy;
 use hm_wire::{Callsign, Locator};
 
 use super::choose::Costs;
-use crate::config::{self, Config, RadioSettings};
+use crate::config::{self, Config, RadioSettings, RelaySettings};
 use crate::files::Trust;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -26,6 +26,8 @@ pub struct Live {
     pub receipt_retry: RetryPolicy,
     pub custody_grace_secs: u64,
     pub custody_suspect_secs: u64,
+    pub evidence_half_life_secs: u64,
+    pub relay: RelaySettings,
     /// Seconds between beacons; 0 sends none. (Minutes in station.toml.)
     pub beacon_secs: u64,
     pub peers: Vec<(Callsign, String)>,
@@ -62,6 +64,8 @@ impl Live {
             },
             custody_grace_secs: c.delivery.custody_grace_secs,
             custody_suspect_secs: c.delivery.custody_suspect_secs,
+            evidence_half_life_secs: c.delivery.evidence_half_life_secs,
+            relay: c.relay.clone(),
             beacon_secs: c.radio.beacon_minutes.saturating_mul(60),
             peers: c.peers()?,
             locator: c.locator()?,
@@ -87,6 +91,11 @@ pub struct Change {
     pub retry_first_secs: Option<u64>,
     pub retry_max_secs: Option<u64>,
     pub retry_attempts: Option<u32>,
+    pub custody_grace_secs: Option<u64>,
+    pub custody_suspect_secs: Option<u64>,
+    pub receipt_retry_attempts: Option<u32>,
+    pub evidence_half_life_secs: Option<u64>,
+    pub relay: Option<RelaySettings>,
     pub peers: Option<Vec<(Callsign, String)>>,
     /// `Some(None)` removes the locator.
     pub locator: Option<Option<Locator>>,
@@ -251,12 +260,27 @@ impl LiveConfig {
         if c.retry_attempts == Some(0) || c.retry_first_secs == Some(0) {
             return bad("retries need at least one attempt and a delay of at least a second");
         }
+        if c.receipt_retry_attempts == Some(0) {
+            return bad("receipt_retry_attempts must be positive");
+        }
+        if c.custody_grace_secs == Some(0) || c.custody_suspect_secs == Some(0) {
+            return bad("custody_grace_secs and custody_suspect_secs must be positive");
+        }
+        if c.evidence_half_life_secs == Some(0) {
+            return bad("evidence_half_life_secs must be positive");
+        }
         if let Some(r) = &c.radio {
             if let Err(e) = r.check() {
                 return bad(&e);
             }
         }
+        if let Some(r) = &c.relay {
+            if let Err(e) = r.check() {
+                return bad(&e);
+            }
+        }
         let radio_now = self.get().radio;
+        let relay_now = self.get().relay;
         let edit = |p: &Path| -> io::Result<()> {
             if let Some(v) = c.beacon_minutes {
                 config::set_value(p, "radio", "beacon_minutes", v as i64)?;
@@ -274,10 +298,17 @@ impl LiveConfig {
                 ("retry_first_secs", c.retry_first_secs),
                 ("retry_max_secs", c.retry_max_secs),
                 ("retry_attempts", c.retry_attempts.map(u64::from)),
+                ("custody_grace_secs", c.custody_grace_secs),
+                ("custody_suspect_secs", c.custody_suspect_secs),
+                ("receipt_retry_attempts", c.receipt_retry_attempts.map(u64::from)),
+                ("evidence_half_life_secs", c.evidence_half_life_secs),
             ] {
                 if let Some(v) = v {
                     config::set_value(p, "delivery", k, v as i64)?;
                 }
+            }
+            if let Some(relay) = &c.relay {
+                config::set_relay(p, &relay_now, relay)?;
             }
             if let Some(peers) = &c.peers {
                 config::set_peers(p, peers)?;
@@ -308,12 +339,29 @@ impl LiveConfig {
             }
             if let Some(v) = c2.retry_first_secs {
                 l.retry.first_delay_secs = v;
+                l.receipt_retry.first_delay_secs = v;
             }
             if let Some(v) = c2.retry_max_secs {
                 l.retry.max_delay_secs = v;
+                l.receipt_retry.max_delay_secs = v;
             }
             if let Some(v) = c2.retry_attempts {
                 l.retry.max_attempts = v;
+            }
+            if let Some(v) = c2.receipt_retry_attempts {
+                l.receipt_retry.max_attempts = v;
+            }
+            if let Some(v) = c2.custody_grace_secs {
+                l.custody_grace_secs = v;
+            }
+            if let Some(v) = c2.custody_suspect_secs {
+                l.custody_suspect_secs = v;
+            }
+            if let Some(v) = c2.evidence_half_life_secs {
+                l.evidence_half_life_secs = v;
+            }
+            if let Some(r) = c2.relay {
+                l.relay = r;
             }
             if let Some(p) = c2.peers {
                 l.peers = p;
@@ -329,6 +377,75 @@ impl LiveConfig {
             }
         })
     }
+
+    /// Load the settings file with CLI overrides applied (for restart-bound fields).
+    pub fn file_config(&self) -> Option<Result<Config, String>> {
+        let path = self.file.as_deref()?;
+        Some((|| {
+            let mut c = Config::load(path).map_err(|e| e.to_string())?;
+            if let Some(o) = &self.overrides {
+                o(&mut c);
+            }
+            Ok(c)
+        })())
+    }
+
+    /// Write restart-bound settings to the file only; they take effect on the next start.
+    pub fn save_restart(&self, patch: RestartChange) -> io::Result<()> {
+        let bad = |m: &str| Err(io::Error::new(io::ErrorKind::InvalidInput, m.to_string()));
+        let path = self
+            .file
+            .as_deref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no settings file to save to"))?;
+        if let Some(m) = &patch.modem {
+            m.check().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        }
+        if let Some(http) = &patch.http {
+            if http.trim().is_empty() {
+                return bad("station.http must not be empty");
+            }
+        }
+        if let Some(store) = &patch.store {
+            if store.trim().is_empty() {
+                return bad("station.store must not be empty");
+            }
+        }
+        let mut seen = self.seen.lock().expect("lock");
+        let before = Config::load(path).map_err(|e| invalid(e.to_string()))?;
+        if let Some(listen) = &patch.internet_listen {
+            let trimmed = listen.trim();
+            if trimmed.is_empty() {
+                config::unset_value(path, "internet", "listen")?;
+            } else {
+                config::set_value(path, "internet", "listen", trimmed.to_string())?;
+            }
+        }
+        if let Some(v) = patch.open_hub {
+            config::set_value(path, "internet", "open_hub", v)?;
+        }
+        if let Some(m) = &patch.modem {
+            config::set_modem(path, &before.modem, m)?;
+        }
+        if let Some(http) = &patch.http {
+            config::set_value(path, "station", "http", http.trim().to_string())?;
+        }
+        if let Some(store) = &patch.store {
+            config::set_value(path, "station", "store", store.trim().to_string())?;
+        }
+        *seen = fingerprint(path);
+        Ok(())
+    }
+}
+
+/// Restart-bound settings written to the file; applied on the next `hm node` start.
+#[derive(Clone, Debug, Default)]
+pub struct RestartChange {
+    /// `Some("")` clears `internet.listen`.
+    pub internet_listen: Option<String>,
+    pub open_hub: Option<bool>,
+    pub modem: Option<config::ModemSettings>,
+    pub http: Option<String>,
+    pub store: Option<String>,
 }
 
 #[cfg(test)]

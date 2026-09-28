@@ -87,7 +87,7 @@ enum Cmd {
         #[command(flatten)]
         station: StationArgs,
         #[command(flatten)]
-        node: NodeArgs,
+        node: Box<NodeArgs>,
     },
     /// List the sound cards the built-in modem can use.
     AudioDevices,
@@ -164,6 +164,12 @@ struct StationArgs {
     /// Slack around predicted ends of transmissions, ms [radio.guard_ms].
     #[arg(long)]
     guard: Option<u64>,
+    /// Built-in modem framing: ax25, il2p or auto [radio.framing].
+    #[arg(long)]
+    framing: Option<String>,
+    /// Radio handoff attempts before giving up [radio.max_rounds].
+    #[arg(long)]
+    max_rounds: Option<u32>,
 }
 
 /// `hm node` overrides for this run.
@@ -188,12 +194,81 @@ struct NodeArgs {
     /// replaces [[internet.peers]] for this run.
     #[arg(long = "peer", value_name = "CALL=HOST:PORT")]
     peers: Vec<String>,
+    /// Accept inbound internet links from any valid certificate [internet.open_hub].
+    #[arg(long)]
+    open_hub: Option<bool>,
     /// Relative cost of a delivery attempt by radio [delivery.radio_cost].
     #[arg(long)]
     radio_cost: Option<f64>,
     /// Relative cost of a delivery attempt over the internet [delivery.internet_cost].
     #[arg(long)]
     internet_cost: Option<f64>,
+    /// Relative cost of a delivery attempt by ARQ modem [delivery.modem_cost].
+    #[arg(long)]
+    modem_cost: Option<f64>,
+    /// First retry delay in seconds [delivery.retry_first_secs].
+    #[arg(long)]
+    retry_first_secs: Option<u64>,
+    /// Cap on retry backoff in seconds [delivery.retry_max_secs].
+    #[arg(long)]
+    retry_max_secs: Option<u64>,
+    /// Give up after this many delivery attempts [delivery.retry_attempts].
+    #[arg(long)]
+    retry_attempts: Option<u32>,
+    /// Shadow retain after hop handoff, seconds [delivery.custody_grace_secs].
+    #[arg(long)]
+    custody_grace_secs: Option<u64>,
+    /// Reclaim in-transit custody after this many seconds [delivery.custody_suspect_secs].
+    #[arg(long)]
+    custody_suspect_secs: Option<u64>,
+    /// Retry budget for end-to-end receipts [delivery.receipt_retry_attempts].
+    #[arg(long)]
+    receipt_retry_attempts: Option<u32>,
+    /// Bearer evidence half-life for path choice, seconds [delivery.evidence_half_life_secs].
+    #[arg(long)]
+    evidence_half_life_secs: Option<u64>,
+    /// Accept multi-hop relay custody [relay.enabled].
+    #[arg(long)]
+    relay: Option<bool>,
+    /// Hold mail for intermittently connected stations [relay.mailbox].
+    #[arg(long)]
+    mailbox: Option<bool>,
+    /// Max relay holdings count [relay.max_holdings].
+    #[arg(long)]
+    relay_max_holdings: Option<usize>,
+    /// Max relay holdings bytes [relay.max_bytes].
+    #[arg(long)]
+    relay_max_bytes: Option<u64>,
+    /// Max route hops for relayed traffic [relay.max_hops].
+    #[arg(long)]
+    relay_max_hops: Option<u8>,
+    /// Per-bundle radio airtime budget, seconds [relay.airtime_budget_secs].
+    #[arg(long)]
+    relay_airtime_budget_secs: Option<u64>,
+    /// Min probability gain before urgent dual-copy [relay.urgent_min_gain].
+    #[arg(long)]
+    relay_urgent_min_gain: Option<f64>,
+    /// Fraction of radio airtime for control [relay.control_airtime_fraction].
+    #[arg(long)]
+    relay_control_airtime_fraction: Option<f64>,
+    /// Enable an ARQ modem program [modem.enabled].
+    #[arg(long)]
+    modem: Option<bool>,
+    /// ARQ modem kind: vara or ardop [modem.kind].
+    #[arg(long)]
+    modem_kind: Option<String>,
+    /// ARQ modem host [modem.host].
+    #[arg(long)]
+    modem_host: Option<String>,
+    /// ARQ modem command port [modem.port].
+    #[arg(long)]
+    modem_port: Option<u16>,
+    /// ARQ modem bandwidth, Hz; 0 leaves the modem's setting [modem.bandwidth].
+    #[arg(long)]
+    modem_bandwidth: Option<u32>,
+    /// ARQ modem PTT: none, or the same forms as --ptt [modem.ptt].
+    #[arg(long)]
+    modem_ptt: Option<String>,
     /// Beacon interval in minutes, 0 for none [radio.beacon_minutes].
     #[arg(long)]
     beacon_minutes: Option<u64>,
@@ -223,6 +298,8 @@ impl StationArgs {
         set(&mut c.radio.bitrate, self.bitrate, "radio.bitrate", o);
         set(&mut c.radio.txdelay_ms, self.txdelay, "radio.txdelay_ms", o);
         set(&mut c.radio.guard_ms, self.guard, "radio.guard_ms", o);
+        set(&mut c.radio.framing, self.framing.clone(), "radio.framing", o);
+        set(&mut c.radio.max_rounds, self.max_rounds, "radio.max_rounds", o);
     }
 }
 
@@ -242,6 +319,7 @@ impl NodeArgs {
             "internet.listen",
             o,
         );
+        set(&mut c.internet.open_hub, self.open_hub, "internet.open_hub", o);
         if !self.peers.is_empty() {
             let peers = self
                 .peers
@@ -265,18 +343,95 @@ impl NodeArgs {
             set(&mut c.internet.listen, Some(None), "internet.listen", o);
             set(&mut c.internet.peers, Some(Vec::new()), "internet.peers", o);
         }
-        set(
-            &mut c.delivery.radio_cost,
-            self.radio_cost,
-            "delivery.radio_cost",
-            o,
-        );
+        set(&mut c.delivery.radio_cost, self.radio_cost, "delivery.radio_cost", o);
         set(
             &mut c.delivery.internet_cost,
             self.internet_cost,
             "delivery.internet_cost",
             o,
         );
+        set(&mut c.delivery.modem_cost, self.modem_cost, "delivery.modem_cost", o);
+        set(
+            &mut c.delivery.retry_first_secs,
+            self.retry_first_secs,
+            "delivery.retry_first_secs",
+            o,
+        );
+        set(
+            &mut c.delivery.retry_max_secs,
+            self.retry_max_secs,
+            "delivery.retry_max_secs",
+            o,
+        );
+        set(
+            &mut c.delivery.retry_attempts,
+            self.retry_attempts,
+            "delivery.retry_attempts",
+            o,
+        );
+        set(
+            &mut c.delivery.custody_grace_secs,
+            self.custody_grace_secs,
+            "delivery.custody_grace_secs",
+            o,
+        );
+        set(
+            &mut c.delivery.custody_suspect_secs,
+            self.custody_suspect_secs,
+            "delivery.custody_suspect_secs",
+            o,
+        );
+        set(
+            &mut c.delivery.receipt_retry_attempts,
+            self.receipt_retry_attempts,
+            "delivery.receipt_retry_attempts",
+            o,
+        );
+        set(
+            &mut c.delivery.evidence_half_life_secs,
+            self.evidence_half_life_secs,
+            "delivery.evidence_half_life_secs",
+            o,
+        );
+        set(&mut c.relay.enabled, self.relay, "relay.enabled", o);
+        set(&mut c.relay.mailbox, self.mailbox, "relay.mailbox", o);
+        set(
+            &mut c.relay.max_holdings,
+            self.relay_max_holdings,
+            "relay.max_holdings",
+            o,
+        );
+        set(&mut c.relay.max_bytes, self.relay_max_bytes, "relay.max_bytes", o);
+        set(&mut c.relay.max_hops, self.relay_max_hops, "relay.max_hops", o);
+        set(
+            &mut c.relay.airtime_budget_secs,
+            self.relay_airtime_budget_secs,
+            "relay.airtime_budget_secs",
+            o,
+        );
+        set(
+            &mut c.relay.urgent_min_gain,
+            self.relay_urgent_min_gain,
+            "relay.urgent_min_gain",
+            o,
+        );
+        set(
+            &mut c.relay.control_airtime_fraction,
+            self.relay_control_airtime_fraction,
+            "relay.control_airtime_fraction",
+            o,
+        );
+        set(&mut c.modem.enabled, self.modem, "modem.enabled", o);
+        set(&mut c.modem.kind, self.modem_kind.clone(), "modem.kind", o);
+        set(&mut c.modem.host, self.modem_host.clone(), "modem.host", o);
+        set(&mut c.modem.port, self.modem_port, "modem.port", o);
+        set(
+            &mut c.modem.bandwidth,
+            self.modem_bandwidth,
+            "modem.bandwidth",
+            o,
+        );
+        set(&mut c.modem.ptt, self.modem_ptt.clone(), "modem.ptt", o);
         set(
             &mut c.radio.beacon_minutes,
             self.beacon_minutes,
@@ -290,6 +445,7 @@ impl NodeArgs {
             o,
         );
         c.locator()?;
+        c.modem.check()?;
         Ok(())
     }
 }
@@ -939,13 +1095,13 @@ fn main() -> ExitCode {
         } => load_config(path).and_then(|c| messages(&c, direction, kind, *limit)),
         Cmd::AudioDevices => audio_devices(),
         Cmd::Node { station, node: n } => {
-            let (s2, n2) = (station.clone(), n.clone());
+            let (s2, n2) = (station.clone(), (**n).clone());
             let overrides: hm_cli::node::live::Overrides = std::sync::Arc::new(move |c: &mut Config| {
                 let mut o = Vec::new();
                 s2.apply(c, &mut o);
                 let _ = n2.apply(c, &mut o);
             });
-            with_overrides(path, station, Some(n)).and_then(|(c, o)| node(path, &c, &o, overrides))
+            with_overrides(path, station, Some(n.as_ref())).and_then(|(c, o)| node(path, &c, &o, overrides))
         }
     };
     match result {

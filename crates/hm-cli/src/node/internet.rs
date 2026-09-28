@@ -22,14 +22,13 @@ pub(crate) fn start_net(
     listen: SocketAddr,
     net_control_tx: tokio::sync::mpsc::UnboundedSender<(Callsign, Vec<u8>)>,
 ) -> io::Result<Arc<Net>> {
-    let (store, gate_live, me, key_call, gate_identity, gate_notify, gate_relay) = (
+    let (store, gate_live, me, key_call, gate_identity, gate_notify) = (
         Arc::clone(store),
         Arc::clone(live),
         cfg.me,
         cfg.key.call,
         Identity::from_secret(cfg.key.identity.secret()),
         notify.clone(),
-        cfg.relay.clone(),
     );
     // Weak so the accept gate does not keep Net (and the store) alive after stop.
     let net_slot: Arc<Mutex<Weak<Net>>> = Arc::new(Mutex::new(Weak::new()));
@@ -49,7 +48,7 @@ pub(crate) fn start_net(
                 me,
                 key_call,
                 identity: &gate_identity,
-                relay: &gate_relay,
+                relay: &current.relay,
             },
             via,
             &obj,

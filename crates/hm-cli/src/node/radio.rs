@@ -210,10 +210,11 @@ pub(crate) fn radio_session(
     };
     let mut x = station.engine()?;
     let mut features = link.features();
-    if cfg.relay.enabled {
+    let mut relay = live.get().relay;
+    if relay.enabled {
         features |= FEATURE_RELAY;
     }
-    if cfg.relay.mailbox {
+    if relay.mailbox {
         features |= FEATURE_MAILBOX;
     }
     x.set_features(features);
@@ -224,10 +225,10 @@ pub(crate) fn radio_session(
     let mut out: Vec<Output<Event>> = Vec::new();
     let mut rng = DetRng::from_seed(getrandom::u64().unwrap_or(0xBEAC));
     let mut flags = if cfg.internet.is_some() { FLAG_INTERNET } else { 0 };
-    if cfg.relay.enabled {
+    if relay.enabled {
         flags |= FLAG_RELAY;
     }
-    if cfg.relay.mailbox {
+    if relay.mailbox {
         flags |= FLAG_MAILBOX;
     }
     let mut heard = heard::HeardTable::default();
@@ -240,7 +241,7 @@ pub(crate) fn radio_session(
     });
     let mut heard_changed = false;
     let mut last_report = Instant::now();
-    let control_permyriad = (cfg.relay.control_airtime_fraction * 10_000.0)
+    let mut control_permyriad = (relay.control_airtime_fraction * 10_000.0)
         .round()
         .clamp(0.0, 10_000.0) as u16;
     let mut control_budget =
@@ -252,6 +253,29 @@ pub(crate) fn radio_session(
             let live = live.get();
             if cfg.radio_builder.is_some() && live.radio.link_settings() != *settings {
                 return Ok(Ended::Reconfigure);
+            }
+            if live.relay != relay {
+                relay = live.relay.clone();
+                features = link.features();
+                if relay.enabled {
+                    features |= FEATURE_RELAY;
+                }
+                if relay.mailbox {
+                    features |= FEATURE_MAILBOX;
+                }
+                x.set_features(features);
+                flags = if cfg.internet.is_some() { FLAG_INTERNET } else { 0 };
+                if relay.enabled {
+                    flags |= FLAG_RELAY;
+                }
+                if relay.mailbox {
+                    flags |= FLAG_MAILBOX;
+                }
+                control_permyriad = (relay.control_airtime_fraction * 10_000.0)
+                    .round()
+                    .clamp(0.0, 10_000.0) as u16;
+                control_budget = ControlBudget::new(CONTROL_BUDGET_WINDOW_MS, control_permyriad)
+                    .map_err(io::Error::other)?;
             }
             x.set_trust(live.trust.iter());
             if live.beacon_secs != beacon_secs {

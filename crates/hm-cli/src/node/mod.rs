@@ -117,14 +117,13 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                     }
                 };
                 let modem = cfg.modem.clone().map(|mc| {
-                    let (store, gate_live, me, key_call, gate_identity, gate_notify, gate_relay) = (
+                    let (store, gate_live, me, key_call, gate_identity, gate_notify) = (
                         store.clone(),
                         live.clone(),
                         cfg.me,
                         cfg.key.call,
                         Identity::from_secret(cfg.key.identity.secret()),
                         notify.clone(),
-                        cfg.relay.clone(),
                     );
                     let gate: hm_net::Accept = Arc::new(move |via, obj| {
                         let current = gate_live.get();
@@ -136,7 +135,7 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                                 me,
                                 key_call,
                                 identity: &gate_identity,
-                                relay: &gate_relay,
+                                relay: &current.relay,
                             },
                             via,
                             &obj,

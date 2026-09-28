@@ -211,8 +211,8 @@
   ul.list .detail { display: block; font-size: 0.85rem; color: var(--muted); }
   ul.list .detail.ok { color: var(--ok); } ul.list .detail.warn { color: var(--warn); } ul.list .detail.bad { color: var(--bad); font-weight: 700; }
   ul.list .key { display: block; color: var(--muted); font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  #trust-note, #settings-note { font-size: 0.85rem; color: var(--muted); margin: 0.45rem 0 0; min-height: 1.3em; }
-  #trust-note.ok, #settings-note.ok { color: var(--ok); } #trust-note.bad, #settings-note.bad { color: var(--bad); }
+  #trust-note { font-size: 0.85rem; color: var(--muted); margin: 0.45rem 0 0; min-height: 1.3em; }
+  #trust-note.ok { color: var(--ok); } #trust-note.bad { color: var(--bad); }
   .myline { overflow-wrap: anywhere; font-size: 0.85rem; margin-top: 0.75rem; }
   .link-grid { display: grid; gap: 0.45rem; margin: 0; }
   .link-grid dt { font-weight: 700; font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
@@ -242,19 +242,102 @@
   }
 
   /* Settings */
-  .settings { max-width: 46rem; }
-  fieldset { border: 0; margin: 0 0 1.1rem; padding: 0; }
+  .settings-shell {
+    display: grid; grid-template-columns: minmax(11rem, 14rem) minmax(0, 1fr);
+    gap: 0.85rem; align-items: start; max-width: 64rem;
+  }
+  @media (max-width: 52rem) {
+    .settings-shell { grid-template-columns: minmax(0, 1fr); }
+  }
+  .settings-nav {
+    position: sticky; top: 4.5rem; display: flex; flex-direction: column; gap: 0.2rem;
+    padding: 0.55rem; background: var(--sheet); border: 1px solid var(--rule); border-radius: var(--radius);
+  }
+  @media (max-width: 52rem) {
+    .settings-nav {
+      position: static; flex-direction: row; flex-wrap: nowrap; overflow-x: auto;
+      gap: 0.25rem; padding: 0.4rem; -webkit-overflow-scrolling: touch;
+    }
+  }
+  .settings-nav button {
+    display: block; width: 100%; text-align: left; border: 0; background: transparent;
+    color: var(--muted); font-weight: 650; padding: 0.55rem 0.7rem; border-radius: 6px; cursor: pointer;
+    white-space: nowrap;
+  }
+  @media (max-width: 52rem) {
+    .settings-nav button { width: auto; flex: 0 0 auto; }
+  }
+  .settings-nav button:hover { color: var(--ink); background: var(--raised); }
+  .settings-nav button[aria-selected="true"] {
+    color: var(--ink); background: var(--raised); box-shadow: inset 3px 0 0 var(--accent);
+  }
+  @media (max-width: 52rem) {
+    .settings-nav button[aria-selected="true"] { box-shadow: inset 0 -3px 0 var(--accent); }
+  }
+  .settings-nav .nav-label {
+    display: block; font-size: 0.72rem; font-weight: 500; color: var(--muted);
+    margin-top: 0.1rem; white-space: normal; line-height: 1.25;
+  }
+  @media (max-width: 52rem) { .settings-nav .nav-label { display: none; } }
+  .settings-main { display: flex; flex-direction: column; gap: 0.75rem; min-width: 0; }
+  .settings-panel {
+    background: var(--sheet); border: 1px solid var(--rule); border-radius: var(--radius);
+    padding: 1rem 1.1rem 1.15rem;
+  }
+  .settings-panel > header { margin-bottom: 0.85rem; padding-bottom: 0.75rem; border-bottom: 1px solid var(--rule); }
+  .settings-panel > header h2 { margin: 0 0 0.25rem; font-size: 1.15rem; letter-spacing: 0.01em; }
+  .settings-panel > header p { margin: 0; color: var(--muted); font-size: 0.9rem; line-height: 1.4; max-width: 42rem; }
+  .settings-panel .block { margin-top: 1rem; }
+  .settings-panel .block:first-of-type { margin-top: 0; }
+  .settings-panel .block-title {
+    margin: 0 0 0.45rem; font-size: 0.72rem; font-weight: 800; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--muted);
+  }
+  .settings-panel .lede { margin: 0 0 0.65rem; color: var(--muted); font-size: 0.88rem; }
+  fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
   legend { font-weight: 800; font-size: 1.02rem; padding: 0; margin-bottom: 0.2rem; }
-  .pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 0.65rem; }
-  .pair label { margin-top: 0.45rem; }
-  label.check { display: flex; gap: 0.5rem; align-items: center; }
-  label.check input { width: auto; }
-  details { margin-top: 0.65rem; }
-  summary { cursor: pointer; color: var(--muted); }
-  .peer { display: grid; grid-template-columns: minmax(0, 7rem) minmax(0, 1fr) auto; gap: 0.35rem; margin-top: 0.35rem; }
+  .pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 0.75rem; }
+  .trio { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 0.75rem; }
+  @media (max-width: 40rem) {
+    .pair, .trio { grid-template-columns: minmax(0, 1fr); }
+  }
+  .pair label, .trio label { margin-top: 0.45rem; }
+  label.check { display: flex; gap: 0.55rem; align-items: flex-start; margin: 0.55rem 0; font-weight: 600; }
+  label.check input { width: auto; margin-top: 0.2rem; flex: 0 0 auto; }
+  label.check .check-body { display: flex; flex-direction: column; gap: 0.1rem; min-width: 0; }
+  label.check .check-body .hint { font-weight: 400; font-size: 0.85rem; }
+  details.advanced {
+    margin-top: 1rem; border: 1px solid var(--rule); border-radius: 8px; background: var(--raised);
+    padding: 0.15rem 0.85rem 0.85rem;
+  }
+  details.advanced > summary {
+    cursor: pointer; color: var(--ink); font-weight: 700; padding: 0.7rem 0 0.55rem;
+    list-style: none; display: flex; align-items: center; gap: 0.45rem;
+  }
+  details.advanced > summary::-webkit-details-marker { display: none; }
+  details.advanced > summary::before {
+    content: ""; width: 0.45rem; height: 0.45rem; border-right: 2px solid var(--muted);
+    border-bottom: 2px solid var(--muted); transform: rotate(-45deg); transition: transform 0.15s ease;
+  }
+  details.advanced[open] > summary::before { transform: rotate(45deg); }
+  details.advanced > summary .hint { font-weight: 400; }
+  .peer {
+    display: grid; grid-template-columns: minmax(0, 7.5rem) minmax(0, 1fr) auto; gap: 0.4rem;
+    margin-top: 0.45rem; align-items: center;
+  }
   .peer input:first-child { text-transform: uppercase; }
-  dl.fixed { margin: 0.65rem 0 0; font-size: 0.85rem; color: var(--muted); display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.1rem 0.65rem; }
-  dl.fixed dd { margin: 0; overflow-wrap: anywhere; }
+  .settings-footer {
+    position: sticky; bottom: 0.65rem; z-index: 1;
+    display: flex; flex-wrap: wrap; gap: 0.55rem 1rem; align-items: center;
+    padding: 0.75rem 0.95rem; background: color-mix(in srgb, var(--sheet) 92%, transparent);
+    border: 1px solid var(--rule); border-radius: var(--radius);
+    backdrop-filter: blur(8px); box-shadow: 0 8px 24px rgb(0 0 0 / 0.06);
+  }
+  .settings-footer .btn { margin: 0; }
+  .settings-footer .meta { flex: 1 1 14rem; font-size: 0.82rem; color: var(--muted); min-width: 0; }
+  .settings-footer .meta strong { color: var(--ink); font-weight: 650; }
+  #settings-note { font-size: 0.85rem; color: var(--muted); margin: 0; min-height: 0; flex: 1 1 100%; }
+  #settings-note.ok { color: var(--ok); } #settings-note.bad { color: var(--bad); }
   .locator-row { display: flex; flex-wrap: wrap; gap: 0.45rem; align-items: stretch; }
   .locator-row input { flex: 1 1 10rem; width: auto; }
   .locator-row .btn { margin: 0; white-space: nowrap; }
@@ -262,10 +345,10 @@
   .locator-fuzz > div { flex: 1 1 12rem; }
   .locator-fuzz label { margin-top: 0; }
   #locator-map {
-    height: 18rem; margin-top: 0.55rem; border: 1px solid var(--rule); border-radius: 6px;
+    height: 18rem; margin-top: 0.55rem; border: 1px solid var(--rule); border-radius: 8px;
     background: var(--raised); z-index: 0;
   }
-  #locator-map .leaflet-container { height: 100%; width: 100%; border-radius: 6px; font: inherit; }
+  #locator-map .leaflet-container { height: 100%; width: 100%; border-radius: 8px; font: inherit; }
   #locator-hint { font-size: 0.8rem; color: var(--muted); margin: 0.3rem 0 0; min-height: 1.2em; }
   #locator-hint.bad { color: var(--bad); } #locator-hint.ok { color: var(--ok); }
 </style>
@@ -420,87 +503,269 @@
   </section>
 
   <section class="view" id="view-settings" aria-label="Settings" hidden>
-    <form class="card settings" id="settings-form" autocomplete="off">
-      <fieldset>
-        <legend>Station</legend>
-        <label for="locator">Grid locator <span class="hint">(Maidenhead square sent in beacons; empty for none)</span></label>
-        <div class="locator-row">
-          <input id="locator" maxlength="6" spellcheck="false" pattern="[A-Ra-r]{2}[0-9]{2}([A-Xa-x]{2})?" placeholder="AA00aa" autocomplete="off">
-          <button class="btn quiet" type="button" id="locator-gps">Use my location</button>
-        </div>
-        <div class="locator-fuzz">
-          <div>
-            <label for="locator-range">Privacy range <span class="hint">(GPS and map click pick a square at random within this)</span></label>
-            <select id="locator-range">
-              <option value="5">± 5 km</option>
-              <option value="10" selected>± 10 km</option>
-              <option value="25">± 25 km</option>
-              <option value="50">± 50 km</option>
-              <option value="0">Exact (no offset)</option>
-            </select>
+    <form class="settings-shell" id="settings-form" autocomplete="off" novalidate>
+      <nav class="settings-nav" id="settings-nav" aria-label="Settings sections" role="tablist">
+        <button type="button" role="tab" aria-selected="true" aria-controls="panel-station" data-panel="station">
+          Station
+          <span class="nav-label">Who you are on the air</span>
+        </button>
+        <button type="button" role="tab" aria-selected="false" aria-controls="panel-radio" data-panel="radio">
+          Packet radio
+          <span class="nav-label">TNC or sound card</span>
+        </button>
+        <button type="button" role="tab" aria-selected="false" aria-controls="panel-internet" data-panel="internet">
+          Internet
+          <span class="nav-label">Peers and listening</span>
+        </button>
+        <button type="button" role="tab" aria-selected="false" aria-controls="panel-modem" data-panel="modem">
+          ARQ modem
+          <span class="nav-label">VARA, ARDOP, Mercury</span>
+        </button>
+        <button type="button" role="tab" aria-selected="false" aria-controls="panel-delivery" data-panel="delivery">
+          Delivery
+          <span class="nav-label">Paths, retries, custody</span>
+        </button>
+        <button type="button" role="tab" aria-selected="false" aria-controls="panel-relay" data-panel="relay">
+          Relay
+          <span class="nav-label">Multi-hop and mailbox</span>
+        </button>
+        <button type="button" role="tab" aria-selected="false" aria-controls="panel-node" data-panel="node">
+          This node
+          <span class="nav-label">Web page and store</span>
+        </button>
+      </nav>
+
+      <div class="settings-main">
+        <section class="settings-panel" id="panel-station" role="tabpanel" data-panel="station">
+          <header>
+            <h2>Station</h2>
+            <p>Your grid square goes out in beacons so others can see distance and bearing.</p>
+          </header>
+          <label for="locator">Grid locator</label>
+          <div class="locator-row">
+            <input id="locator" maxlength="6" spellcheck="false" pattern="[A-Ra-r]{2}[0-9]{2}([A-Xa-x]{2})?" placeholder="AA00aa" autocomplete="off">
+            <button class="btn quiet" type="button" id="locator-gps">Use my location</button>
           </div>
-          <button class="btn quiet" type="button" id="locator-reroll" hidden>Pick another square in range</button>
-        </div>
-        <div id="locator-map" role="application" aria-label="Map: click to set grid locator"></div>
-        <p id="locator-hint" role="status">Click the map or use your location; a nearby square is chosen within the range. Or type one.</p>
-      </fieldset>
-      <fieldset>
-        <legend>Packet radio</legend>
-        <label class="check"><input id="r-enabled" type="checkbox"> Use packet radio <span class="hint">(KISS/Direwolf or built-in AFSK)</span></label>
-        <div id="radio-fields">
-          <label for="r-kiss">KISS TNC <span class="hint">(Direwolf <code>127.0.0.1:8001</code>, or <code>serial:/dev/ttyUSB0:9600</code>)</span></label>
-          <input id="r-kiss" spellcheck="false">
-          <label for="r-audio">Sound card <span class="hint">(the built-in modem instead of a TNC; empty for a TNC)</span></label>
-          <input id="r-audio" spellcheck="false" placeholder="default">
-          <label for="r-ptt">PTT <span class="hint">(built-in modem: vox, rigctld, rts:/dev/ttyUSB0, cm108:/dev/hidraw0)</span></label>
-          <input id="r-ptt" spellcheck="false">
-          <label for="r-framing">Framing <span class="hint">(built-in modem; IL2P carries frames through far more noise)</span></label>
-          <select id="r-framing">
-            <option value="ax25">AX.25: every packet station decodes it</option>
-            <option value="auto">Auto: IL2P to stations that decode it</option>
-            <option value="il2p">IL2P always (NinoTNC, Direwolf 1.7, hm)</option>
-          </select>
-          <div class="pair">
-            <div><label for="r-txdelay_ms">Key-up delay <span class="hint">(ms)</span></label><input id="r-txdelay_ms" type="number" min="0" step="10"></div>
-            <div><label for="r-tnc_port">TNC port</label><input id="r-tnc_port" type="number" min="0" max="15" step="1"></div>
+          <div class="locator-fuzz">
+            <div>
+              <label for="locator-range">Privacy range</label>
+              <select id="locator-range">
+                <option value="5">± 5 km</option>
+                <option value="10" selected>± 10 km</option>
+                <option value="25">± 25 km</option>
+                <option value="50">± 50 km</option>
+                <option value="0">Exact (no offset)</option>
+              </select>
+            </div>
+            <button class="btn quiet" type="button" id="locator-reroll" hidden>Pick another square</button>
           </div>
-          <details>
-            <summary>Channel access and timing</summary>
+          <div id="locator-map" role="application" aria-label="Map: click to set grid locator"></div>
+          <p id="locator-hint" role="status">Click the map or use your location. Or type a Maidenhead square.</p>
+        </section>
+
+        <section class="settings-panel" id="panel-radio" role="tabpanel" data-panel="radio" hidden>
+          <header>
+            <h2>Packet radio</h2>
+            <p>KISS/Direwolf or the built-in AFSK modem. Changes usually open a new link at once.</p>
+          </header>
+          <label class="check">
+            <input id="r-enabled" type="checkbox">
+            <span class="check-body">Use packet radio
+              <span class="hint">Turn off for an internet-only node</span>
+            </span>
+          </label>
+          <div id="radio-fields">
+            <div class="block">
+              <h3 class="block-title">Interface</h3>
+              <label for="r-kiss">KISS TNC</label>
+              <input id="r-kiss" spellcheck="false" placeholder="127.0.0.1:8001 or serial:/dev/ttyUSB0:9600">
+              <label for="r-audio">Sound card <span class="hint">(empty = use the TNC above)</span></label>
+              <input id="r-audio" spellcheck="false" placeholder="default">
+              <label for="r-ptt">PTT</label>
+              <input id="r-ptt" spellcheck="false" placeholder="vox, rigctld, rts:…, cm108:…">
+              <div class="pair">
+                <div>
+                  <label for="r-framing">Framing</label>
+                  <select id="r-framing">
+                    <option value="ax25">AX.25 — widest compatibility</option>
+                    <option value="auto">Auto — IL2P when the peer supports it</option>
+                    <option value="il2p">IL2P — more robust in noise</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="beacon_minutes">Beacon every <span class="hint">(minutes; 0 = off)</span></label>
+                  <input id="beacon_minutes" type="number" min="0" step="1" required>
+                </div>
+              </div>
+            </div>
+            <div class="block">
+              <h3 class="block-title">Timing</h3>
+              <div class="pair">
+                <div><label for="r-txdelay_ms">Key-up delay <span class="hint">(ms)</span></label><input id="r-txdelay_ms" type="number" min="0" step="10"></div>
+                <div><label for="r-tnc_port">TNC port</label><input id="r-tnc_port" type="number" min="0" max="15" step="1"></div>
+              </div>
+            </div>
+            <details class="advanced">
+              <summary>Channel access <span class="hint">CSMA, bitrate, handoff rounds</span></summary>
+              <div class="pair">
+                <div><label for="r-persist">Persistence <span class="hint">(0–255)</span></label><input id="r-persist" type="number" min="0" max="255" step="1"></div>
+                <div><label for="r-slottime_ms">Slot time <span class="hint">(ms)</span></label><input id="r-slottime_ms" type="number" min="0" step="10"></div>
+                <div><label for="r-bitrate">Bit rate <span class="hint">(bd)</span></label><input id="r-bitrate" type="number" min="1" step="1"></div>
+                <div><label for="r-guard_ms">Guard <span class="hint">(ms)</span></label><input id="r-guard_ms" type="number" min="0" step="10"></div>
+                <div><label for="r-max_rounds">Max rounds <span class="hint">(handoff attempts)</span></label><input id="r-max_rounds" type="number" min="1" step="1"></div>
+              </div>
+            </details>
+          </div>
+          <p class="lede" id="radio-note" style="margin-top: 0.85rem"></p>
+        </section>
+
+        <section class="settings-panel" id="panel-internet" role="tabpanel" data-panel="internet" hidden>
+          <header>
+            <h2>Internet</h2>
+            <p>Stations this node dials apply at once. Listening and open-hub need a restart.</p>
+          </header>
+          <div class="block">
+            <h3 class="block-title">Peers <span class="hint" style="text-transform:none;letter-spacing:0;font-weight:400">(dialled now)</span></h3>
+            <p class="lede">Keep a QUIC link to these stations. Leave empty if this node only accepts inbound links.</p>
+            <div id="peers"></div>
+            <button class="btn quiet small" type="button" id="add-peer" style="margin-top: 0.55rem">Add a peer</button>
+          </div>
+          <div class="block">
+            <h3 class="block-title">Listening</h3>
+            <p class="lede">Accept inbound QUIC links. Saved now; used the next time you start the node.</p>
+            <label for="f-internet_listen">Address <span class="hint">(empty to stop listening)</span></label>
+            <input id="f-internet_listen" spellcheck="false" placeholder="0.0.0.0:4433">
+            <label class="check">
+              <input id="f-open_hub" type="checkbox">
+              <span class="check-body">Open hub
+                <span class="hint">Accept inbound links from any station with a valid certificate</span>
+              </span>
+            </label>
+          </div>
+        </section>
+
+        <section class="settings-panel" id="panel-modem" role="tabpanel" data-panel="modem" hidden>
+          <header>
+            <h2>ARQ modem</h2>
+            <p>An external modem program (VARA, Mercury, or ARDOP) — not Direwolf or the built-in AFSK path. Saved now; used the next time you start the node.</p>
+          </header>
+          <label class="check">
+            <input id="f-modem-enabled" type="checkbox">
+            <span class="check-body">Enable ARQ modem
+              <span class="hint">Saved now; takes effect on the next start</span>
+            </span>
+          </label>
+          <div id="modem-fields">
             <div class="pair">
-              <div><label for="r-persist">Persistence <span class="hint">(0–255)</span></label><input id="r-persist" type="number" min="0" max="255" step="1"></div>
-              <div><label for="r-slottime_ms">Slot time <span class="hint">(ms)</span></label><input id="r-slottime_ms" type="number" min="0" step="10"></div>
-              <div><label for="r-bitrate">Bit rate <span class="hint">(bd)</span></label><input id="r-bitrate" type="number" min="1" step="1"></div>
-              <div><label for="r-guard_ms">Guard <span class="hint">(ms)</span></label><input id="r-guard_ms" type="number" min="0" step="10"></div>
+              <div>
+                <label for="f-modem-kind">Kind</label>
+                <select id="f-modem-kind">
+                  <option value="vara">VARA / Mercury</option>
+                  <option value="ardop">ARDOP</option>
+                </select>
+              </div>
+              <div>
+                <label for="f-modem-port">Command port</label>
+                <input id="f-modem-port" type="number" min="1" max="65534" step="1">
+              </div>
+            </div>
+            <label for="f-modem-host">Host</label>
+            <input id="f-modem-host" spellcheck="false" placeholder="127.0.0.1">
+            <div class="pair">
+              <div>
+                <label for="f-modem-bandwidth">Bandwidth <span class="hint">(Hz; 0 = modem default)</span></label>
+                <input id="f-modem-bandwidth" type="number" min="0" step="1">
+              </div>
+              <div>
+                <label for="f-modem-ptt">PTT</label>
+                <input id="f-modem-ptt" spellcheck="false" placeholder="none">
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-panel" id="panel-delivery" role="tabpanel" data-panel="delivery" hidden>
+          <header>
+            <h2>Delivery</h2>
+            <p>How the node chooses a path and how hard it tries before giving up.</p>
+          </header>
+          <div class="block">
+            <h3 class="block-title">Path preference</h3>
+            <p class="lede">Lower cost is tried first when more than one path can reach a station.</p>
+            <div class="trio">
+              <div><label for="radio_cost">Packet radio</label><input id="radio_cost" type="number" min="0.01" step="0.01" required></div>
+              <div><label for="internet_cost">Internet</label><input id="internet_cost" type="number" min="0.01" step="0.01" required></div>
+              <div><label for="modem_cost">ARQ modem</label><input id="modem_cost" type="number" min="0.01" step="0.01" required></div>
+            </div>
+          </div>
+          <div class="block">
+            <h3 class="block-title">Retries</h3>
+            <div class="trio">
+              <div><label for="retry_first_secs">First retry <span class="hint">(s)</span></label><input id="retry_first_secs" type="number" min="1" step="1" required></div>
+              <div><label for="retry_max_secs">Longest wait <span class="hint">(s)</span></label><input id="retry_max_secs" type="number" min="1" step="1" required></div>
+              <div><label for="retry_attempts">Attempts</label><input id="retry_attempts" type="number" min="1" step="1" required></div>
+            </div>
+          </div>
+          <details class="advanced">
+            <summary>Custody &amp; confirmation <span class="hint">shadow retain, reclaim, receipts</span></summary>
+            <p class="lede">After a hop handoff the prior station keeps a shadow copy, then may reclaim if the destination never confirms.</p>
+            <div class="pair">
+              <div><label for="custody_grace_secs">Shadow grace <span class="hint">(s)</span></label><input id="custody_grace_secs" type="number" min="1" step="1" required></div>
+              <div><label for="custody_suspect_secs">Suspect after <span class="hint">(s)</span></label><input id="custody_suspect_secs" type="number" min="1" step="1" required></div>
+              <div><label for="receipt_retry_attempts">Receipt attempts</label><input id="receipt_retry_attempts" type="number" min="1" step="1" required></div>
+              <div><label for="evidence_half_life_secs">Evidence half-life <span class="hint">(s)</span></label><input id="evidence_half_life_secs" type="number" min="1" step="1" required></div>
             </div>
           </details>
-          <label for="beacon_minutes">Beacon every <span class="hint">(minutes; 0 turns it off)</span></label>
-          <input id="beacon_minutes" type="number" min="0" step="1" required>
+        </section>
+
+        <section class="settings-panel" id="panel-relay" role="tabpanel" data-panel="relay" hidden>
+          <header>
+            <h2>Relay</h2>
+            <p>Forward traffic for other stations, or hold it until they check in.</p>
+          </header>
+          <label class="check">
+            <input id="relay_enabled" type="checkbox">
+            <span class="check-body">Relay multi-hop traffic
+              <span class="hint">Accept custody when the final recipient is someone else</span>
+            </span>
+          </label>
+          <label class="check">
+            <input id="relay_mailbox" type="checkbox">
+            <span class="check-body">Mailbox
+              <span class="hint">Hold mail for stations that connect only now and then</span>
+            </span>
+          </label>
+          <details class="advanced">
+            <summary>Limits &amp; airtime <span class="hint">storage, hops, control share</span></summary>
+            <div class="pair">
+              <div><label for="relay_max_holdings">Max holdings</label><input id="relay_max_holdings" type="number" min="1" step="1" required></div>
+              <div><label for="relay_max_bytes">Max bytes</label><input id="relay_max_bytes" type="number" min="1" step="1" required></div>
+              <div><label for="relay_max_hops">Max hops</label><input id="relay_max_hops" type="number" min="1" max="16" step="1" required></div>
+              <div><label for="relay_airtime_budget_secs">Airtime budget <span class="hint">(s)</span></label><input id="relay_airtime_budget_secs" type="number" min="1" step="1" required></div>
+              <div><label for="relay_urgent_min_gain">Urgent dual-copy gain</label><input id="relay_urgent_min_gain" type="number" min="0" max="0.999" step="0.01" required></div>
+              <div><label for="relay_control_airtime_fraction">Control airtime fraction</label><input id="relay_control_airtime_fraction" type="number" min="0" max="1" step="0.001" required></div>
+            </div>
+          </details>
+        </section>
+
+        <section class="settings-panel" id="panel-node" role="tabpanel" data-panel="node" hidden>
+          <header>
+            <h2>This node</h2>
+            <p>Where the web page listens and where messages are stored. Saved now; used the next time you start the node.</p>
+          </header>
+          <label for="f-http">Web address</label>
+          <input id="f-http" spellcheck="false" required placeholder="127.0.0.1:8080">
+          <label for="f-store">Store path</label>
+          <input id="f-store" spellcheck="false" required placeholder="station.db">
+          <p class="lede" id="settings-file-meta" style="margin-top: 1rem"></p>
+        </section>
+
+        <div class="settings-footer">
+          <button class="btn" type="submit">Save settings</button>
+          <div class="meta" id="settings-meta">Changes in the open section are saved with everything else.</div>
+          <p id="settings-note" role="status"></p>
         </div>
-        <p class="hint" id="radio-note"></p>
-      </fieldset>
-      <fieldset>
-        <legend>Delivery</legend>
-        <div class="pair">
-          <div><label for="radio_cost">Packet radio cost <span class="hint">(KISS / AFSK)</span></label><input id="radio_cost" type="number" min="0.01" step="0.01" required></div>
-          <div><label for="internet_cost">Internet cost <span class="hint">(QUIC)</span></label><input id="internet_cost" type="number" min="0.01" step="0.01" required></div>
-          <div><label for="modem_cost">ARQ cost <span class="hint">(VARA, ARDOP, Mercury — not Direwolf)</span></label><input id="modem_cost" type="number" min="0.01" step="0.01" required></div>
-        </div>
-        <p class="hint">The cheaper path that reaches a station is tried first. Packet radio is hm's AX.25/AFSK stack; ARQ is an external modem program.</p>
-        <div class="pair">
-          <div><label for="retry_first_secs">First retry <span class="hint">(s)</span></label><input id="retry_first_secs" type="number" min="1" step="1" required></div>
-          <div><label for="retry_max_secs">Longest wait <span class="hint">(s)</span></label><input id="retry_max_secs" type="number" min="1" step="1" required></div>
-        </div>
-        <label for="retry_attempts">Attempts before giving up</label>
-        <input id="retry_attempts" type="number" min="1" step="1" required>
-      </fieldset>
-      <fieldset>
-        <legend>Internet peers <span class="hint">(stations this node dials)</span></legend>
-        <div id="peers"></div>
-        <button class="btn quiet small" type="button" id="add-peer" style="margin-top: 0.5rem">Add a peer</button>
-      </fieldset>
-      <button class="btn" type="submit">Save settings</button>
-      <p id="settings-note" role="status"></p>
-      <dl class="fixed" id="fixed"></dl>
+      </div>
     </form>
   </section>
 </main>
@@ -1413,8 +1678,19 @@ $("trust-form").addEventListener("submit", async (ev) => {
 
 // ---- Settings ----------------------------------------------------------
 const radioText = ["kiss", "audio", "ptt", "framing"];
-const radioNumbers = ["txdelay_ms", "tnc_port", "persist", "slottime_ms", "bitrate", "guard_ms"];
-const liveFields = ["beacon_minutes", "radio_cost", "internet_cost", "modem_cost", "retry_first_secs", "retry_max_secs", "retry_attempts"];
+const radioNumbers = ["txdelay_ms", "tnc_port", "persist", "slottime_ms", "bitrate", "guard_ms", "max_rounds"];
+const liveFields = [
+  "beacon_minutes", "radio_cost", "internet_cost", "modem_cost",
+  "retry_first_secs", "retry_max_secs", "retry_attempts",
+  "custody_grace_secs", "custody_suspect_secs", "receipt_retry_attempts",
+  "evidence_half_life_secs",
+];
+const relayNumbers = [
+  "max_holdings", "max_bytes", "max_hops", "airtime_budget_secs",
+  "urgent_min_gain", "control_airtime_fraction",
+];
+const modemText = ["kind", "host", "ptt"];
+const modemNumbers = ["port", "bandwidth"];
 let settingsFile = null;
 
 const LOCATOR_RE = /^[A-R]{2}[0-9]{2}([A-X]{2})?$/i;
@@ -1650,6 +1926,19 @@ function settingsNote(text, cls) {
   n.textContent = text;
 }
 
+function showSettingsPanel(name) {
+  const nav = $("settings-nav");
+  for (const btn of nav.querySelectorAll("[data-panel]")) {
+    btn.setAttribute("aria-selected", btn.dataset.panel === name ? "true" : "false");
+  }
+  for (const panel of document.querySelectorAll(".settings-panel[data-panel]")) {
+    panel.hidden = panel.dataset.panel !== name;
+  }
+  if (name === "station" && locatorMap) {
+    requestAnimationFrame(() => locatorMap.invalidateSize());
+  }
+}
+
 function settingsBusy() {
   const form = $("settings-form");
   const ae = document.activeElement;
@@ -1670,21 +1959,39 @@ function showSettings(v, force) {
   const r = v.live.radio;
   $("r-enabled").checked = r.enabled;
   for (const k of radioText.concat(radioNumbers)) $("r-" + k).value = r[k];
-  $("radio-fields").hidden = !r.enabled;
+  setGroupEnabled("radio-fields", r.enabled);
   $("radio-note").textContent = v.radio_applies_now
     ? "Radio changes open the new link at once."
     : "Radio changes are saved and take a restart of the node.";
+  const relay = v.live.relay;
+  $("relay_enabled").checked = !!relay.enabled;
+  $("relay_mailbox").checked = !!relay.mailbox;
+  for (const k of relayNumbers) $("relay_" + k).value = relay[k];
   $("peers").replaceChildren(...v.live.peers.map(peerRow));
   const fixed = v.restart_to_change;
-  const rows = [["Internet", fixed.internet_listen ? "listening on " + fixed.internet_listen : "not listening"],
-    ["ARQ modem", fixed.modem || "none"],
-    ["Web page", fixed.http], ["Store", fixed.store], ["Saved to", v.file || "nowhere: changes last until restart"]];
+  $("f-internet_listen").value = fixed.internet_listen || "";
+  $("f-open_hub").checked = !!fixed.open_hub;
+  $("f-http").value = fixed.http || "";
+  $("f-store").value = fixed.store || "";
+  const modem = fixed.modem || {};
+  $("f-modem-enabled").checked = !!modem.enabled;
+  for (const k of modemText) $("f-modem-" + k).value = modem[k] || "";
+  for (const k of modemNumbers) $("f-modem-" + k).value = modem[k] ?? "";
+  setGroupEnabled("modem-fields", !!modem.enabled);
+  const meta = [];
+  if (v.file) meta.push("Saved to " + v.file);
+  else meta.push("No settings file — changes last until restart");
   if (v.overridden.length) {
-    rows.push(["For this run", "set on the command line: " + v.overridden.join(", ") + " (changes to these are saved, and used once the node runs without them)"]);
+    meta.push("Command-line overrides for this run: " + v.overridden.join(", "));
   }
-  const dl = $("fixed");
-  dl.replaceChildren();
-  for (const [k, val] of rows) dl.append(el("dt", null, k), el("dd", null, val));
+  $("settings-file-meta").textContent = meta.join(". ") + ".";
+  const foot = $("settings-meta");
+  foot.replaceChildren();
+  if (v.file) {
+    foot.append("Save writes ", el("strong", null, "all"), " sections to the settings file.");
+  } else {
+    foot.textContent = "Save keeps everything in memory until restart.";
+  }
 }
 
 async function loadSettings(force) {
@@ -1692,7 +1999,23 @@ async function loadSettings(force) {
   if (r.ok) showSettings(await r.json(), force);
 }
 
-$("r-enabled").addEventListener("change", (ev) => { $("radio-fields").hidden = !ev.target.checked; });
+$("settings-nav").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-panel]");
+  if (!btn || !btn.dataset.panel) return;
+  showSettingsPanel(btn.dataset.panel);
+});
+
+function setGroupEnabled(id, on) {
+  const root = $(id);
+  root.hidden = !on;
+  for (const el of root.querySelectorAll("input, select, textarea, button")) {
+    if (el.id === "add-peer") continue;
+    el.disabled = !on;
+  }
+}
+
+$("r-enabled").addEventListener("change", (ev) => { setGroupEnabled("radio-fields", ev.target.checked); });
+$("f-modem-enabled").addEventListener("change", (ev) => { setGroupEnabled("modem-fields", ev.target.checked); });
 
 $("add-peer").addEventListener("click", () => {
   const row = peerRow({ station: "", address: "" });
@@ -1755,21 +2078,56 @@ $("locator-gps").addEventListener("click", () => {
 
 $("settings-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
+  const form = ev.currentTarget;
+  const bad = [...form.elements].find((el) => el.willValidate && !el.disabled && !el.checkValidity());
+  if (bad) {
+    const panel = bad.closest(".settings-panel[data-panel]");
+    if (panel) showSettingsPanel(panel.dataset.panel);
+    bad.reportValidity();
+    return;
+  }
   const body = {};
   for (const k of liveFields) body[k] = Number($(k).value);
   body.locator = $("locator").value.trim();
   body.radio = { enabled: $("r-enabled").checked };
   for (const k of radioText) body.radio[k] = $("r-" + k).value.trim();
   for (const k of radioNumbers) body.radio[k] = Number($("r-" + k).value);
+  body.relay = {
+    enabled: $("relay_enabled").checked,
+    mailbox: $("relay_mailbox").checked,
+  };
+  for (const k of relayNumbers) body.relay[k] = Number($("relay_" + k).value);
   body.peers = [...document.querySelectorAll("#peers .peer")]
     .map((row) => { const [c, a] = row.querySelectorAll("input"); return { station: c.value.trim().toUpperCase(), address: a.value.trim() }; })
     .filter((p) => p.station || p.address);
+  body.restart_to_change = {
+    internet_listen: $("f-internet_listen").value.trim(),
+    open_hub: $("f-open_hub").checked,
+    http: $("f-http").value.trim(),
+    store: $("f-store").value.trim(),
+    modem: {
+      enabled: $("f-modem-enabled").checked,
+      kind: $("f-modem-kind").value.trim(),
+      host: $("f-modem-host").value.trim(),
+      port: Number($("f-modem-port").value),
+      bandwidth: Number($("f-modem-bandwidth").value),
+      ptt: $("f-modem-ptt").value.trim() || "none",
+    },
+  };
   const r = await api("/api/settings", Object.assign({ method: "PATCH" }, json(body)));
   const j = await r.json();
   if (r.ok) {
     document.activeElement.blur();
     showSettings(j, true);
-    settingsNote("In use now" + (settingsFile ? " and saved to " + settingsFile + "." : "; not saved, this node has no settings file."), "ok");
+    const restart = ["internet", "modem", "node"].includes(
+      document.querySelector(".settings-panel[data-panel]:not([hidden])")?.dataset.panel
+    );
+    settingsNote(
+      restart
+        ? "Saved" + (settingsFile ? " to " + settingsFile : "") + ". Restart the node for listen, modem, web address, or store changes."
+        : "Saved" + (settingsFile ? " to " + settingsFile : "") + ". Live settings are in use now.",
+      "ok"
+    );
   } else {
     settingsNote("Not changed: " + (j.error || r.statusText), "bad");
   }

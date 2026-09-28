@@ -110,6 +110,10 @@ impl Chooser {
         self.costs = costs;
     }
 
+    pub fn set_half_life(&mut self, half_life_secs: u64) {
+        self.half_life_secs = half_life_secs.max(1) as f64;
+    }
+
     pub fn new(costs: Costs, half_life_secs: u64, rng: DetRng) -> Chooser {
         Chooser {
             costs,

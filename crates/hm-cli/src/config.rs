@@ -150,6 +150,8 @@ pub struct RadioSettings {
     /// Built-in modem: "ax25", "il2p" (Reed–Solomon FEC; NinoTNC and Direwolf
     /// 1.7 decode it) or "auto" (IL2P to stations that say they decode it).
     pub framing: String,
+    /// Transfer-engine rounds before giving up a radio handoff.
+    pub max_rounds: u32,
     /// A signed beacon this often, in minutes; 0 for none.
     pub beacon_minutes: u64,
 }
@@ -168,6 +170,7 @@ impl Default for RadioSettings {
             txdelay_ms: 300,
             guard_ms: 1500,
             framing: "ax25".into(),
+            max_rounds: 12,
             beacon_minutes: 10,
         }
     }
@@ -180,7 +183,7 @@ impl RadioSettings {
             bitrate_bps: self.bitrate,
             txdelay_ms: self.txdelay_ms,
             guard_ms: self.guard_ms,
-            max_rounds: 12,
+            max_rounds: self.max_rounds.max(1).min(u32::from(u8::MAX)) as u8,
         }
     }
 
@@ -213,6 +216,9 @@ impl RadioSettings {
         crate::sound_link::Framing::parse(&self.framing).map_err(|e| format!("radio.{e}"))?;
         if self.ptt.trim().is_empty() {
             return Err("radio.ptt is empty (use \"vox\" for none)".into());
+        }
+        if self.max_rounds == 0 {
+            return Err("radio.max_rounds must be positive".into());
         }
         Ok(())
     }
@@ -327,6 +333,8 @@ pub struct DeliverySettings {
     pub custody_suspect_secs: u64,
     /// Retry budget for destination-signed end-to-end receipts.
     pub receipt_retry_attempts: u32,
+    /// Half-life of bearer success/failure evidence used by path selection.
+    pub evidence_half_life_secs: u64,
 }
 
 impl Default for DeliverySettings {
@@ -341,7 +349,38 @@ impl Default for DeliverySettings {
             custody_grace_secs: 6 * 3600,
             custody_suspect_secs: 24 * 3600,
             receipt_retry_attempts: 24,
+            evidence_half_life_secs: 3600,
         }
+    }
+}
+
+impl DeliverySettings {
+    pub fn check(&self) -> Result<(), String> {
+        for (name, cost) in [
+            ("radio_cost", self.radio_cost),
+            ("internet_cost", self.internet_cost),
+            ("modem_cost", self.modem_cost),
+        ] {
+            if !(cost.is_finite() && cost > 0.0) {
+                return Err(format!("delivery.{name} must be a positive number"));
+            }
+        }
+        if self.retry_first_secs == 0 || self.retry_max_secs == 0 || self.retry_attempts == 0 {
+            return Err("delivery retries need positive first/max delay and attempts".into());
+        }
+        if self.retry_max_secs < self.retry_first_secs {
+            return Err("delivery.retry_max_secs must be >= retry_first_secs".into());
+        }
+        if self.custody_grace_secs == 0 || self.custody_suspect_secs == 0 {
+            return Err("delivery custody_grace_secs and custody_suspect_secs must be positive".into());
+        }
+        if self.receipt_retry_attempts == 0 {
+            return Err("delivery.receipt_retry_attempts must be positive".into());
+        }
+        if self.evidence_half_life_secs == 0 {
+            return Err("delivery.evidence_half_life_secs must be positive".into());
+        }
+        Ok(())
     }
 }
 
@@ -379,7 +418,7 @@ impl Default for RelaySettings {
 }
 
 impl RelaySettings {
-    fn check(&self) -> Result<(), String> {
+    pub fn check(&self) -> Result<(), String> {
         if self.max_holdings == 0 || self.max_bytes == 0 {
             return Err("relay max_holdings and max_bytes must be positive".into());
         }
@@ -433,6 +472,7 @@ impl Config {
         c.locator()?;
         c.radio.check()?;
         c.modem.check()?;
+        c.delivery.check()?;
         c.relay.check()?;
         Ok(c)
     }
@@ -742,6 +782,9 @@ pub fn set_radio(path: &Path, old: &RadioSettings, new: &RadioSettings) -> io::R
     if old.framing != new.framing {
         put("framing", new.framing.as_str().into());
     }
+    if old.max_rounds != new.max_rounds {
+        put("max_rounds", i64::from(new.max_rounds).into());
+    }
     if old.persist != new.persist {
         put("persist", i64::from(new.persist).into());
     }
@@ -762,6 +805,76 @@ pub fn set_radio(path: &Path, old: &RadioSettings, new: &RadioSettings) -> io::R
                 t.remove("audio");
             }
         }
+    }
+    write_doc(path, &doc)
+}
+
+/// Replace changed `[relay]` keys, keeping comments on untouched ones.
+pub fn set_relay(path: &Path, old: &RelaySettings, new: &RelaySettings) -> io::Result<()> {
+    let mut doc = read_doc(path)?;
+    let t = table(&mut doc, "relay");
+    let mut put = |key: &str, v: toml_edit::Value| {
+        let mut v = v;
+        if let Some(o) = t.get(key).and_then(|i| i.as_value()) {
+            *v.decor_mut() = o.decor().clone();
+        }
+        t[key] = Item::Value(v);
+    };
+    if old.enabled != new.enabled {
+        put("enabled", new.enabled.into());
+    }
+    if old.mailbox != new.mailbox {
+        put("mailbox", new.mailbox.into());
+    }
+    if old.max_holdings != new.max_holdings {
+        put("max_holdings", (new.max_holdings as i64).into());
+    }
+    if old.max_bytes != new.max_bytes {
+        put("max_bytes", (new.max_bytes as i64).into());
+    }
+    if old.max_hops != new.max_hops {
+        put("max_hops", i64::from(new.max_hops).into());
+    }
+    if old.airtime_budget_secs != new.airtime_budget_secs {
+        put("airtime_budget_secs", (new.airtime_budget_secs as i64).into());
+    }
+    if old.urgent_min_gain != new.urgent_min_gain {
+        put("urgent_min_gain", new.urgent_min_gain.into());
+    }
+    if old.control_airtime_fraction != new.control_airtime_fraction {
+        put("control_airtime_fraction", new.control_airtime_fraction.into());
+    }
+    write_doc(path, &doc)
+}
+
+/// Replace changed `[modem]` keys, keeping comments on untouched ones.
+pub fn set_modem(path: &Path, old: &ModemSettings, new: &ModemSettings) -> io::Result<()> {
+    let mut doc = read_doc(path)?;
+    let t = table(&mut doc, "modem");
+    let mut put = |key: &str, v: toml_edit::Value| {
+        let mut v = v;
+        if let Some(o) = t.get(key).and_then(|i| i.as_value()) {
+            *v.decor_mut() = o.decor().clone();
+        }
+        t[key] = Item::Value(v);
+    };
+    if old.enabled != new.enabled {
+        put("enabled", new.enabled.into());
+    }
+    if old.kind != new.kind {
+        put("kind", new.kind.as_str().into());
+    }
+    if old.host != new.host {
+        put("host", new.host.as_str().into());
+    }
+    if old.port != new.port {
+        put("port", i64::from(new.port).into());
+    }
+    if old.bandwidth != new.bandwidth {
+        put("bandwidth", i64::from(new.bandwidth).into());
+    }
+    if old.ptt != new.ptt {
+        put("ptt", new.ptt.as_str().into());
     }
     write_doc(path, &doc)
 }
@@ -799,6 +912,7 @@ key = {key:?}
 # audio = "default"         the built-in modem on a sound card instead
 # ptt = "vox"               or "rts:/dev/ttyUSB0", "cm108:/dev/hidraw0"
 # framing = "ax25"          built-in modem: or "il2p" (far more robust in noise), "auto"
+# max_rounds = 12           radio handoff attempts before giving up
 [radio]
 beacon_minutes = 10         # 0 turns the beacon off
 
@@ -831,12 +945,19 @@ retry_attempts = 12
 custody_grace_secs = 21600
 custody_suspect_secs = 86400
 receipt_retry_attempts = 24
+# evidence_half_life_secs = 3600   bearer success/failure fade for path choice
 
 # Relaying is opt-in. `mailbox` holds traffic for intermittently connected
 # stations; `enabled` may forward it through another relay.
 [relay]
 enabled = false
 mailbox = false
+# max_holdings = 256
+# max_bytes = 16777216
+# max_hops = 8
+# airtime_budget_secs = 300
+# urgent_min_gain = 0.05
+# control_airtime_fraction = 0.02
 
 # Stations whose messages you can verify. The public core hub is trusted by
 # default. Add others with `hm trust add "CALL KEY"` or on the web page.

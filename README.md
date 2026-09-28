@@ -187,19 +187,21 @@ The node applies these at once, without a restart:
 
 - **Trusted stations**: add or remove them on the web page, with `hm trust add/remove`, or
   by editing `[[trust]]`. A station taken off the list loses its internet link at once.
-- **Delivery**: link costs and retry timing.
+- **Delivery**: link costs, retry timing, custody shadow/suspect timers, receipt attempts,
+  and evidence half-life for path choice.
+- **Relay / mailbox**: whether this node accepts multi-hop custody and holds mail.
 - **Internet peers**: which stations the node dials.
 - **Radio**: everything under `[radio]` (TNC or sound card, PTT, key-up delay, channel
-  access, turning the radio on or off). The node closes the old link and opens the new
-  one; mail on its way over the old link is retried on the new one.
+  access, `max_rounds`, turning the radio on or off). The node closes the old link and
+  opens the new one; mail on its way over the old link is retried on the new one.
 - **Beacon interval** and **grid locator**.
 
 Changes made on the web page are written to `station.toml`, keeping its comments and layout.
 The node also notices when the file is edited by hand, within a second or two. A file that
 does not parse is logged and ignored, and the node keeps the settings it was using. The
-internet listen address, the web address and the store are read at start-up; change them
-in the file and restart. Settings given on the command line stay in force for that run,
-even when the file changes; the web page lists them.
+internet listen address, open-hub flag, ARQ `[modem]`, web address and store take a restart;
+the settings page edits them too and saves them for the next start. Settings given on the
+command line stay in force for that run, even when the file changes; the web page lists them.
 
 ### The web page
 
@@ -226,7 +228,8 @@ The page has five views:
   the outbound queue (queued / in transit), stations heard on the radio (beacons,
   clock offset, offers, locators, distance and bearing), and trusted stations you can
   add or remove.
-- **Settings**: everything the node applies without a restart.
+- **Settings**: live knobs (delivery, relay, radio, peers, locator) plus restart-bound ones
+  (listen, open hub, modem, web address, store).
 
 The page stays up to date by itself: the node tells it what changed over a server-sent
 event stream (`/api/events`). A chat line between two stations linked over the internet
@@ -558,7 +561,7 @@ with a radio.
 | POST | `/api/trust` | `{"line": "SO5KM-1 8a1e…", "note"?}` (as `hm whoami` prints it) → `201` |
 | DELETE | `/api/trust/{station}` | stop trusting a station → `204` |
 | GET | `/api/settings` | the settings in use: `live` ones, and those that take a restart |
-| PATCH | `/api/settings` | any of `beacon_minutes`, `radio_cost`, `internet_cost`, `modem_cost`, `retry_first_secs`, `retry_max_secs`, `retry_attempts`, `peers` (`[{"station", "address"}]`), `locator` (`""` for none), `radio` (any `[radio]` fields) → the new settings; saved to `station.toml` |
+| PATCH | `/api/settings` | any live fields: `beacon_minutes`, delivery costs/retries/`custody_*`/`receipt_retry_attempts`/`evidence_half_life_secs`, `relay` (`enabled`, `mailbox`, limits…), `peers`, `locator` (`""` for none), `radio` (any `[radio]` fields including `max_rounds`); optional `restart_to_change` (`internet_listen`, `open_hub`, `modem`, `http`, `store`) saved for the next start → the new settings; written to `station.toml` |
 
 Every `/api` request needs `Authorization: Bearer <token>`. The API is plain HTTP and
 listens on localhost by default; to use the web interface from another machine, put it
