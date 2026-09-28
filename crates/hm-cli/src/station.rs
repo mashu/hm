@@ -177,6 +177,7 @@ impl Station<'_> {
 }
 
 /// Seal a text message from `me` to one station. A subject makes it mail; otherwise chat.
+/// `seq` is the directed conversation sequence for chat (ignored for mail).
 pub fn build_bundle(
     key: &KeyFile,
     me: Callsign,
@@ -184,6 +185,7 @@ pub fn build_bundle(
     text: &str,
     subject: Option<&str>,
     prec: Precedence,
+    seq: Option<u64>,
 ) -> Result<SignedBundle, BundleError> {
     let (kind, ttl) = match subject {
         Some(_) => (Kind::Mail, MAIL_TTL),
@@ -195,6 +197,11 @@ pub fn build_bundle(
         .with_precedence(prec);
     if let Some(subject) = subject {
         bundle = bundle.with_subject(subject);
+    }
+    if kind == Kind::Chat {
+        if let Some(seq) = seq {
+            bundle = bundle.with_seq(seq);
+        }
     }
     bundle.seal(&key.identity)
 }
@@ -327,9 +334,11 @@ mod tests {
             "73",
             None,
             Precedence::Routine,
+            Some(1),
         )
         .unwrap();
         assert_eq!(chat.bundle().kind, Kind::Chat);
+        assert_eq!(chat.bundle().seq, Some(1));
         let mail = build_bundle(
             &alice,
             call("SA0KAM"),
@@ -337,9 +346,11 @@ mod tests {
             "sked",
             Some("40m"),
             Precedence::Priority,
+            None,
         )
         .unwrap();
         assert_eq!(mail.bundle().kind, Kind::Mail);
+        assert!(mail.bundle().seq.is_none());
 
         let wire = chat.to_vec();
         let unknown = open_message(call("SA0KAM"), &wire, &Trust::default(), None);

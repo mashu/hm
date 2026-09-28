@@ -122,6 +122,11 @@ pub(crate) fn accept(
             return Acceptance::Rejected(error.to_string());
         }
     }
+    if bundle.kind == Kind::CustodyFail {
+        if let Err(error) = bundle.validate_custody_fail() {
+            return Acceptance::Rejected(error.to_string());
+        }
+    }
     // Bulletins are group-addressed RF posts: store locally, never receipt, never relay.
     let bulletin_group = bundle.to.iter().find_map(|address| match address {
         Address::Group(name) => Some(name.as_str()),
@@ -201,6 +206,7 @@ pub(crate) fn accept(
             visited,
             max_hops,
             expires_at: bundle.expires_at(),
+            wire_seq: bundle.seq,
         };
         return match store.enqueue_relay(m.id, inner, metadata, now) {
             Ok(true) => {
@@ -213,6 +219,50 @@ pub(crate) fn accept(
             }
             Ok(false) => Acceptance::Duplicate,
             Err(error) => Acceptance::Rejected(format!("store: {error}")),
+        };
+    }
+    if bundle.kind == Kind::CustodyFail {
+        let stored = match store.put_received(m.id, inner, via, verified, now) {
+            Ok(stored) => stored,
+            Err(error) => return Acceptance::Rejected(format!("store: {error}")),
+        };
+        if verified {
+            if let Some(holding) = bundle.reply_to {
+                let reason = bundle
+                    .body
+                    .as_ref()
+                    .and_then(|body| body.as_text().ok())
+                    .map(|text| text.into_owned())
+                    .unwrap_or_else(|| "custody failed downstream".into());
+                match store.apply_custody_fail(holding, bundle.from, now, &reason) {
+                    Ok(hm_store::ReclaimOutcome::Requeued) => log(format!(
+                        "reclaimed {} after custody-fail from {}",
+                        short(&holding),
+                        bundle.from
+                    )),
+                    Ok(hm_store::ReclaimOutcome::DeliveredUnconfirmed) => log(format!(
+                        "{} marked delivered-unconfirmed after custody-fail from {}",
+                        short(&holding),
+                        bundle.from
+                    )),
+                    Ok(hm_store::ReclaimOutcome::Failed) => log(format!(
+                        "{} failed after custody-fail from {}",
+                        short(&holding),
+                        bundle.from
+                    )),
+                    Ok(hm_store::ReclaimOutcome::Ignored) => {}
+                    Err(error) => log(format!(
+                        "could not apply custody-fail {}: {error}",
+                        short(&m.id)
+                    )),
+                }
+            }
+        }
+        notify.send("message");
+        return if stored {
+            Acceptance::Stored
+        } else {
+            Acceptance::Duplicate
         };
     }
     if bundle.kind == Kind::Receipt {
@@ -243,7 +293,7 @@ pub(crate) fn accept(
     // Unverified final deliveries are stored but not acknowledged: a receipt
     // would be locally originated and could consume RF for an unauthorized party.
     if !verified {
-        return match store.put_received(m.id, inner, via, false, now) {
+        return match store.put_received_with(m.id, inner, via, false, now, bundle.seq) {
             Ok(true) => {
                 log(format!(
                     "received {} from {} via {via} (unverified; no receipt)",
@@ -262,6 +312,8 @@ pub(crate) fn accept(
         .saturating_sub(now)
         .max(24 * 3600)
         .min(u64::from(u32::MAX)) as u32;
+    // Receipts are critical control traffic: at least Priority so they outrank routine chat.
+    let receipt_prec = bundle.precedence().rank().max(1);
     let receipt = match Bundle::receipt(
         our_recipient.expect("checked above"),
         bundle.from,
@@ -269,7 +321,7 @@ pub(crate) fn accept(
         now,
         receipt_ttl,
     )
-    .with_precedence(bundle.precedence())
+    .with_precedence(hm_bundle::Precedence::from_u8(receipt_prec))
     .with_max_hops(bundle.max_hops())
     .seal(identity)
     {
@@ -282,12 +334,13 @@ pub(crate) fn accept(
         object: inner,
         from: via,
         verified: true,
+        wire_seq: bundle.seq,
     };
     let reply = QueuedMessage {
         id: receipt.id(),
         object: &receipt_bytes,
         to: bundle.from,
-        precedence: bundle.precedence().rank(),
+        precedence: receipt_prec,
         expires_at: now.saturating_add(u64::from(receipt_ttl)),
         max_hops: bundle.max_hops(),
     };

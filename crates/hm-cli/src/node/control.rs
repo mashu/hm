@@ -346,13 +346,17 @@ impl ControlPlane {
         from: Callsign,
         payload: &[u8],
         trust: &Trust,
+        // Transport-authenticated key for `from` (QUIC session on an open hub).
+        peer_key: Option<PublicKey>,
         local: (Callsign, PublicKey),
         store: &Store,
         graph: &mut ContactGraph,
         accept_relay: bool,
         now: u64,
     ) -> Result<Vec<ControlAction>, String> {
-        if trust.key_for(from).is_none() {
+        // RF SYNC still needs a trust entry. Internet open-hub dialers are
+        // authenticated by their QUIC certificate (`peer_key`) instead.
+        if trust.key_for(from).is_none() && peer_key.is_none() {
             return Err(format!("untrusted SYNC peer {from}"));
         }
         self.prune_pairwise(now);
@@ -360,10 +364,12 @@ impl ControlPlane {
             SyncMessage::Contact(advert) => {
                 let key = if advert.origin == local.0 {
                     local.1
+                } else if let Some(key) = trust.key_for(advert.origin) {
+                    key
+                } else if advert.origin == from {
+                    peer_key.ok_or_else(|| format!("untrusted CONTACT origin {}", advert.origin))?
                 } else {
-                    trust
-                        .key_for(advert.origin)
-                        .ok_or_else(|| format!("untrusted CONTACT origin {}", advert.origin))?
+                    return Err(format!("untrusted CONTACT origin {}", advert.origin));
                 };
                 if !verify_contact(&advert, key) {
                     return Err(format!("bad CONTACT signature from {}", advert.origin));
@@ -608,6 +614,7 @@ mod tests {
                 b,
                 &filter,
                 &a_trust,
+                None,
                 (a, a_key.public()),
                 &a_store,
                 &mut a_graph,
@@ -625,6 +632,7 @@ mod tests {
                 a,
                 &offer,
                 &b_trust,
+                None,
                 (b, b_key.public()),
                 &b_store,
                 &mut b_graph,
@@ -643,6 +651,7 @@ mod tests {
                     b,
                     &want,
                     &a_trust,
+                    None,
                     (a, a_key.public()),
                     &a_store,
                     &mut a_graph,
@@ -653,5 +662,49 @@ mod tests {
             vec![ControlAction::Requested { id, peer: b }]
         );
         assert_eq!(a_plane.target_for(id, 20), Some(b));
+    }
+
+    #[test]
+    fn open_hub_accepts_sync_from_transport_authenticated_peer() {
+        let (hub, home) = (call("SA0KAM-0"), call("SA0KAM-1"));
+        let home_key = Identity::from_secret([3; 32]);
+        let empty = Trust::default();
+        let db = TempDb::new("hub-open");
+        let store = Store::open(&db.0).unwrap();
+        let mut plane = ControlPlane::default();
+        let mut graph = ContactGraph::new(Default::default()).unwrap();
+        let filter = ControlPlane::default()
+            .filters(hub, &store, false, 20)
+            .unwrap()
+            .remove(0);
+        assert!(plane
+            .receive(
+                home,
+                &filter,
+                &empty,
+                None,
+                (hub, Identity::from_secret([1; 32]).public()),
+                &store,
+                &mut graph,
+                true,
+                20,
+            )
+            .unwrap_err()
+            .contains("untrusted SYNC peer"));
+        let actions = plane
+            .receive(
+                home,
+                &filter,
+                &empty,
+                Some(home_key.public()),
+                (hub, Identity::from_secret([1; 32]).public()),
+                &store,
+                &mut graph,
+                true,
+                20,
+            )
+            .unwrap();
+        // Empty store → no offers; admission itself is the assertion.
+        assert!(actions.is_empty() || actions.iter().any(|a| matches!(a, ControlAction::Reply(_))));
     }
 }

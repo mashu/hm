@@ -179,6 +179,29 @@ fn receipt_and_precedence_helpers() {
 }
 
 #[test]
+fn custody_fail_and_chat_seq() {
+    let holding = chat().seal(&me()).unwrap();
+    let fail = Bundle::custody_fail(
+        call("SO5KM"),
+        call("SA0KAM"),
+        holding.id(),
+        "abandoned",
+        1_790_000_060,
+        86_400,
+    );
+    assert_eq!(fail.kind, Kind::CustodyFail);
+    assert_eq!(fail.reply_to, Some(holding.id()));
+    assert!(fail.clone().seal(&Identity::from_secret([9; 32])).is_ok());
+    let mut with_seq = fail.clone();
+    with_seq.seq = Some(1);
+    assert!(with_seq.seal(&Identity::from_secret([9; 32])).is_err());
+
+    let sequenced = chat().with_seq(3).seal(&me()).unwrap();
+    assert_eq!(sequenced.bundle().seq, Some(3));
+    assert!(chat().with_seq(0).seal(&me()).is_err());
+}
+
+#[test]
 fn expiry() {
     let b = chat();
     assert!(!b.is_expired(1_790_000_000 + 3599));

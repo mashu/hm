@@ -163,6 +163,13 @@ fn start_routed(s: Setup, relay: RelaySettings, schedules: Vec<ScheduledContact>
             notes: vec![],
             costs: Costs::default(),
             retry: s.retry,
+            receipt_retry: RetryPolicy {
+                first_delay_secs: s.retry.first_delay_secs,
+                max_delay_secs: s.retry.max_delay_secs,
+                max_attempts: s.retry.max_attempts.saturating_mul(2).max(24),
+            },
+            custody_grace_secs: 6 * 3600,
+            custody_suspect_secs: 24 * 3600,
             beacon_secs: s.beacon_every.map_or(0, |d| d.as_secs()),
             peers,
             locator: Locator::parse("JO89xi").ok(),

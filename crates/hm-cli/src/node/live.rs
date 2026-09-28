@@ -23,6 +23,9 @@ pub struct Live {
     pub notes: Vec<(Callsign, String)>,
     pub costs: Costs,
     pub retry: RetryPolicy,
+    pub receipt_retry: RetryPolicy,
+    pub custody_grace_secs: u64,
+    pub custody_suspect_secs: u64,
     /// Seconds between beacons; 0 sends none. (Minutes in station.toml.)
     pub beacon_secs: u64,
     pub peers: Vec<(Callsign, String)>,
@@ -52,6 +55,13 @@ impl Live {
                 max_delay_secs: c.delivery.retry_max_secs,
                 max_attempts: c.delivery.retry_attempts,
             },
+            receipt_retry: RetryPolicy {
+                first_delay_secs: c.delivery.retry_first_secs,
+                max_delay_secs: c.delivery.retry_max_secs,
+                max_attempts: c.delivery.receipt_retry_attempts,
+            },
+            custody_grace_secs: c.delivery.custody_grace_secs,
+            custody_suspect_secs: c.delivery.custody_suspect_secs,
             beacon_secs: c.radio.beacon_minutes.saturating_mul(60),
             peers: c.peers()?,
             locator: c.locator()?,

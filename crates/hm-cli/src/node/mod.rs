@@ -261,6 +261,7 @@ mod tests {
             "relay policy",
             None,
             Precedence::Routine,
+            Some(1),
         )
         .unwrap()
         .to_vec();
@@ -316,7 +317,15 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = Store::open(&path).unwrap();
         let notify = Notify::new();
-        let bundle = build_bundle(&sender, sender.call, me.call, "hello", None, Precedence::Routine)
+        let bundle = build_bundle(
+            &sender,
+            sender.call,
+            me.call,
+            "hello",
+            None,
+            Precedence::Routine,
+            Some(1),
+        )
             .unwrap()
             .to_vec();
         let trust = Trust::default();

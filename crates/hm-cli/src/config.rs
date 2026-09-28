@@ -321,6 +321,12 @@ pub struct DeliverySettings {
     pub retry_max_secs: u64,
     /// Give up after this many attempts.
     pub retry_attempts: u32,
+    /// Retain a shadow copy after hop handoff for holdings pull / reclaim.
+    pub custody_grace_secs: u64,
+    /// Reclaim in-transit custody when no e2e receipt arrives within this time.
+    pub custody_suspect_secs: u64,
+    /// Retry budget for destination-signed end-to-end receipts.
+    pub receipt_retry_attempts: u32,
 }
 
 impl Default for DeliverySettings {
@@ -332,6 +338,9 @@ impl Default for DeliverySettings {
             retry_first_secs: 60,
             retry_max_secs: 3600,
             retry_attempts: 12,
+            custody_grace_secs: 6 * 3600,
+            custody_suspect_secs: 24 * 3600,
+            receipt_retry_attempts: 24,
         }
     }
 }
@@ -811,6 +820,7 @@ address = "{hub_addr}"
 
 # The cheaper way that reaches a station is tried first; a failed delivery
 # is retried after first_secs, doubling up to max_secs, attempts times.
+# After a hop handoff, shadow retain and suspect reclaim apply.
 [delivery]
 radio_cost = 1.0
 internet_cost = 2.0
@@ -818,6 +828,9 @@ modem_cost = 1.5
 retry_first_secs = 60
 retry_max_secs = 3600
 retry_attempts = 12
+custody_grace_secs = 21600
+custody_suspect_secs = 86400
+receipt_retry_attempts = 24
 
 # Relaying is opt-in. `mailbox` holds traffic for intermittently connected
 # stations; `enabled` may forward it through another relay.

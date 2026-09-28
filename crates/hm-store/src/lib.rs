@@ -6,8 +6,12 @@
 //!   first, then oldest, each with its next attempt time.
 //!
 //! Every operation is one write transaction, so a crash leaves either the
-//! old state or the new one. A bundle is stored once however often it
-//! arrives, which is what makes delivery exactly-once across restarts.
+//! old state or the new one. A bundle is stored at most once by content id
+//! (local at-most-once). Hop transfer is at-least-once while `Queued`; after
+//! a verified handoff the prior custodian may reclaim via shadow grace,
+//! suspect timer, or a custody-fail notice. End-to-end `Delivered` requires
+//! the destination receipt (otherwise eventually `DeliveredUnconfirmed` or
+//! `Failed`).
 
 use std::path::Path;
 
@@ -24,6 +28,8 @@ const BY_TIME: TableDefinition<(u8, u64, u64, [u8; 32]), ()> = TableDefinition::
 const QUEUE: TableDefinition<(u8, u64, [u8; 32]), ()> = TableDefinition::new("queue");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const CONTACT_EVIDENCE: TableDefinition<[u8; 16], &[u8]> = TableDefinition::new("contact_evidence");
+/// Per-peer outbound chat sequence (callsign bytes → last assigned seq).
+const PEER_SEQ: TableDefinition<[u8; 6], u64> = TableDefinition::new("peer_seq");
 
 #[derive(Debug)]
 pub enum Error {
@@ -103,6 +109,10 @@ pub enum State {
     /// Removed from the local queue by the operator.
     #[n(6)]
     Cancelled,
+    /// Hop custody was transferred but no destination receipt returned; delivery
+    /// may have succeeded.
+    #[n(7)]
+    DeliveredUnconfirmed,
 }
 
 /// What the store knows about one message.
@@ -172,6 +182,12 @@ pub struct Record {
     /// Handoffs currently queued or in flight.
     #[n(22)]
     pub next_hops: Option<Vec<Callsign>>,
+    /// Retain bytes / advertise holdings until this Unix second after handoff.
+    #[n(23)]
+    pub shadow_until: Option<u64>,
+    /// Sender-assigned conversation sequence from the wire bundle (chat).
+    #[n(24)]
+    pub wire_seq: Option<u64>,
 }
 
 impl Record {
@@ -185,6 +201,12 @@ impl Record {
 
     pub fn is_active_holding(&self) -> bool {
         self.state == State::Queued
+            || (self.state == State::InTransit
+                && self.shadow_until.is_some_and(|until| until > 0))
+    }
+
+    pub fn in_shadow(&self, now: u64) -> bool {
+        self.state == State::InTransit && self.shadow_until.is_some_and(|until| until > now)
     }
 }
 
@@ -209,6 +231,7 @@ pub struct RelayMetadata<'a> {
     pub visited: &'a [Callsign],
     pub max_hops: u8,
     pub expires_at: u64,
+    pub wire_seq: Option<u64>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -217,6 +240,7 @@ pub struct ReceivedMessage<'a> {
     pub object: &'a [u8],
     pub from: Callsign,
     pub verified: bool,
+    pub wire_seq: Option<u64>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -227,6 +251,25 @@ pub struct QueuedMessage<'a> {
     pub precedence: u8,
     pub expires_at: u64,
     pub max_hops: u8,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct EnqueueOpts {
+    pub to: Callsign,
+    pub precedence: u8,
+    pub now: u64,
+    pub wire_seq: Option<u64>,
+    pub expires_at: Option<u64>,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct CustodyHandoff<'a> {
+    pub next_hop: Callsign,
+    pub receipt_verified: bool,
+    pub by: &'a str,
+    pub now: u64,
+    pub grace_secs: u64,
+    pub suspect_secs: u64,
 }
 
 impl AdmissionLimits {
@@ -269,6 +312,19 @@ pub enum Retry {
     At(u64),
     GaveUp,
     Inactive,
+}
+
+/// Outcome of trying to reclaim or close an in-transit holding.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ReclaimOutcome {
+    /// Back on the delivery queue.
+    Requeued,
+    /// Origin had handed off; destination receipt never arrived.
+    DeliveredUnconfirmed,
+    /// Relay (or expired origin) gave up.
+    Failed,
+    /// Not applicable (wrong state / already terminal).
+    Ignored,
 }
 
 /// Result of an operator asking to remove one locally stored message.
@@ -401,6 +457,7 @@ impl Store {
             tx.open_table(QUEUE)?;
             tx.open_table(META)?;
             tx.open_table(CONTACT_EVIDENCE)?;
+            tx.open_table(PEER_SEQ)?;
         }
         tx.commit()?;
         Ok(Store {
@@ -437,6 +494,36 @@ impl Store {
         Ok(seq)
     }
 
+    fn blank_record(id: ObjectId, direction: Direction, peer: Callsign, now: u64, seq: u64) -> Record {
+        Record {
+            id,
+            direction,
+            peer,
+            at: now,
+            state: State::Unread,
+            precedence: 0,
+            attempts: 0,
+            next_attempt: 0,
+            verified: false,
+            seq,
+            note: None,
+            by: None,
+            final_peer: None,
+            next_hop: None,
+            hop_count: None,
+            visited: None,
+            custody_by: None,
+            e2e_receipt: None,
+            expires_at: None,
+            custody_from: None,
+            max_hops: None,
+            custody_copies: None,
+            next_hops: None,
+            shadow_until: None,
+            wire_seq: None,
+        }
+    }
+
     /// Store a received bundle. Returns false, changing nothing, if this bundle
     /// is already stored (inbound or outbound).
     pub fn put_received(
@@ -447,6 +534,18 @@ impl Store {
         verified: bool,
         now: u64,
     ) -> Result<bool> {
+        self.put_received_with(id, object, from, verified, now, None)
+    }
+
+    pub fn put_received_with(
+        &self,
+        id: ObjectId,
+        object: &[u8],
+        from: Callsign,
+        verified: bool,
+        now: u64,
+        wire_seq: Option<u64>,
+    ) -> Result<bool> {
         let tx = self.write_tx()?;
         {
             let mut messages = tx.open_table(MESSAGES)?;
@@ -454,31 +553,10 @@ impl Store {
                 return Ok(false); // dropping the transaction aborts it
             }
             let seq = Store::next_seq(&mut tx.open_table(META)?)?;
-            let r = Record {
-                id,
-                direction: Direction::In,
-                peer: from,
-                at: now,
-                state: State::Unread,
-                precedence: 0,
-                attempts: 0,
-                next_attempt: 0,
-                verified,
-                seq,
-                note: None,
-                by: None,
-                final_peer: None,
-                next_hop: None,
-                hop_count: None,
-                visited: None,
-                custody_by: None,
-                e2e_receipt: None,
-                expires_at: None,
-                custody_from: None,
-                max_hops: None,
-                custody_copies: None,
-                next_hops: None,
-            };
+            let mut r = Store::blank_record(id, Direction::In, from, now, seq);
+            r.state = State::Unread;
+            r.verified = verified;
+            r.wire_seq = wire_seq;
             tx.open_table(OBJECTS)?.insert(id.0, object)?;
             messages.insert(id.0, encode(&r).as_slice())?;
             tx.open_table(BY_TIME)?.insert((0u8, now, seq, id.0), ())?;
@@ -504,31 +582,16 @@ impl Store {
             inserted = messages.get(received.id.0)?.is_none();
             if inserted {
                 let seq = Store::next_seq(&mut tx.open_table(META)?)?;
-                let record = Record {
-                    id: received.id,
-                    direction: Direction::In,
-                    peer: received.from,
-                    at: now,
-                    state: State::Unread,
-                    precedence: 0,
-                    attempts: 0,
-                    next_attempt: 0,
-                    verified: received.verified,
+                let mut record = Store::blank_record(
+                    received.id,
+                    Direction::In,
+                    received.from,
+                    now,
                     seq,
-                    note: None,
-                    by: None,
-                    final_peer: None,
-                    next_hop: None,
-                    hop_count: None,
-                    visited: None,
-                    custody_by: None,
-                    e2e_receipt: None,
-                    expires_at: None,
-                    custody_from: None,
-                    max_hops: None,
-                    custody_copies: None,
-                    next_hops: None,
-                };
+                );
+                record.state = State::Unread;
+                record.verified = received.verified;
+                record.wire_seq = received.wire_seq;
                 tx.open_table(OBJECTS)?.insert(received.id.0, received.object)?;
                 messages.insert(received.id.0, encode(&record).as_slice())?;
                 tx.open_table(BY_TIME)?
@@ -536,31 +599,15 @@ impl Store {
             }
             if messages.get(reply.id.0)?.is_none() {
                 let seq = Store::next_seq(&mut tx.open_table(META)?)?;
-                let record = Record {
-                    id: reply.id,
-                    direction: Direction::Out,
-                    peer: reply.to,
-                    at: now,
-                    state: State::Queued,
-                    precedence: reply.precedence,
-                    attempts: 0,
-                    next_attempt: now,
-                    verified: false,
-                    seq,
-                    note: None,
-                    by: None,
-                    final_peer: Some(reply.to),
-                    next_hop: Some(reply.to),
-                    hop_count: Some(0),
-                    visited: None,
-                    custody_by: None,
-                    e2e_receipt: None,
-                    expires_at: Some(reply.expires_at),
-                    custody_from: None,
-                    max_hops: Some(reply.max_hops),
-                    custody_copies: None,
-                    next_hops: None,
-                };
+                let mut record = Store::blank_record(reply.id, Direction::Out, reply.to, now, seq);
+                record.state = State::Queued;
+                record.precedence = reply.precedence;
+                record.next_attempt = now;
+                record.final_peer = Some(reply.to);
+                record.next_hop = Some(reply.to);
+                record.hop_count = Some(0);
+                record.expires_at = Some(reply.expires_at);
+                record.max_hops = Some(reply.max_hops);
                 tx.open_table(OBJECTS)?.insert(reply.id.0, reply.object)?;
                 messages.insert(reply.id.0, encode(&record).as_slice())?;
                 tx.open_table(BY_TIME)?.insert((1_u8, now, seq, reply.id.0), ())?;
@@ -581,6 +628,28 @@ impl Store {
         precedence: u8,
         now: u64,
     ) -> Result<bool> {
+        self.enqueue_with(
+            id,
+            object,
+            EnqueueOpts {
+                to,
+                precedence,
+                now,
+                wire_seq: None,
+                expires_at: None,
+            },
+        )
+    }
+
+    /// Queue a bundle with optional wire conversation sequence and expiry.
+    pub fn enqueue_with(&self, id: ObjectId, object: &[u8], opts: EnqueueOpts) -> Result<bool> {
+        let EnqueueOpts {
+            to,
+            precedence,
+            now,
+            wire_seq,
+            expires_at,
+        } = opts;
         let tx = self.write_tx()?;
         {
             let mut messages = tx.open_table(MESSAGES)?;
@@ -588,31 +657,15 @@ impl Store {
                 return Ok(false);
             }
             let seq = Store::next_seq(&mut tx.open_table(META)?)?;
-            let r = Record {
-                id,
-                direction: Direction::Out,
-                peer: to,
-                at: now,
-                state: State::Queued,
-                precedence,
-                attempts: 0,
-                next_attempt: now,
-                verified: false,
-                seq,
-                note: None,
-                by: None,
-                final_peer: Some(to),
-                next_hop: Some(to),
-                hop_count: Some(0),
-                visited: None,
-                custody_by: None,
-                e2e_receipt: None,
-                expires_at: None,
-                custody_from: None,
-                max_hops: None,
-                custody_copies: None,
-                next_hops: None,
-            };
+            let mut r = Store::blank_record(id, Direction::Out, to, now, seq);
+            r.state = State::Queued;
+            r.precedence = precedence;
+            r.next_attempt = now;
+            r.final_peer = Some(to);
+            r.next_hop = Some(to);
+            r.hop_count = Some(0);
+            r.wire_seq = wire_seq;
+            r.expires_at = expires_at;
             tx.open_table(OBJECTS)?.insert(id.0, object)?;
             messages.insert(id.0, encode(&r).as_slice())?;
             tx.open_table(BY_TIME)?.insert((1u8, now, seq, id.0), ())?;
@@ -650,31 +703,18 @@ impl Store {
                 return Ok(false);
             }
             let seq = Store::next_seq(&mut tx.open_table(META)?)?;
-            let r = Record {
-                id,
-                direction: Direction::Relay,
-                peer: metadata.destination,
-                at: now,
-                state: State::Queued,
-                precedence: metadata.precedence,
-                attempts: 0,
-                next_attempt: now,
-                verified: true,
-                seq,
-                note: None,
-                by: None,
-                final_peer: Some(metadata.destination),
-                next_hop: None,
-                hop_count: Some(metadata.hop_count),
-                visited: (!metadata.visited.is_empty()).then(|| metadata.visited.to_vec()),
-                custody_by: None,
-                e2e_receipt: None,
-                expires_at: Some(metadata.expires_at),
-                custody_from: Some(metadata.custody_from),
-                max_hops: Some(metadata.max_hops),
-                custody_copies: None,
-                next_hops: None,
-            };
+            let mut r = Store::blank_record(id, Direction::Relay, metadata.destination, now, seq);
+            r.state = State::Queued;
+            r.precedence = metadata.precedence;
+            r.next_attempt = now;
+            r.verified = true;
+            r.final_peer = Some(metadata.destination);
+            r.hop_count = Some(metadata.hop_count);
+            r.visited = (!metadata.visited.is_empty()).then(|| metadata.visited.to_vec());
+            r.expires_at = Some(metadata.expires_at);
+            r.custody_from = Some(metadata.custody_from);
+            r.max_hops = Some(metadata.max_hops);
+            r.wire_seq = metadata.wire_seq;
             tx.open_table(OBJECTS)?.insert(id.0, object)?;
             messages.insert(id.0, encode(&r).as_slice())?;
             tx.open_table(BY_TIME)?.insert((2u8, now, seq, id.0), ())?;
@@ -744,32 +784,51 @@ impl Store {
     }
 
     /// An attempt failed; schedule the next one or give up.
-    pub fn attempt_failed(&self, id: ObjectId, reason: &str, policy: RetryPolicy, now: u64) -> Result<Retry> {
+    /// On `GaveUp` for a relay holding, `custody_fail_to` is the prior custodian.
+    pub fn attempt_failed(
+        &self,
+        id: ObjectId,
+        reason: &str,
+        policy: RetryPolicy,
+        now: u64,
+    ) -> Result<(Retry, Option<Callsign>)> {
         self.update(id, |r| {
             if r.state != State::Queued {
-                return Retry::Inactive;
+                return (Retry::Inactive, None);
             }
             r.attempts += 1;
             r.note = Some(reason.to_string());
             if r.attempts >= policy.max_attempts {
                 r.state = State::Failed;
-                Retry::GaveUp
+                let notify = if r.direction == Direction::Relay {
+                    r.custody_from
+                } else {
+                    None
+                };
+                (Retry::GaveUp, notify)
             } else {
                 r.next_attempt = now + policy.delay_after(r.attempts);
-                Retry::At(r.next_attempt)
+                (Retry::At(r.next_attempt), None)
             }
         })
     }
 
     /// Give up on an outbound message at once (a failure no retry can fix).
-    pub fn abandon(&self, id: ObjectId, reason: &str) -> Result<()> {
+    /// Returns the prior custodian to notify with a custody-fail when this was
+    /// a relay holding.
+    pub fn abandon(&self, id: ObjectId, reason: &str) -> Result<Option<Callsign>> {
         self.update(id, |r| {
             if r.state != State::Queued {
-                return;
+                return None;
             }
             r.attempts += 1;
             r.state = State::Failed;
             r.note = Some(reason.to_string());
+            if r.direction == Direction::Relay {
+                r.custody_from
+            } else {
+                None
+            }
         })
     }
 
@@ -807,17 +866,21 @@ impl Store {
 
     /// A verified transfer receipt proves durable custody at `next_hop`.
     /// Unverified receipts MUST NOT transfer custody.
-    pub fn custody_transferred(
-        &self,
-        id: ObjectId,
-        next_hop: Callsign,
-        receipt_verified: bool,
-        by: &str,
-        now: u64,
-    ) -> Result<bool> {
-        if !receipt_verified {
+    ///
+    /// After handoff, a shadow copy is retained for holdings pull and a suspect
+    /// timer schedules reclaim if no end-to-end receipt arrives.
+    pub fn custody_transferred(&self, id: ObjectId, handoff: CustodyHandoff<'_>) -> Result<bool> {
+        if !handoff.receipt_verified {
             return Ok(false);
         }
+        let CustodyHandoff {
+            next_hop,
+            receipt_verified,
+            by,
+            now,
+            grace_secs,
+            suspect_secs,
+        } = handoff;
         self.update(id, |r| {
             if !matches!(r.state, State::Queued | State::InTransit)
                 || !r
@@ -847,11 +910,127 @@ impl Store {
             r.custody_by = Some(next_hop);
             r.next_hop = r.next_hops.as_ref().and_then(|hops| hops.first().copied());
             r.attempts += 1;
-            r.next_attempt = now;
+            let mut suspect_at = now.saturating_add(suspect_secs.max(1));
+            if let Some(expires) = r.expires_at {
+                suspect_at = suspect_at.min(expires);
+            }
+            r.next_attempt = suspect_at;
+            r.shadow_until = Some(now.saturating_add(grace_secs.max(1)));
             r.note = None;
             r.by = Some(by.to_string());
             true
         })
+    }
+
+    /// In-transit records whose suspect timer has fired.
+    pub fn suspect_due(&self, now: u64) -> Result<Vec<Record>> {
+        let tx = self.read_tx()?;
+        let messages = tx.open_table(MESSAGES)?;
+        let mut out = Vec::new();
+        for entry in messages.iter()? {
+            let (_, bytes) = entry?;
+            let record = decode(bytes.value())?;
+            if record.state == State::InTransit
+                && matches!(record.direction, Direction::Out | Direction::Relay)
+                && record.next_attempt <= now
+            {
+                out.push(record);
+            }
+        }
+        out.sort_by_key(|r| (r.next_attempt, r.seq));
+        Ok(out)
+    }
+
+    /// Outcome of trying to reclaim or close an in-transit holding.
+    /// Reclaim custody after a suspect timer or a custody-fail notice.
+    /// When the bundle is expired, origin outbox items become
+    /// `DeliveredUnconfirmed`; relay holdings become `Failed`. Otherwise the
+    /// copy is re-queued (object bytes remain in the content store).
+    pub fn reclaim_custody(&self, id: ObjectId, now: u64, reason: &str) -> Result<ReclaimOutcome> {
+        self.update(id, |r| {
+            if r.state != State::InTransit {
+                return ReclaimOutcome::Ignored;
+            }
+            let expired = r.expires_at.is_some_and(|expires| expires <= now);
+            if !expired {
+                if let Some(by) = r.custody_by.take() {
+                    if let Some(copies) = &mut r.custody_copies {
+                        copies.retain(|c| *c != by);
+                        if copies.is_empty() {
+                            r.custody_copies = None;
+                        }
+                    }
+                }
+                r.next_hops = None;
+                r.next_hop = None;
+                r.state = State::Queued;
+                r.next_attempt = now;
+                r.note = Some(reason.to_string());
+                r.attempts = 0;
+                return ReclaimOutcome::Requeued;
+            }
+            r.next_hops = None;
+            r.next_hop = None;
+            r.note = Some(reason.to_string());
+            if r.direction == Direction::Out {
+                r.state = State::DeliveredUnconfirmed;
+                ReclaimOutcome::DeliveredUnconfirmed
+            } else {
+                r.state = State::Failed;
+                ReclaimOutcome::Failed
+            }
+        })
+    }
+
+    /// Apply a verified custody-fail notice from `from` about holding `id`.
+    pub fn apply_custody_fail(
+        &self,
+        id: ObjectId,
+        from: Callsign,
+        now: u64,
+        reason: &str,
+    ) -> Result<ReclaimOutcome> {
+        let record = match self.record(id)? {
+            Some(record) => record,
+            None => return Ok(ReclaimOutcome::Ignored),
+        };
+        if matches!(
+            record.state,
+            State::Delivered | State::DeliveredUnconfirmed | State::Cancelled | State::Failed
+        ) {
+            return Ok(ReclaimOutcome::Ignored);
+        }
+        if record.state != State::InTransit || record.custody_by != Some(from) {
+            return Ok(ReclaimOutcome::Ignored);
+        }
+        self.reclaim_custody(id, now, reason)
+    }
+
+    /// Mark an outbox item as delivered without an e2e receipt.
+    pub fn delivered_unconfirmed(&self, id: ObjectId, reason: &str, now: u64) -> Result<bool> {
+        self.update(id, |r| {
+            if r.direction != Direction::Out || r.state != State::InTransit {
+                return false;
+            }
+            r.state = State::DeliveredUnconfirmed;
+            r.next_attempt = now;
+            r.note = Some(reason.to_string());
+            true
+        })
+    }
+
+    /// Next outbound chat sequence for `peer` (1-based, persistent).
+    pub fn next_peer_seq(&self, peer: Callsign) -> Result<u64> {
+        let tx = self.write_tx()?;
+        let seq;
+        {
+            let mut table = tx.open_table(PEER_SEQ)?;
+            let key = peer.to_bytes();
+            seq = table.get(key)?.map(|v| v.value()).unwrap_or(0) + 1;
+            table.insert(key, seq)?;
+        }
+        tx.commit()?;
+        Ok(seq)
     }
 
     /// Only a receipt signed by the final destination completes an outbox item.
@@ -874,6 +1053,7 @@ impl Store {
             r.e2e_receipt = Some(receipt);
             r.next_attempt = now;
             r.note = None;
+            r.shadow_until = None;
             true
         })
     }
@@ -1012,7 +1192,8 @@ impl Store {
             let bulletin = record.direction == Direction::Out
                 && record.final_destination() == bulletin_dest
                 && matches!(record.state, State::Queued | State::Delivered);
-            if !bulletin && record.state != State::Queued {
+            let shadowed = record.in_shadow(now);
+            if !bulletin && record.state != State::Queued && !shadowed {
                 continue;
             }
             let eligible = if bulletin {

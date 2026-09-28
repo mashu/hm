@@ -16,7 +16,7 @@
 //! | DELETE | `/api/conversations/{peer}` | delete inactive local chat history, preserving active delivery |
 //! | POST | `/api/read/{id}` | mark an inbound message read |
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, Query, Request, State};
@@ -275,6 +275,12 @@ pub struct MessageView {
     id: String,
     /// Order of arrival or queuing in this store, across both directions.
     seq: u64,
+    /// Sender-assigned conversation sequence when present (chat).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wire_seq: Option<u64>,
+    /// Soft FIFO gap hint when a higher wire_seq arrived without predecessors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seq_gap: Option<String>,
     direction: &'static str,
     peer: String,
     at: u64,
@@ -305,6 +311,8 @@ fn view(r: Record, object: Option<Vec<u8>>) -> MessageView {
     MessageView {
         id: r.id.to_string(),
         seq: r.seq,
+        wire_seq: r.wire_seq.or_else(|| bundle.as_ref().and_then(|b| b.seq)),
+        seq_gap: None,
         direction: if r.direction == Direction::In { "in" } else { "out" },
         peer: r.peer.to_string(),
         at: r.at,
@@ -335,6 +343,43 @@ fn view(r: Record, object: Option<Vec<u8>>) -> MessageView {
         text: bundle
             .as_ref()
             .and_then(|b| b.body.as_ref()?.as_text().ok().map(|text| text.into_owned())),
+    }
+}
+
+fn annotate_seq_gaps(messages: &mut [MessageView]) {
+    // Per directed stream (from → peer): note gaps in wire_seq for soft FIFO UI.
+    let mut by_stream: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
+    for (index, message) in messages.iter().enumerate() {
+        let Some(wire) = message.wire_seq else {
+            continue;
+        };
+        let _ = wire;
+        let from = message
+            .from
+            .clone()
+            .unwrap_or_else(|| message.peer.clone());
+        let to = message
+            .to
+            .first()
+            .cloned()
+            .unwrap_or_else(|| message.peer.clone());
+        by_stream.entry((from, to)).or_default().push(index);
+    }
+    for indices in by_stream.values() {
+        let mut seqs: Vec<(usize, u64)> = indices
+            .iter()
+            .filter_map(|&i| messages[i].wire_seq.map(|s| (i, s)))
+            .collect();
+        seqs.sort_by_key(|(_, s)| *s);
+        let mut expected = None;
+        for &(index, seq) in &seqs {
+            if let Some(exp) = expected {
+                if seq > exp {
+                    messages[index].seq_gap = Some(format!("missing seq {exp}..{}", seq - 1));
+                }
+            }
+            expected = Some(seq.saturating_add(1));
+        }
     }
 }
 
@@ -393,8 +438,15 @@ async fn messages(
                 out.push(v);
             }
         }
-        out.sort_by_key(|m| std::cmp::Reverse((m.at, m.seq)));
+        out.sort_by(|a, b| {
+            // Soft FIFO: prefer wire_seq when both have it; else arrival time.
+            match (a.wire_seq, b.wire_seq) {
+                (Some(x), Some(y)) if x != y => x.cmp(&y).reverse(),
+                _ => (a.at, a.seq).cmp(&(b.at, b.seq)).reverse(),
+            }
+        });
         out.truncate(limit);
+        annotate_seq_gaps(&mut out);
         Ok(out)
     })
     .await
@@ -453,7 +505,7 @@ struct SendRequest {
     text: String,
     subject: Option<String>,
     precedence: Option<String>,
-    /// `"bulletin"` publishes an RF group bulletin (`to` is the group name).
+    /// `"bulletin"` publishes a group bulletin (`to` is the group name).
     kind: Option<String>,
     /// Alternate to `to` when `kind` is bulletin.
     group: Option<String>,
@@ -535,14 +587,39 @@ async fn send(
     let to = Callsign::parse(req.to.trim()).map_err(|e| bad(format!("to: {e}")))?;
     let prec = parse_precedence(req.precedence.as_deref())?;
     let subject = req.subject.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let bundle =
-        build_bundle(&s.cfg.key, s.cfg.me, to, &req.text, subject, prec).map_err(|e| bad(e.to_string()))?;
-    let (id, bytes) = (bundle.id(), bundle.to_vec());
     let store = s.store.clone();
-    tokio::task::spawn_blocking(move || store.enqueue(id, &bytes, to, prec.to_u8(), unix_now()))
-        .await
-        .map_err(internal)?
-        .map_err(internal)?;
+    let seq = if subject.is_none() {
+        let peer = to;
+        tokio::task::spawn_blocking(move || store.next_peer_seq(peer))
+            .await
+            .map_err(internal)?
+            .map_err(internal)
+            .map(Some)?
+    } else {
+        None
+    };
+    let bundle = build_bundle(&s.cfg.key, s.cfg.me, to, &req.text, subject, prec, seq)
+        .map_err(|e| bad(e.to_string()))?;
+    let (id, bytes) = (bundle.id(), bundle.to_vec());
+    let wire_seq = bundle.bundle().seq;
+    let expires_at = Some(bundle.bundle().expires_at());
+    let store = s.store.clone();
+    tokio::task::spawn_blocking(move || {
+        store.enqueue_with(
+            id,
+            &bytes,
+            hm_store::EnqueueOpts {
+                to,
+                precedence: prec.to_u8(),
+                now: unix_now(),
+                wire_seq,
+                expires_at,
+            },
+        )
+    })
+    .await
+    .map_err(internal)?
+    .map_err(internal)?;
     s.notify.send("message");
     Ok((
         StatusCode::CREATED,

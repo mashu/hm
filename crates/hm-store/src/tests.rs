@@ -88,22 +88,22 @@ fn delivery_leaves_the_queue_and_failures_back_off_then_give_up() {
 
     assert_eq!(
         s.attempt_failed(id(2), "no answer", policy, 100).unwrap(),
-        Retry::At(110)
+        (Retry::At(110), None)
     );
     assert!(s.due(105).unwrap().is_empty(), "not due before the delay");
     assert_eq!(s.due(110).unwrap().len(), 1);
     assert_eq!(
         s.attempt_failed(id(2), "no answer", policy, 110).unwrap(),
-        Retry::At(130)
+        (Retry::At(130), None)
     );
     assert_eq!(
         s.attempt_failed(id(2), "no answer", policy, 130).unwrap(),
-        Retry::At(155),
+        (Retry::At(155), None),
         "capped at 25 s"
     );
     assert_eq!(
         s.attempt_failed(id(2), "no answer", policy, 155).unwrap(),
-        Retry::GaveUp
+        (Retry::GaveUp, None)
     );
     let r = s.record(id(2)).unwrap().unwrap();
     assert_eq!(
@@ -173,18 +173,33 @@ fn relay_custody_moves_without_claiming_final_delivery() {
         visited: &[origin],
         max_hops: 8,
         expires_at: 1_000,
+        wire_seq: None,
     };
     assert!(s.enqueue_relay(id(1), b"bundle", metadata, 100).unwrap());
     assert_eq!(s.relay_usage(100).unwrap(), HoldingUsage { count: 1, bytes: 6 });
     assert_eq!(s.holding_ids(destination, false, 100).unwrap(), vec![id(1)]);
     assert_eq!(s.holding_ids(relay, true, 100).unwrap(), vec![id(1)]);
     assert!(s.set_next_hop(id(1), relay).unwrap());
-    assert!(s.custody_transferred(id(1), relay, true, "radio", 110).unwrap());
+    assert!(s
+        .custody_transferred(id(1), CustodyHandoff {
+            next_hop: relay,
+            receipt_verified: true,
+            by: "radio",
+            now: 110,
+            grace_secs: 3600,
+            suspect_secs: 86_400,
+        })
+        .unwrap());
     let record = s.record(id(1)).unwrap().unwrap();
     assert_eq!(record.state, State::InTransit);
     assert_eq!(record.custody_by, Some(relay));
+    assert_eq!(record.shadow_until, Some(110 + 3600));
+    assert_eq!(record.next_attempt, 1000, "suspect capped by expires_at");
     assert_eq!(s.relay_usage(110).unwrap().count, 0);
     assert!(s.due(110).unwrap().is_empty());
+    // Shadow still advertised for holdings pull.
+    assert_eq!(s.holding_ids(destination, false, 110).unwrap(), vec![id(1)]);
+    assert!(s.holding_ids(destination, false, 110 + 3601).unwrap().is_empty());
 }
 
 #[test]
@@ -201,10 +216,24 @@ fn active_custody_is_l_one_normally_and_l_two_only_when_urgent() {
     assert!(store.set_next_hop(id(2), second).unwrap());
     assert!(!store.set_next_hop(id(2), third).unwrap());
     assert!(store
-        .custody_transferred(id(2), first, true, "radio", 20)
+        .custody_transferred(id(2), CustodyHandoff {
+            next_hop: first,
+            receipt_verified: true,
+            by: "radio",
+            now: 20,
+            grace_secs: 3600,
+            suspect_secs: 86_400,
+        })
         .unwrap());
     assert!(store
-        .custody_transferred(id(2), second, true, "internet", 21)
+        .custody_transferred(id(2), CustodyHandoff {
+            next_hop: second,
+            receipt_verified: true,
+            by: "internet",
+            now: 21,
+            grace_secs: 3600,
+            suspect_secs: 86_400,
+        })
         .unwrap());
     let record = store.record(id(2)).unwrap().unwrap();
     assert_eq!(record.custody_copies.as_deref(), Some(&[first, second][..]));
@@ -218,7 +247,16 @@ fn unverified_receipt_does_not_transfer_custody() {
     let relay = call("M0BBB");
     s.enqueue(id(1), b"one", destination, 0, 10).unwrap();
     assert!(s.set_next_hop(id(1), relay).unwrap());
-    assert!(!s.custody_transferred(id(1), relay, false, "radio", 20).unwrap());
+    assert!(!s
+        .custody_transferred(id(1), CustodyHandoff {
+            next_hop: relay,
+            receipt_verified: false,
+            by: "radio",
+            now: 20,
+            grace_secs: 3600,
+            suspect_secs: 86_400,
+        })
+        .unwrap());
     let record = s.record(id(1)).unwrap().unwrap();
     assert_eq!(record.state, State::Queued);
     assert!(record.custody_by.is_none());
@@ -233,7 +271,16 @@ fn cancellation_ignores_late_receipt_and_e2e_requires_destination() {
     s.enqueue(id(1), b"one", destination, 0, 10).unwrap();
     assert!(s.set_next_hop(id(1), relay).unwrap());
     assert!(s.cancel(id(1)).unwrap());
-    assert!(!s.custody_transferred(id(1), relay, true, "radio", 20).unwrap());
+    assert!(!s
+        .custody_transferred(id(1), CustodyHandoff {
+            next_hop: relay,
+            receipt_verified: true,
+            by: "radio",
+            now: 20,
+            grace_secs: 3600,
+            suspect_secs: 86_400,
+        })
+        .unwrap());
     assert_eq!(s.record(id(1)).unwrap().unwrap().state, State::Cancelled);
 
     s.enqueue(id(2), b"two", destination, 0, 10).unwrap();
@@ -262,10 +309,120 @@ fn deletion_cancels_first_and_never_removes_active_custody() {
     store.enqueue(id(2), b"active", destination, 0, 20).unwrap();
     assert!(store.set_next_hop(id(2), relay).unwrap());
     assert!(store
-        .custody_transferred(id(2), relay, true, "radio", 21)
+        .custody_transferred(id(2), CustodyHandoff {
+            next_hop: relay,
+            receipt_verified: true,
+            by: "radio",
+            now: 21,
+            grace_secs: 3600,
+            suspect_secs: 86_400,
+        })
         .unwrap());
     assert_eq!(store.delete(id(2)).unwrap(), DeleteOutcome::Active);
     assert_eq!(store.record(id(2)).unwrap().unwrap().state, State::InTransit);
+}
+
+#[test]
+fn suspect_reclaims_then_delivered_unconfirmed_when_expired() {
+    let db = TempDb::new("suspect");
+    let s = Store::open(&db.0).unwrap();
+    let destination = call("M0CCC");
+    let relay = call("M0BBB");
+    s.enqueue(id(1), b"one", destination, 0, 10).unwrap();
+    assert!(s.set_next_hop(id(1), relay).unwrap());
+    assert!(s
+        .custody_transferred(id(1), CustodyHandoff {
+            next_hop: relay,
+            receipt_verified: true,
+            by: "radio",
+            now: 100,
+            grace_secs: 50,
+            suspect_secs: 30,
+        })
+        .unwrap());
+    assert!(s.suspect_due(120).unwrap().is_empty());
+    assert_eq!(s.suspect_due(130).unwrap().len(), 1);
+    assert_eq!(
+        s.reclaim_custody(id(1), 130, "custody suspect; reclaiming")
+            .unwrap(),
+        ReclaimOutcome::Requeued
+    );
+    assert_eq!(s.record(id(1)).unwrap().unwrap().state, State::Queued);
+    assert_eq!(s.due(130).unwrap().len(), 1);
+
+    // Fresh message that expires before reclaim.
+    s.enqueue_with(
+        id(2),
+        b"two",
+        EnqueueOpts {
+            to: destination,
+            precedence: 0,
+            now: 200,
+            wire_seq: None,
+            expires_at: Some(220),
+        },
+    )
+    .unwrap();
+    assert!(s.set_next_hop(id(2), relay).unwrap());
+    assert!(s
+        .custody_transferred(id(2), CustodyHandoff {
+            next_hop: relay,
+            receipt_verified: true,
+            by: "radio",
+            now: 200,
+            grace_secs: 10,
+            suspect_secs: 5,
+        })
+        .unwrap());
+    // suspect_at is min(205, expires 220) = 205
+    assert_eq!(
+        s.reclaim_custody(id(2), 230, "expired").unwrap(),
+        ReclaimOutcome::DeliveredUnconfirmed
+    );
+    assert_eq!(
+        s.record(id(2)).unwrap().unwrap().state,
+        State::DeliveredUnconfirmed
+    );
+}
+
+#[test]
+fn custody_fail_notice_reclaims() {
+    let db = TempDb::new("custody-fail");
+    let s = Store::open(&db.0).unwrap();
+    let destination = call("M0CCC");
+    let relay = call("M0BBB");
+    s.enqueue(id(1), b"one", destination, 0, 10).unwrap();
+    assert!(s.set_next_hop(id(1), relay).unwrap());
+    assert!(s
+        .custody_transferred(id(1), CustodyHandoff {
+            next_hop: relay,
+            receipt_verified: true,
+            by: "radio",
+            now: 20,
+            grace_secs: 3600,
+            suspect_secs: 86_400,
+        })
+        .unwrap());
+    assert_eq!(
+        s.apply_custody_fail(id(1), relay, 50, "relay abandoned")
+            .unwrap(),
+        ReclaimOutcome::Requeued
+    );
+    assert_eq!(s.record(id(1)).unwrap().unwrap().state, State::Queued);
+    assert_eq!(
+        s.apply_custody_fail(id(1), relay, 60, "stale").unwrap(),
+        ReclaimOutcome::Ignored
+    );
+}
+
+#[test]
+fn peer_chat_seq_is_monotonic() {
+    let db = TempDb::new("peer-seq");
+    let s = Store::open(&db.0).unwrap();
+    let peer = call("M0CCC");
+    assert_eq!(s.next_peer_seq(peer).unwrap(), 1);
+    assert_eq!(s.next_peer_seq(peer).unwrap(), 2);
+    assert_eq!(s.next_peer_seq(call("M0DDD")).unwrap(), 1);
 }
 
 #[test]
@@ -411,6 +568,7 @@ fn final_delivery_and_e2e_receipt_queue_are_atomic_and_idempotent() {
         object: b"message",
         from: call("M0AAA"),
         verified: true,
+        wire_seq: None,
     };
     let reply = QueuedMessage {
         id: id(2),

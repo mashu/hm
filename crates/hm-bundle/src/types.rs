@@ -61,6 +61,8 @@ u8_enum!(
         Position = 4,
         /// Signed delivery receipt; `reply_to` names the confirmed bundle.
         Receipt = 5,
+        /// Prior custodian notice that a holding was abandoned or expired.
+        CustodyFail = 6,
     }
 );
 

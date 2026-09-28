@@ -454,8 +454,16 @@ fn send(
     let (key, me) = open_station(c)?;
     let trust = trusted(c)?;
     let to = Callsign::parse(to).map_err(|e| format!("{to}: {e}"))?;
-    let bundle =
-        station::build_bundle(&key, me, to, text, subject, prec.into()).map_err(|e| e.to_string())?;
+    let seq = if subject.is_none() {
+        hm_store::Store::open(&c.station.store)
+            .ok()
+            .and_then(|store| store.next_peer_seq(to).ok())
+            .or(Some(1))
+    } else {
+        None
+    };
+    let bundle = station::build_bundle(&key, me, to, text, subject, prec.into(), seq)
+        .map_err(|e| e.to_string())?;
     let object = bundle.to_vec();
     let (mut link, _) = open_kiss(c, me)?;
     eprintln!("{me} -> {to}: {} bytes, bundle {}", object.len(), bundle.id());

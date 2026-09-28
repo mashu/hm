@@ -4,14 +4,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use hm_bundle::{Kind, Opened};
+use hm_bundle::{Bundle, Kind, Opened, Precedence};
 use hm_core::DetRng;
 use hm_net::{Net, NetError};
 use hm_route::{
     plan_routes, BeaconObservation, Bearer as RouteBearer, ContactGraph, ContactKey, GraphConfig,
     LiveContact, Route, RouteRequest, RoutingPolicy,
 };
-use hm_store::{Direction, Retry, Store};
+use hm_store::{Direction, ReclaimOutcome, Retry, Store};
 use hm_wire::{wrap_routed, Callsign, ObjectId, FLAG_INTERNET};
 use hm_xfer::{Failure, Receipt};
 
@@ -38,6 +38,88 @@ pub(crate) struct InFlight {
 }
 
 pub(crate) type NetResult = (ObjectId, Callsign, Result<(), NetError>);
+
+fn enqueue_custody_fail(
+    store: &Store,
+    me: Callsign,
+    identity: &hm_ident::Identity,
+    holding: ObjectId,
+    prior: Callsign,
+    reason: &str,
+    now: u64,
+) {
+    let ttl = 7 * 24 * 3600u32;
+    let sealed = match Bundle::custody_fail(me, prior, holding, reason, now, ttl)
+        .with_precedence(Precedence::Priority)
+        .seal(identity)
+    {
+        Ok(sealed) => sealed,
+        Err(error) => {
+            log(format!("cannot build custody-fail for {}: {error}", short(&holding)));
+            return;
+        }
+    };
+    let bytes = sealed.to_vec();
+    match store.enqueue_with(
+        sealed.id(),
+        &bytes,
+        hm_store::EnqueueOpts {
+            to: prior,
+            precedence: Precedence::Priority.rank(),
+            now,
+            wire_seq: None,
+            expires_at: Some(now.saturating_add(u64::from(ttl))),
+        },
+    ) {
+        Ok(true) => log(format!(
+            "queued custody-fail for {} to {prior}",
+            short(&holding)
+        )),
+        Ok(false) => {}
+        Err(error) => log(format!("store: {error}")),
+    }
+}
+
+fn on_gave_up_receipt(store: &Store, receipt_id: ObjectId, now: u64) {
+    let Ok(Some(object)) = store.object(receipt_id) else {
+        return;
+    };
+    let Ok(opened) = Opened::decode(&object) else {
+        return;
+    };
+    if opened.bundle.kind != Kind::Receipt {
+        return;
+    }
+    let Some(original) = opened.bundle.reply_to else {
+        return;
+    };
+    match store.delivered_unconfirmed(
+        original,
+        "end-to-end receipt could not be delivered",
+        now,
+    ) {
+        Ok(true) => log(format!(
+            "{} marked delivered-unconfirmed (receipt gave up)",
+            short(&original)
+        )),
+        Ok(false) => {}
+        Err(error) => log(format!("store: {error}")),
+    }
+}
+
+fn retry_policy_for(store: &Store, id: ObjectId, live: &super::live::Live) -> hm_store::RetryPolicy {
+    let Ok(Some(object)) = store.object(id) else {
+        return live.retry;
+    };
+    let Ok(opened) = Opened::decode(&object) else {
+        return live.retry;
+    };
+    if opened.bundle.kind == Kind::Receipt {
+        live.receipt_retry
+    } else {
+        live.retry
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn coordinator(
@@ -102,6 +184,7 @@ pub(crate) async fn coordinator(
     let mut failed_contacts: BTreeMap<ObjectId, BTreeMap<ContactKey, u64>> = BTreeMap::new();
     let mut known_internet_links = BTreeSet::new();
     let mut last_pairwise_sync: BTreeMap<(Callsign, Bearer), u64> = BTreeMap::new();
+    let mut last_sync_ignore: Option<(Callsign, u64)> = None;
     let mut advertised_live: BTreeMap<(Callsign, RouteBearer), u64> = BTreeMap::new();
     let (net_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<NetResult>();
     let (modem_tx, mut modem_rx) =
@@ -132,7 +215,17 @@ pub(crate) async fn coordinator(
                         let _ = graph.release(hop.contact, flight.object_bytes);
                     }
                 }
-                match store.custody_transferred(id, peer, true, bearer.name(), now) {
+                match store.custody_transferred(
+                    id,
+                    hm_store::CustodyHandoff {
+                        next_hop: peer,
+                        receipt_verified: true,
+                        by: bearer.name(),
+                        now,
+                        grace_secs: live.get().custody_grace_secs,
+                        suspect_secs: live.get().custody_suspect_secs,
+                    },
+                ) {
                     Ok(true) => log(format!(
                         "custody of {} transferred to {peer} by {}",
                         short(&id),
@@ -164,25 +257,40 @@ pub(crate) async fn coordinator(
                 if let Err(error) = store.clear_next_hop(id, peer) {
                     log(format!("store: {error}"));
                 }
+                let policy = retry_policy_for(store, id, &live.get());
                 let r = if permanent {
-                    store.abandon(id, &reason).map(|_| Retry::GaveUp)
+                    store.abandon(id, &reason).map(|notify| (Retry::GaveUp, notify))
                 } else {
                     store.attempt_failed(
                         id,
                         &format!("{reason} ({})", bearer.name()),
-                        live.get().retry,
+                        policy,
                         now,
                     )
                 };
                 match r {
-                    Ok(Retry::At(t)) => log(format!(
+                    Ok((Retry::At(t), _)) => log(format!(
                         "{} to {peer} by {} failed: {reason}; next try in {} s",
                         short(&id),
                         bearer.name(),
                         t.saturating_sub(now)
                     )),
-                    Ok(Retry::GaveUp) => log(format!("gave up on {} to {peer}: {reason}", short(&id))),
-                    Ok(Retry::Inactive) => {}
+                    Ok((Retry::GaveUp, notify)) => {
+                        log(format!("gave up on {} to {peer}: {reason}", short(&id)));
+                        on_gave_up_receipt(store, id, now);
+                        if let Some(prior) = notify {
+                            enqueue_custody_fail(
+                                store,
+                                cfg.me,
+                                &cfg.key.identity,
+                                id,
+                                prior,
+                                &reason,
+                                now,
+                            );
+                        }
+                    }
+                    Ok((Retry::Inactive, _)) => {}
                     Err(e) => log(format!("store: {e}")),
                 }
             }
@@ -196,7 +304,11 @@ pub(crate) async fn coordinator(
             Some(ev) = radio_evt.recv() => match ev {
                 RadioEvt::Using(via) => {
                     if via != radio_via {
-                        log(format!("radio now {}", via.as_deref().unwrap_or("off")));
+                        match (&via, &radio_via) {
+                            (Some(desc), _) => log(format!("radio now {desc}")),
+                            (None, Some(_)) => log("radio now off"),
+                            (None, None) => {}
+                        }
                     }
                     radio_via = via;
                 }
@@ -270,8 +382,10 @@ pub(crate) async fn coordinator(
                         store,
                         live,
                         cfg,
+                        None,
                         from,
                         &payload,
+                        &mut last_sync_ignore,
                     );
                     apply_sync_actions(
                         actions,
@@ -430,8 +544,10 @@ pub(crate) async fn coordinator(
                     store,
                     live,
                     cfg,
+                    net.as_ref(),
                     from,
                     &payload,
+                    &mut last_sync_ignore,
                 );
                 apply_sync_actions(
                     actions,
@@ -497,15 +613,15 @@ pub(crate) async fn coordinator(
                                         live.get().retry,
                                         now,
                                     ) {
-                                        Ok(Retry::At(t)) => log(format!(
+                                        Ok((Retry::At(t), _)) => log(format!(
                                             "bulletin {}; next try in {} s",
                                             short(&id),
                                             t.saturating_sub(now)
                                         )),
-                                        Ok(Retry::GaveUp) => {
+                                        Ok((Retry::GaveUp, _)) => {
                                             log(format!("gave up on bulletin {}", short(&id)))
                                         }
-                                        Ok(Retry::Inactive) => {}
+                                        Ok((Retry::Inactive, _)) => {}
                                         Err(err) => log(format!("store: {err}")),
                                     }
                                 }
@@ -708,6 +824,58 @@ pub(crate) async fn coordinator(
                     }
                     Err(error) => log(format!("could not encode CONTACT advert: {error}")),
                 }
+                match store.suspect_due(now) {
+                    Ok(suspects) => {
+                        for record in suspects {
+                            if in_flight.keys().any(|(id, _)| *id == record.id) {
+                                continue;
+                            }
+                            match store.reclaim_custody(
+                                record.id,
+                                now,
+                                "custody suspect; reclaiming",
+                            ) {
+                                Ok(ReclaimOutcome::Requeued) => {
+                                    log(format!(
+                                        "reclaimed {} (custody suspect)",
+                                        short(&record.id)
+                                    ));
+                                    notify.send("message");
+                                }
+                                Ok(ReclaimOutcome::DeliveredUnconfirmed) => {
+                                    log(format!(
+                                        "{} delivered-unconfirmed after custody suspect",
+                                        short(&record.id)
+                                    ));
+                                    notify.send("message");
+                                }
+                                Ok(ReclaimOutcome::Failed) => {
+                                    log(format!(
+                                        "{} failed after custody suspect",
+                                        short(&record.id)
+                                    ));
+                                    if record.direction == Direction::Relay {
+                                        if let Some(prior) = record.custody_from {
+                                            enqueue_custody_fail(
+                                                store,
+                                                cfg.me,
+                                                &cfg.key.identity,
+                                                record.id,
+                                                prior,
+                                                "custody suspect; expired",
+                                                now,
+                                            );
+                                        }
+                                    }
+                                    notify.send("message");
+                                }
+                                Ok(ReclaimOutcome::Ignored) => {}
+                                Err(error) => log(format!("store: {error}")),
+                            }
+                        }
+                    }
+                    Err(error) => log(format!("store: {error}")),
+                }
                 let due = match store.due(now) {
                     Ok(d) => d,
                     Err(e) => {
@@ -723,12 +891,34 @@ pub(crate) async fn coordinator(
                         continue;
                     };
                     let Ok(opened) = Opened::decode(&object) else {
-                        let _ = store.abandon(r.id, "stored object is not a bundle");
+                        if let Ok(Some(prior)) =
+                            store.abandon(r.id, "stored object is not a bundle")
+                        {
+                            enqueue_custody_fail(
+                                store,
+                                cfg.me,
+                                &cfg.key.identity,
+                                r.id,
+                                prior,
+                                "stored object is not a bundle",
+                                now,
+                            );
+                        }
                         continue;
                     };
                     let bundle = opened.bundle;
                     if bundle.is_expired(now) {
-                        let _ = store.abandon(r.id, "bundle expired");
+                        if let Ok(Some(prior)) = store.abandon(r.id, "bundle expired") {
+                            enqueue_custody_fail(
+                                store,
+                                cfg.me,
+                                &cfg.key.identity,
+                                r.id,
+                                prior,
+                                "bundle expired",
+                                now,
+                            );
+                        }
                         continue;
                     }
                     if bundle.kind == Kind::Bulletin {
@@ -846,7 +1036,17 @@ pub(crate) async fn coordinator(
                         && live.get().trust.key_for(origin).is_none()
                     {
                         let reason = format!("relay origin {origin} is no longer trusted");
-                        let _ = store.abandon(r.id, &reason);
+                        if let Ok(Some(prior)) = store.abandon(r.id, &reason) {
+                            enqueue_custody_fail(
+                                store,
+                                cfg.me,
+                                &cfg.key.identity,
+                                r.id,
+                                prior,
+                                &reason,
+                                now,
+                            );
+                        }
                         log(format!("stopped relaying {}: {reason}", short(&r.id)));
                         continue;
                     }

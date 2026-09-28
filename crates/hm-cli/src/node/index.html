@@ -366,14 +366,14 @@
     <div class="bulletin">
       <form class="card" id="bulletin-compose" autocomplete="off">
         <h2>Publish</h2>
-        <p class="hint">Posts go to the radio when it is up, and to linked internet stations (who can also ask for ones they missed). At most four per hour; no delivery receipts.</p>
+        <p class="hint">Queued like mail: the node picks packet radio and/or linked internet peers. At most four per hour; no delivery receipts.</p>
         <label for="bulletin-group">Group</label>
         <input id="bulletin-group" name="group" required maxlength="32" placeholder="SK-EMCOMM" spellcheck="false">
         <label for="bulletin-subject">Subject <span class="hint">(optional)</span></label>
         <input id="bulletin-subject" name="subject" maxlength="128">
         <label for="bulletin-text">Message</label>
         <textarea id="bulletin-text" name="text" rows="6" required></textarea>
-        <button class="btn" type="submit">Publish on radio</button>
+        <button class="btn" type="submit">Publish</button>
         <p id="bulletin-status" role="status"></p>
       </form>
       <div class="card">
@@ -644,6 +644,9 @@ function messageState(m) {
     const by = m.delivered_by ? " by " + m.delivered_by : "";
     return ["Delivered", "Delivered" + by + (m.verified ? " · receipt verified" : " · destination receipt received"), "ok"];
   }
+  if (m.state === "DeliveredUnconfirmed") {
+    return ["Delivered?", "Hop custody transferred · destination receipt never returned" + (m.note ? " · " + m.note : ""), "warn"];
+  }
   if (m.state === "Failed") return ["Failed", "Not delivered: " + (m.note || "gave up"), "bad"];
   if (m.state === "Cancelled") return ["Cancelled", "Dropped from the local queue", ""];
   if (m.state === "InTransit") return ["In transit", "Next hop has custody · awaiting destination receipt", "warn"];
@@ -907,6 +910,12 @@ function renderThread() {
       el("span", null, m.text !== null ? m.text : "(no text)"),
       footer
     );
+    if (m.seq_gap) {
+      const gap = el("span", "meta", m.seq_gap);
+      gap.style.display = "block";
+      gap.style.opacity = "0.75";
+      li.append(gap);
+    }
     ol.append(li);
   }
   ol.scrollTop = ol.scrollHeight;
@@ -1089,10 +1098,10 @@ function bulletinGroup(m) {
 
 function bulletinState(m) {
   if (m.direction === "out") {
-    if (m.state === "Delivered") return ["Published", "Sent on the radio (no per-listener receipts)", "ok"];
+    if (m.state === "Delivered") return ["Published", "Sent (no per-listener receipts)", "ok"];
     if (m.state === "Failed") return ["Failed", "Not published: " + (m.note || "gave up"), "bad"];
     if (m.state === "Cancelled") return ["Cancelled", "Dropped from the local queue", ""];
-    if (m.state === "InTransit" || m.state === "Queued") return ["Pending", "Waiting for a clear channel", "warn"];
+    if (m.state === "InTransit" || m.state === "Queued") return ["Pending", "Waiting for a path that reaches listeners", "warn"];
   }
   if (m.state === "Unread") {
     return ["New", m.verified ? "Received · unread · verified" : "Received · unread · not verified", m.verified ? "ok" : "warn"];
@@ -1136,7 +1145,7 @@ function renderBulletins() {
   if (list.length === 0) {
     box.append(el("p", "empty", bulletinFilter
       ? "No bulletins in group " + bulletinFilter + " yet."
-      : "No bulletins yet. Publish one, or wait for a station on frequency."));
+      : "No bulletins yet. Publish one, or wait for one to arrive."));
     return;
   }
   for (const m of list) {
@@ -1186,7 +1195,7 @@ $("bulletin-compose").addEventListener("submit", async (ev) => {
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || r.statusText);
     st.className = "ok";
-    st.textContent = "Queued for RF publish. It goes out when the channel is clear.";
+    st.textContent = "Queued. It goes out when a link allows; follow it below or under Network.";
     f.text.value = "";
     f.subject.value = "";
     quietly(loadBulletins());

@@ -59,19 +59,24 @@ pub(crate) fn broadcast_sync(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn receive_sync(
     control: &mut ControlPlane,
     graph: &mut ContactGraph,
     store: &Store,
     live: &LiveConfig,
     cfg: &NodeConfig,
+    net: Option<&Arc<Net>>,
     from: Callsign,
     payload: &[u8],
+    last_ignore: &mut Option<(Callsign, u64)>,
 ) -> Vec<ControlAction> {
+    let peer_key = net.and_then(|n| n.public_key_of(from));
     match control.receive(
         from,
         payload,
         &live.get().trust,
+        peer_key,
         (cfg.me, cfg.key.identity.public()),
         store,
         graph,
@@ -80,7 +85,12 @@ pub(crate) fn receive_sync(
     ) {
         Ok(actions) => actions,
         Err(error) => {
-            log(format!("ignored SYNC from {from}: {error}"));
+            let now = unix_now();
+            let repeat = last_ignore.is_some_and(|(peer, at)| peer == from && now.saturating_sub(at) < 300);
+            if !repeat {
+                log(format!("ignored SYNC from {from}: {error}"));
+                *last_ignore = Some((from, now));
+            }
             vec![]
         }
     }

@@ -118,7 +118,7 @@ One message, sealed in an envelope (domain: bundle). CBOR map:
 | 0 | v | uint, 0 |
 | 1 | from | callsign |
 | 2 | to | array of 1–32 addresses |
-| 3 | kind | uint: 0 mail, 1 chat, 2 form, 3 bulletin, 4 position, 5 receipt |
+| 3 | kind | uint: 0 mail, 1 chat, 2 form, 3 bulletin, 4 position, 5 receipt, 6 custody-fail |
 | 4 | prec | optional uint: 1 priority, 2 immediate, 3 flash; absent = routine |
 | 5 | created | uint, Unix seconds |
 | 6 | ttl | uint > 0, seconds after `created` when relays may drop it |
@@ -127,6 +127,7 @@ One message, sealed in an envelope (domain: bundle). CBOR map:
 | 9 | parts | optional array of part references |
 | 10 | reply_to | optional bstr(32), id of another bundle |
 | 11 | max_hops | optional uint 1–16; absent = 8 |
+| 12 | seq | optional uint > 0; sender-assigned directed chat sequence |
 
 Body codecs:
 
@@ -152,8 +153,18 @@ Part reference (attachment, pulled on demand): map `0 hash bstr(32)`, `1 size ui
 `2 mime text`, `3 name text?`, `4 thumb bstr?`.
 
 A receipt (kind 5) must set `reply_to` to the bundle it confirms, name the
-original sender as its only recipient, and carry no subject, body or parts.
-Empty optional arrays, `prec = 0`, and `max_hops = 8` must be omitted.
+original sender as its only recipient, and carry no subject, body, parts or
+`seq`. Empty optional arrays, `prec = 0`, and `max_hops = 8` must be omitted.
+
+A custody-fail (kind 6) must set `reply_to` to the holding that failed, name the
+prior custodian (or origin) as its only recipient, may carry a short text body
+reason, and must not carry subject, parts or `seq`. Relays emit it when they
+abandon or expire a holding so the prior custodian can reclaim or fail.
+
+New chat sends SHOULD set `seq` to a positive monotonic counter for the directed
+stream `(from, primary station to)`. Receivers deliver immediately (no
+head-of-line blocking) and MAY surface gaps when a higher `seq` arrives first.
+Mail, bulletins, receipts and custody-fail MUST omit `seq`.
 
 Receiving is two-step: decode for routing (recipients, precedence, expiry), then
 verify with the sender's key from the local trust list (or a binding anchored
@@ -433,7 +444,17 @@ both fit the airtime budget. There is no neighbourhood payload flood.
 The transfer receipt in section 7 means only that the next hop durably accepted
 custody. A custodian stores the exact signed bundle bytes before signing that
 receipt. After a verified custody receipt the previous custodian deactivates
-its queued copy; it may retain bytes for deduplication and audit.
+its queued copy and enters `InTransit`; it MUST retain the bytes for a
+configured shadow grace (default 6 h) and MAY advertise them in holdings SYNC
+so the next hop can pull again. It schedules a custody suspect timer (default
+24 h, capped by bundle expiry). When the timer fires without an end-to-end
+receipt, it reclaims custody (`Queued` again) while the bundle is still valid,
+or marks origin traffic `DeliveredUnconfirmed` / relay traffic `Failed` when
+expired.
+
+A verified kind-6 custody-fail from the station that accepted custody MUST
+trigger the same reclaim path. End-to-end receipts SHOULD use a longer retry
+budget than routine traffic and at least Priority precedence.
 
 Each hop carries mutable routing metadata outside the signed bundle:
 
@@ -462,10 +483,11 @@ already names it or exceeds the bundle's `max_hops`. The inner signed envelope
 is never changed.
 
 Only the final recipient establishes end-to-end delivery. After storing a
-non-receipt bundle addressed to itself, it emits one signed kind-5 receipt
-bundle. The receipt is routed like any other bundle. The original sender marks
-the outbox delivered only after verifying that final recipient's signature and
-matching `reply_to`.
+non-receipt, non-custody-fail bundle addressed to itself, it emits one signed
+kind-5 receipt bundle. The receipt is routed like any other bundle. The original
+sender marks the outbox delivered only after verifying that final recipient's
+signature and matching `reply_to`. If hop custody was transferred but the
+receipt never returns, the origin MAY eventually show `DeliveredUnconfirmed`.
 
 ### 11.3 SYNC payloads
 

@@ -27,7 +27,7 @@ decide *whether*, *when* and *over which medium* to spend airtime.
 
 | Strength | What it means in practice |
 | --- | --- |
-| **Signed custody, not blind relay** | Each hop moves durable custody only after a verified next-hop receipt; the origin marks **Delivered** only on a destination-signed end-to-end receipt. |
+| **Signed custody, not blind relay** | Each hop moves durable custody only after a verified next-hop receipt; the prior hop retains a shadow copy for reclaim. The origin marks **Delivered** only on a destination-signed end-to-end receipt (else eventually **DeliveredUnconfirmed** or **Failed**). |
 | **Bayesian contacts** | Link success is a decaying Beta posterior from schedules, beacons, live links and handoff outcomes—not a single SNR snapshot. |
 | **Thompson-sampled bearers** | Radio, Internet and ARQ modems compete by discounted cost ÷ sampled success rate, so a failing radio yields to Internet and is retried as evidence fades. |
 | **Fountain-coded RF transfers** | RaptorQ symbol bursts with adaptive sizing absorb loss without stop-and-wait ACKs on every fragment. |
@@ -65,7 +65,7 @@ when the RNG seed is fixed.
 | --- | --- | --- | --- |
 | **Identity & trust** | Callsigns, Ed25519 keys, signed envelopes, local trust lists | `hm-ident`, `hm-cli` config | Trust is explicit and local; keys are never learned from beacons. |
 | **Application objects** | Chat / mail / bulletin / receipt bundles, compression | `hm-bundle` | Content-addressed, sealed objects; cleartext by design for amateur service. |
-| **Custody & persistence** | Inbox, outbox, relay holdings, retries | `hm-store` | Crash-safe `redb` store; exactly-once semantics across restarts. |
+| **Custody & persistence** | Inbox, outbox, relay holdings, retries, shadow retain, suspect reclaim | `hm-store` | Crash-safe `redb` store; at-most-once local store by content id; hop at-least-once while queued |
 | **Contact & routing** | Bayesian graph, CGR-style plans, failover, urgent dual-path | `hm-route` | Policy lives here: change scoring or admission without touching RF framing. |
 | **Transfer** | Sessions, OFFER, RaptorQ bursts, ACKs, transfer receipts | `hm-xfer` | Sans-IO engine driven by `hm-core::Machine`; same logic on radio and in sim. |
 | **Wire framing** | 18-byte headers, ACK/OFFER/OPEN/CLOSE, beacons, SYNC | `hm-wire` | Compact, versioned; independent Python vectors in CI. |
@@ -88,7 +88,7 @@ Wire details and test vectors: [`SPEC.md`](SPEC.md). Bulletin channels:
 | `hm-sim` | Discrete-event simulator: multiple channels and radios per station, airtime with keyed-PTT bursts and AX.25/HDLC framing checked against the modulator, half-duplex, p-persistent CSMA with a measured carrier-detect delay, hidden-terminal collisions, Bernoulli / Gilbert–Elliott / hourly HF loss or the built-in modem's measured loss by SNR and frame length, outages, partitions, clock drift, corrupted frames, airtime split by purpose, delivery and latency metrics; deterministic routing comparisons against epidemic, Spray-and-Wait, PRoPHET-like and MEED baselines |
 | `hm-bearer` | KISS framing (streaming decoder) and AX.25 UI encapsulation for Direwolf and hardware TNCs |
 | `hm-xfer` | Fountain-coded (RaptorQ) transfer engine: OFFER + symbol bursts, ACKs with the missing count, hash-verified delivery, signed delivery receipts, duplicate suppression, per-sender resource limits, sessions (OPEN with feature bits and limits, CLOSE for busy, refused or too large), loss-adaptive burst sizing, random exponential backoff, airtime budget |
-| `hm-store` | Persistent store on `redb` (pure Rust, crash-safe): content-addressed messages, inbox, outbox and relay holdings, custody records, cancellations, retries with exponential backoff, exactly-once across restarts |
+| `hm-store` | Persistent store on `redb` (pure Rust, crash-safe): content-addressed messages, inbox, outbox and relay holdings, custody records, cancellations, retries with exponential backoff, shadow retain after handoff, custody suspect reclaim; at-most-once local store by content id |
 | `hm-net` | Internet links: QUIC with TLS 1.3 on Ed25519 station keys (mutual trust by default; optional `open_hub` for public cores), automatic redial, one stream per bundle with a signed receipt |
 | `hm-modem-afsk` | Our own AFSK 1200 modem (Bell 202), pure Rust and `no_std`: HDLC framing and CRC, multi-slicer demodulator with per-tone AGC and PLL clock recovery, carrier detect |
 | `hm-rig` | Radio hardware: sound cards through `cpal` (ALSA, CoreAudio, WASAPI); PTT by rigctld (Hamlib CAT), serial RTS/DTR, CM108 GPIO (AIOC, Digirig) or VOX; a virtual radio channel for tests |
@@ -139,7 +139,8 @@ scripted provisioning, `hm keygen --call SA0KAM-1` remains available.
 New stations trust and dial the public core hub **SA0KAM-0** at `34.51.161.47:4433` by
 default. Remove or replace that `[[trust]]` / `[[internet.peers]]` entry if you do not
 want it. A core hub sets `internet.open_hub = true` so home stations can dial in without
-being pre-listed in the hub's trust file (homes still must trust the hub).
+being pre-listed in the hub's trust file (QUIC and SYNC both use the dialer's certificate;
+homes still must trust the hub).
 
 ### station.toml
 
@@ -298,8 +299,8 @@ SO5KM=hm.example.org:4433`, or `hm node --no-radio --listen 0.0.0.0:4433`.
 Internet links are QUIC connections authenticated with the station keys themselves:
 by default only mutually trusted stations connect, and each link is bound to a
 callsign. A listener may set `internet.open_hub = true` to accept any dialer that
-presents a valid station certificate (homes must still trust the hub). There is no
-certificate authority and no central server; any node can listen, dial, or both.
+presents a valid station certificate (and its SYNC); homes must still trust the hub.
+There is no certificate authority and no central server; any node can listen, dial, or both.
 
 For direct neighbours, recent delivery evidence still determines whether radio or
 internet is tried first. For a farther destination, the node builds a Bayesian contact

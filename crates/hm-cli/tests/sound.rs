@@ -183,6 +183,13 @@ fn start(ether: &Ether, key: &KeyFile, me: &str, peer: &KeyFile, db: &Tmp) -> no
                 max_delay_secs: 5,
                 max_attempts: 20,
             },
+            receipt_retry: RetryPolicy {
+                first_delay_secs: 2,
+                max_delay_secs: 5,
+                max_attempts: 24,
+            },
+            custody_grace_secs: 6 * 3600,
+            custody_suspect_secs: 24 * 3600,
             beacon_secs: 0,
             peers: vec![],
             locator: None,

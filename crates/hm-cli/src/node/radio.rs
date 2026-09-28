@@ -113,28 +113,45 @@ pub(crate) fn radio_thread(
             None => cfg.radio.as_ref(),
         };
         let _ = events.send(RadioEvt::Using(rc.map(|r| r.describe())));
+        // Radio off: idle until [radio] is enabled. Do not emit Down or reconnect.
+        let Some(rc) = rc else {
+            while !stop.load(Ordering::Relaxed) && !changed(&settings) {
+                while cmds.try_recv().is_ok() {}
+                thread::sleep(Duration::from_millis(200));
+            }
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            if changed(&settings) {
+                let now = live.get().radio;
+                settings = now.link_settings();
+                match cfg.radio_builder.as_ref().expect("checked by changed")(&now) {
+                    Ok(r) => rebuilt = Some(r),
+                    Err(e) => log(format!(
+                        "radio settings not applied, keeping the link in use: {e}"
+                    )),
+                }
+            }
+            continue;
+        };
         let session = |rc: &RadioConfig, link: &mut dyn Link| {
             let _ = events.send(RadioEvt::Up);
             radio_session(cfg, rc, live, &settings, link, &cmds, &events, stop)
         };
-        let result = match rc {
-            None => Err("the radio is off".to_string()),
-            Some(rc) => match &rc.link {
-                RadioLink::Kiss {
-                    target,
-                    tnc_port,
-                    params,
-                } => KissLink::open(target, cfg.me, *tnc_port, *params)
+        let result = match &rc.link {
+            RadioLink::Kiss {
+                target,
+                tnc_port,
+                params,
+            } => KissLink::open(target, cfg.me, *tnc_port, *params)
+                .map(|mut l| session(rc, &mut l))
+                .map_err(|e| format!("cannot open {}: {e}", rc.describe())),
+            RadioLink::Modem { audio, ptt, csma, .. } => {
+                SoundLink::start(cfg.me, audio.clone(), ptt.clone(), *csma)
                     .map(|mut l| session(rc, &mut l))
-                    .map_err(|e| format!("cannot open {}: {e}", rc.describe())),
-                RadioLink::Modem { audio, ptt, csma, .. } => {
-                    SoundLink::start(cfg.me, audio.clone(), ptt.clone(), *csma)
-                        .map(|mut l| session(rc, &mut l))
-                        .map_err(|e| format!("cannot open {}: {e}", rc.describe()))
-                }
-            },
+                    .map_err(|e| format!("cannot open {}: {e}", rc.describe()))
+            }
         };
-        let off = rc.is_none();
         let wait = match result {
             Ok(Ok(Ended::Stopped)) => return,
             Ok(Ok(Ended::Reconfigure)) => {
@@ -150,9 +167,9 @@ pub(crate) fn radio_thread(
                 true
             }
         };
-        // Wait to reconnect (while off: until switched on), unless [radio] changes.
+        // Wait to reconnect, unless [radio] changes.
         let until = Instant::now() + RECONNECT;
-        while wait && (off || Instant::now() < until) && !changed(&settings) {
+        while wait && Instant::now() < until && !changed(&settings) {
             if stop.load(Ordering::Relaxed) {
                 return;
             }

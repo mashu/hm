@@ -115,6 +115,9 @@ pub struct Bundle {
     /// Absent means [`DEFAULT_MAX_HOPS`].
     #[n(11)]
     pub max_hops: Option<u8>,
+    /// Sender-assigned conversation sequence for directed chat streams.
+    #[n(12)]
+    pub seq: Option<u64>,
 }
 
 impl Bundle {
@@ -132,6 +135,7 @@ impl Bundle {
             parts: None,
             reply_to: None,
             max_hops: None,
+            seq: None,
         }
     }
 
@@ -146,6 +150,21 @@ impl Bundle {
         Bundle::new(from, Kind::Receipt, created, ttl)
             .to(Address::Station(original_sender))
             .in_reply_to(id)
+    }
+
+    /// Notice that this station abandoned custody of `id`, for the prior custodian.
+    pub fn custody_fail(
+        from: Callsign,
+        prior: Callsign,
+        id: ObjectId,
+        reason: &str,
+        created: u64,
+        ttl: u32,
+    ) -> Bundle {
+        Bundle::new(from, Kind::CustodyFail, created, ttl)
+            .to(Address::Station(prior))
+            .in_reply_to(id)
+            .with_text(reason)
     }
 
     pub fn to(mut self, a: Address) -> Bundle {
@@ -180,6 +199,11 @@ impl Bundle {
 
     pub fn with_max_hops(mut self, max_hops: u8) -> Bundle {
         self.max_hops = (max_hops != DEFAULT_MAX_HOPS).then_some(max_hops);
+        self
+    }
+
+    pub fn with_seq(mut self, seq: u64) -> Bundle {
+        self.seq = Some(seq);
         self
     }
 
@@ -236,6 +260,16 @@ impl Bundle {
         if self.kind == Kind::Receipt {
             self.validate_receipt()?;
         }
+        if self.kind == Kind::CustodyFail {
+            self.validate_custody_fail()?;
+        }
+        if self.kind == Kind::Chat && self.seq.is_none() {
+            // Legacy peers may omit seq; new senders always set it. Validation
+            // allows omit so older bundles still decode and store.
+        }
+        if self.seq == Some(0) {
+            return Err(BundleError::Invalid("seq must be positive when present"));
+        }
         Ok(())
     }
 
@@ -253,6 +287,34 @@ impl Bundle {
         }
         if self.subject.is_some() || self.body.is_some() || self.parts.is_some() {
             return Err(BundleError::Invalid("a receipt must not carry content"));
+        }
+        if self.seq.is_some() {
+            return Err(BundleError::Invalid("a receipt must not carry seq"));
+        }
+        Ok(())
+    }
+
+    pub fn validate_custody_fail(&self) -> Result<(), BundleError> {
+        if self.kind != Kind::CustodyFail {
+            return Err(BundleError::Invalid("not a custody-fail"));
+        }
+        if self.reply_to.is_none() {
+            return Err(BundleError::Invalid(
+                "a custody-fail must name the holding it reports",
+            ));
+        }
+        if self.to.len() != 1 || !matches!(self.to.first(), Some(Address::Station(_))) {
+            return Err(BundleError::Invalid(
+                "a custody-fail must have exactly one station recipient",
+            ));
+        }
+        if self.subject.is_some() || self.parts.is_some() {
+            return Err(BundleError::Invalid(
+                "a custody-fail must not carry subject or parts",
+            ));
+        }
+        if self.seq.is_some() {
+            return Err(BundleError::Invalid("a custody-fail must not carry seq"));
         }
         Ok(())
     }

@@ -87,6 +87,7 @@ fn exchange(drop_every: usize, text: &str) -> (SendOutcome, Vec<Message>, usize)
         text,
         None,
         Precedence::Routine,
+        Some(1),
     )
     .unwrap();
     let st = Station {
