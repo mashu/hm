@@ -657,7 +657,10 @@ at the weakest SNR it meets.
 
 | Scenario | Result | Reproduce |
 | --- | --- | --- |
+| 150-byte chat, one hop | arrives p50 2.5 s clean, 2.5 s (p95 6.5 s) at 10% loss, 5.7 s (p95 22.8 s) at 30%; HF 300 bd at 0.5 Hz fading: receipt back p50 84 / 39 / 21 s at 17 / 20 / 24 dB | `cargo test -p hm-xfer --release --test sim chat_latency -- --ignored --nocapture` |
 | 1 kB, 10% frame loss both ways, 10,000 trials | 100% delivered, 0 duplicates, every receipt verified; latency p50 9.3 s, p95 23.9 s | `HM_XFER_TRIALS=10000 cargo test -p hm-xfer --release --test sim exit_criterion_1kb -- --nocapture` |
+| Control traffic (beacons, contact adverts, holdings pulls) of 5–40 stations sharing one channel | 2.3–3.7% of a VHF channel and 3.1–4.2% of an HF one, whatever the number of stations; before this version 10–75% of VHF and over 100% of HF at 40 stations | `cargo test -p hm-cli --release --test control_load -- --ignored --nocapture` |
+| 2 kB bulletin to 10 listeners, each losing 25% of frames | 99% of listeners with repair requests (about six in all), 72% with one publish; 37% more airtime | `cargo test -p hm-xfer --release --test sim bulletin_repair -- --nocapture` |
 | 5 kB, clean link | hm headers and preambles 9.6%, OPEN, OFFER and ACK with receipt 2.2%, TXDELAY and TXTAIL 2.7%; AX.25 framing and bit stuffing 9.9%; 72.6% of airtime is useful payload | `cargo test -p hm-xfer --release --test sim exit_criterion_overhead -- --nocapture` |
 | 2 kB, bursty loss (Gilbert–Elliott, ~12% mean) | 100/100 delivered | `cargo test -p hm-xfer --release --test sim bursty -- --nocapture` |
 | Two hidden senders to one node, no CSMA | 30/30 both delivered, last p50 93 s, max 143 s | `cargo test -p hm-xfer --release --test sim two_senders -- --nocapture` |
