@@ -1,121 +1,15 @@
-//! Contact adverts and pairwise holdings SYNC over radio and internet.
+//! Our signed contact adverts and the flags they carry.
 
-use std::collections::BTreeSet;
-use std::sync::{mpsc, Arc};
-
-use hm_net::Net;
-use hm_route::{ContactGraph, ScheduledContact};
-use hm_store::Store;
-use hm_wire::{Callsign, ContactAdvert, ContactBearer, Dest, FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY};
-
-use super::control::{sign_contact, ControlAction, ControlPlane, LIVE_ADVERT_VALIDITY_SECS};
-use super::live::LiveConfig;
-use super::radio::RadioCmd;
-use super::types::{log, short, NodeConfig};
-use crate::station::unix_now;
+use hm_ident::Identity;
 use hm_model::Bearer;
+use hm_route::ScheduledContact;
+use hm_wire::{Callsign, ContactAdvert, ContactBearer, FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY};
 
-pub(crate) fn send_sync(
-    net: Option<&Arc<Net>>,
-    radio: &mpsc::Sender<RadioCmd>,
-    bearer: Bearer,
-    to: Callsign,
-    payload: Vec<u8>,
-) {
-    match bearer {
-        Bearer::Radio => {
-            let _ = radio.send(RadioCmd::Sync {
-                to: Dest::Station(to),
-                payload,
-            });
-        }
-        Bearer::Internet => {
-            let Some(network) = net.cloned() else {
-                return;
-            };
-            tokio::spawn(async move {
-                let _ = network.send_control(to, &payload).await;
-            });
-        }
-        Bearer::Modem => {}
-    }
-}
+use super::control::{sign_contact, LIVE_ADVERT_VALIDITY_SECS};
+use crate::config::RelaySettings;
 
-pub(crate) fn broadcast_sync(
-    net: Option<&Arc<Net>>,
-    radio: &mpsc::Sender<RadioCmd>,
-    radio_up: bool,
-    internet_peers: &BTreeSet<Callsign>,
-    payload: Vec<u8>,
-) {
-    if radio_up {
-        let _ = radio.send(RadioCmd::Sync {
-            to: Dest::Broadcast,
-            payload: payload.clone(),
-        });
-    }
-    for peer in internet_peers {
-        send_sync(net, radio, Bearer::Internet, *peer, payload.clone());
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn receive_sync(
-    control: &mut ControlPlane,
-    graph: &mut ContactGraph,
-    store: &Store,
-    live: &LiveConfig,
-    cfg: &NodeConfig,
-    net: Option<&Arc<Net>>,
-    from: Callsign,
-    payload: &[u8],
-    last_ignore: &mut Option<(Callsign, u64)>,
-) -> Vec<ControlAction> {
-    let peer_key = net.and_then(|n| n.public_key_of(from));
-    match control.receive(
-        from,
-        payload,
-        &live.get().trust,
-        peer_key,
-        (cfg.me, cfg.key.identity.public()),
-        store,
-        graph,
-        live.get().relay.enabled || live.get().relay.mailbox,
-        // SYNC from the radio comes without an internet link.
-        net.is_none(),
-        unix_now(),
-    ) {
-        Ok(actions) => actions,
-        Err(error) => {
-            let now = unix_now();
-            let repeat = last_ignore.is_some_and(|(peer, at)| peer == from && now.saturating_sub(at) < 300);
-            if !repeat {
-                log(format!("ignored SYNC from {from}: {error}"));
-                *last_ignore = Some((from, now));
-            }
-            vec![]
-        }
-    }
-}
-
-pub(crate) fn apply_sync_actions(
-    actions: Vec<ControlAction>,
-    net: Option<&Arc<Net>>,
-    radio: &mpsc::Sender<RadioCmd>,
-    bearer: Bearer,
-    from: Callsign,
-) {
-    for action in actions {
-        match action {
-            ControlAction::Reply(payload) => send_sync(net, radio, bearer, from, payload),
-            ControlAction::Requested { id, peer } => {
-                log(format!("{} requested custody of {}", peer, short(&id)));
-            }
-        }
-    }
-}
-
-pub(crate) fn advertised_flags(has_internet: bool, relay: &crate::config::RelaySettings) -> u8 {
+/// The flags our beacons and adverts carry: internet, relay, mailbox.
+pub(crate) fn advertised_flags(has_internet: bool, relay: &RelaySettings) -> u8 {
     let mut flags = if has_internet { FLAG_INTERNET } else { 0 };
     if relay.enabled {
         flags |= FLAG_RELAY;
@@ -130,12 +24,14 @@ pub(crate) fn advertised_flags(has_internet: bool, relay: &crate::config::RelayS
 /// the relay settings in use (`relay`), so a change made while the node runs is
 /// advertised the next time the schedules are published.
 pub(crate) fn scheduled_advert(
-    cfg: &NodeConfig,
-    relay: &crate::config::RelaySettings,
+    me: Callsign,
+    identity: &Identity,
+    has_internet: bool,
+    relay: &RelaySettings,
     schedule: ScheduledContact,
     sequence: u32,
 ) -> Result<Option<ContactAdvert>, String> {
-    if schedule.from != cfg.me {
+    if schedule.from != me {
         return Ok(None);
     }
     let start = u32::try_from(schedule.start).map_err(|_| "contact start exceeds wire range")?;
@@ -143,7 +39,7 @@ pub(crate) fn scheduled_advert(
     let capacity_bytes =
         u32::try_from(schedule.capacity_bytes).map_err(|_| "contact capacity exceeds wire range")?;
     let advert = ContactAdvert {
-        origin: cfg.me,
+        origin: me,
         sequence,
         start,
         end,
@@ -152,12 +48,10 @@ pub(crate) fn scheduled_advert(
         success_permyriad: schedule.success_permyriad.unwrap_or(5_000),
         rate_bps: schedule.rate_bps,
         capacity_bytes,
-        flags: schedule.flags | advertised_flags(cfg.internet.is_some(), relay),
+        flags: schedule.flags | advertised_flags(has_internet, relay),
         signature: [0; 64],
     };
-    sign_contact(&cfg.key.identity, advert)
-        .map(Some)
-        .map_err(str::to_string)
+    sign_contact(identity, advert).map(Some).map_err(str::to_string)
 }
 
 /// Our signed claim of a live contact to `peer`, lasting since `since`:
@@ -165,8 +59,10 @@ pub(crate) fn scheduled_advert(
 /// our belief that a handoff over it completes (`success`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn live_advert(
-    cfg: &NodeConfig,
-    relay: &crate::config::RelaySettings,
+    me: Callsign,
+    identity: &Identity,
+    has_internet: bool,
+    relay: &RelaySettings,
     peer: Callsign,
     bearer: Bearer,
     success: f64,
@@ -181,9 +77,9 @@ pub(crate) fn live_advert(
         .map_err(|_| "contact end exceeds wire range")?;
     let capacity_bytes = u32::try_from(capacity_bytes.min(u64::from(u32::MAX))).expect("bounded to u32");
     sign_contact(
-        &cfg.key.identity,
+        identity,
         ContactAdvert {
-            origin: cfg.me,
+            origin: me,
             sequence,
             start,
             end,
@@ -192,7 +88,7 @@ pub(crate) fn live_advert(
             success_permyriad: (success.clamp(0.0, 1.0) * 10_000.0).round() as u16,
             rate_bps,
             capacity_bytes,
-            flags: advertised_flags(cfg.internet.is_some(), relay),
+            flags: advertised_flags(has_internet, relay),
             signature: [0; 64],
         },
     )

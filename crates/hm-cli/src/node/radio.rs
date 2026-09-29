@@ -29,6 +29,7 @@ use crate::kiss_link::KissLink;
 use crate::sound_link::SoundLink;
 use crate::station::{unix_now, Station};
 
+#[derive(Debug)]
 pub(crate) enum RadioCmd {
     /// Transfer `object` to `to`, with overs sized from the station's belief
     /// about frame loss on the link (`erasure`).
@@ -59,6 +60,7 @@ pub(crate) enum RadioCmd {
     Holding(bool),
 }
 
+#[derive(Debug)]
 pub(crate) enum RadioEvt {
     /// The radio link now in use (`None`: the radio is off).
     Using(Option<String>),

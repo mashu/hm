@@ -27,6 +27,7 @@ mod rf_policy;
 mod accept;
 mod coordinator;
 mod internet;
+mod machine;
 mod radio;
 mod sync;
 mod types;
