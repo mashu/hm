@@ -645,27 +645,32 @@ their turn. How mail is shared between radio, internet and modem follows the cos
 delivering lately. The status line shows whether the modem program is reachable and whom
 it is connected to. Changing `[modem]` takes a restart.
 
-## Measured (simulator, 1200 bd, 300 ms TXDELAY)
+## Measured (simulator)
 
-The simulated channel sends frames as the built-in modem does: AX.25 UI header,
+Rows are VHF packet at 1200 bd with 300 ms TXDELAY unless they say HF. The
+simulated channel sends frames as the built-in modem does: AX.25 UI header,
 frame check, flags and bit stuffing included (within 0.02% of the modulator's
-airtime). SNR is measured in a 3 kHz bandwidth.
+airtime). SNR is measured in a 3 kHz bandwidth. HF rows run at 300 bd over a
+fading path: Watterson-style flat fading with a Gaussian Doppler spectrum (CCIR
+520 / ITU-R F.1487 spreads), the same fade in both directions, each frame judged
+at the weakest SNR it meets.
 
 | Scenario | Result | Reproduce |
 | --- | --- | --- |
 | 1 kB, 10% frame loss both ways, 10,000 trials | 100% delivered, 0 duplicates, every receipt verified; latency p50 9.3 s, p95 23.9 s | `HM_XFER_TRIALS=10000 cargo test -p hm-xfer --release --test sim exit_criterion_1kb -- --nocapture` |
 | 5 kB, clean link | hm headers and preambles 9.6%, OPEN, OFFER and ACK with receipt 2.2%, TXDELAY and TXTAIL 2.7%; AX.25 framing and bit stuffing 9.9%; 72.6% of airtime is useful payload | `cargo test -p hm-xfer --release --test sim exit_criterion_overhead -- --nocapture` |
 | 2 kB, bursty loss (Gilbert–Elliott, ~12% mean) | 100/100 delivered | `cargo test -p hm-xfer --release --test sim bursty -- --nocapture` |
-| Two hidden senders to one node, no CSMA | 30/30 both delivered, last within 141 s | `cargo test -p hm-xfer --release --test sim two_senders -- --nocapture` |
+| Two hidden senders to one node, no CSMA | 30/30 both delivered, last p50 93 s, max 143 s | `cargo test -p hm-xfer --release --test sim two_senders -- --nocapture` |
 | 2 kB over the modem's measured loss at 7 / 8 / 9 dB SNR | 100/100 delivered at each; latency p50 25.1 / 17.5 / 17.5 s | `cargo test -p hm-xfer --release --test sim measured_modem -- --nocapture` |
-| Four stations to one hub, 1.5 kB each, 9 dB, all hear each other | without CSMA: last delivery p50 251 s, 4.8 overs per object, 153 receptions lost to collisions per run; with CSMA: p50 126 s, 1.8 overs per object, 44 lost, all from stations keying up within the 125 ms carrier-detect delay of each other | `cargo test -p hm-xfer --release --test sim busy_channel -- --nocapture` |
+| Four stations to one hub, 1.5 kB each, 9 dB, all hear each other | without CSMA: last delivery p50 205 s, 5.4 overs per object, 136 receptions lost to collisions per run; with CSMA: p50 72 s, 1.8 overs per object, 39 lost, all from stations keying up within the 125 ms carrier-detect delay of each other | `cargo test -p hm-xfer --release --test sim busy_channel -- --nocapture` |
 | Receiver never keys up during an over, 8 kB at 15% loss | 0 frames talked over in 40 runs | `cargo test -p hm-xfer --release --test sim nobody_talks -- --nocapture` |
+| HF: 2 kB at 300 bd, 0.5 Hz Doppler spread, 20 dB mean SNR | 20/20 delivered, p50 199 s, 166 s of airtime; with the VHF link sizes used before, p50 344 s and 231 s | `cargo test -p hm-xfer --release --test sim hf_link_sizing -- --nocapture`; the grid of symbol sizes and over lengths behind the HF sizing: `... explore_hf_parameters_on_fading -- --ignored --nocapture` |
 | Modem frame loss vs SNR, 48 kHz, white noise | 38% of 40-byte frames lost at 5.5 dB, 40% of 360-byte frames at 7 dB, none at or above 9.5 dB; table in `crates/hm-sim/src/afsk_1200.rs` | `HM_WRITE_CURVE=1 cargo test -p hm-sim --release --test afsk afsk_1200_curve -- --ignored` |
 | Modem carrier detect | 68–101 ms after key-up at 7–20 dB SNR | `cargo test -p hm-sim --release --test afsk carrier_detect -- --nocapture` |
 | Modem vs Direwolf 1.8.1, `gen_packets -n 100` at 11–48 kHz | 246 frames decoded vs 236 for Direwolf's better profile (104%) | `cargo test -p hm-modem-afsk --release --test modem -- --nocapture` (needs `direwolf` installed) |
 | Modem vs Direwolf 1.8.1, held out: tilt ±6 dB/octave, SNR down to −4 dB | 333 vs 328 (102%) | same |
 | Modem interop | Direwolf decodes 50/50 of our frames, clean and at 12 dB SNR | same |
-| 5% undetected frame corruption | 33/40 delivered (92% over 400 runs), none corrupt | `cargo test -p hm-xfer --release --test sim heavy_corruption -- --nocapture` |
+| 4 kB, 5% undetected frame corruption | 40/40 delivered, none corrupt | `cargo test -p hm-xfer --release --test sim heavy_corruption -- --nocapture` |
 
 The wire format is in [SPEC.md](SPEC.md), with test vectors verified by an
 independent Python implementation.

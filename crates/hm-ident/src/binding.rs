@@ -163,9 +163,14 @@ impl SignedBinding {
             .collect()
     }
 
-    /// True if `self` should replace `other`: same callsign, higher `seq`.
+    /// True if `self` should replace `other`: same callsign and key, higher
+    /// `seq`. Anyone can self-sign a binding for any callsign, so a record
+    /// under another key never replaces one by sequence number alone; moving
+    /// a callsign to a new key is for the trust list to decide.
     pub fn supersedes(&self, other: &SignedBinding) -> bool {
-        self.record.callsign == other.record.callsign && self.record.seq > other.record.seq
+        self.record.callsign == other.record.callsign
+            && self.record.key == other.record.key
+            && self.record.seq > other.record.seq
     }
 }
 
@@ -241,6 +246,11 @@ mod tests {
             .unwrap();
         assert!(b.supersedes(&a));
         assert!(!a.supersedes(&b));
+        let other = Identity::from_secret([12; 32]);
+        let c = BindingRecord::new(call("SA0KAM"), other.public(), 3, 0)
+            .seal(&other)
+            .unwrap();
+        assert!(!c.supersedes(&b), "another key, whatever its sequence");
     }
 
     #[test]

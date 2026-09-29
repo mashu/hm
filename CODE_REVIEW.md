@@ -15,6 +15,71 @@ tuned for VHF 1200 bd.
 
 ---
 
+## Fix status (branch `claude/admiring-bell-k8drix`, 2026‑09‑29)
+
+Every fix below is covered by tests that fail on the code before it (checked by
+running them against the old code), and the workspace passes `cargo fmt`, `clippy
+-D warnings` and all 326 tests.
+
+| Finding | Status | Commit | What changed |
+| --- | --- | --- | --- |
+| F1 clippy | fixed | `d6f80d1` | `is_none_or` rewrites |
+| F2 relay settings | fixed | `d6f80d1` | `NodeConfig.relay` removed; adverts take the live settings and are re‑advertised on change |
+| F3 ARQ call race | fixed | `d6f80d1` | real daemon bug too: data arriving before `CONNECTED` was dropped; now buffered (bundles only). Fake modem made atomic |
+| P1 congestion amplifier | fixed | `e052e51` | loss estimated only from ACK contents; per‑peer AIMD window caps the over; ACK wait starts when the over has left the air (`Machine::transmitted`) |
+| P2 HF not modelled | fixed | `e052e51`, `7697840` | `Config::for_link` sizes by bit rate; `hf_300` profile (64‑byte symbols, overs up to 60 s, chosen from a measured grid); Watterson fading channel in `hm-sim` with a statistical test against theory; `RadioParams::HF_300` |
+| P3 head‑of‑line blocking | fixed | `e052e51` | several transfers to different peers at once, one over awaiting an ACK; 1 kB behind a silent station: 16 min → 45 s |
+| P4 header overhead | **open** | — | needs a wire‑format decision (compact HF header); symbol fitting removes padding waste meanwhile |
+| P5 IL2P no CRC | documented | this commit | SPEC §2; see correction below |
+| P6 evidence | fixed | `1c0b8e5`, `f0a6ac5` | each beacon once, dated when heard, weight 0.25; heard lists deduplicated; per‑UTC‑hour evidence with other hours pooled at 0.25; blackhole penalty when our message's custody times out with no e2e receipt |
+| P7 route search | fixed | `1c0b8e5` | dominance pruning keyed by first hop; best‑found routes on budget exhaustion |
+| P8 duplicate ⇒ custody | fixed | `f0a6ac5` | a `Failed` relay holding re‑offered is revived with the new metadata |
+| P9 wall‑clock retries | fixed | `f0a6ac5` | own and mailbox messages held until bundle expiry, retried at the longest interval and woken when the destination is heard or links |
+| P10 broadcast repair | **open** | — | fountain‑coded multicast repair is future work |
+| §3 unauthenticated CTRL | documented | this commit | SPEC §7; the daemon already retries after CLOSE refused/too large |
+| §3 open‑hub quotas | fixed | `da9236b` | 256 links, 16 streams and 4 MiB per link, 30 s per message, no up‑front allocation |
+| §3 `supersedes` | fixed | this commit | requires the same key as well |
+| §4 fuzz gaps | mostly fixed | `da9236b` | `ctrl`, `il2p` in the nightly matrix; new `sync` and `routed` targets with seed corpora. Still no fuzzing of the `HMD0` stream reader or the HTTP API |
+
+**Found while fixing (not in the original review):**
+
+- **Relays resent every message they had handed on.** A relay's `InTransit`
+  holding was only ever closed by the suspect timer, since end‑to‑end receipts
+  close only the origin's record. After 24 h each relay requeued and resent
+  every holding, for the life of the bundle. Fixed in `f0a6ac5`: a receipt
+  signed by the destination that passes through the relay closes its holding.
+- **Open‑hub callsign takeover.** With `open_hub`, a stranger's certificate
+  could claim a *trusted* station's callsign under another key: the hub named
+  it by that callsign, replaced the real station's link, and accepted
+  authenticated SYNC control messages from it in that station's name. Fixed in
+  `da9236b`.
+- **`max_rounds` counted every over,** so any object needing more than 12 overs
+  failed however well it was going (50 kB on a near‑clean VHF channel did).
+  Now a transfer fails only after 12 overs in a row bring no progress (`7697840`).
+- **Symbols were not fitted to the object:** a 119‑byte chat bundle went out as
+  a 200‑byte symbol, 81 bytes of padding (`e052e51`).
+
+**Corrections to this review:**
+
+- P5 overstated the IL2P risk to hm. The IL2P type‑1 header (RS t=1) carries
+  the AX.25 addresses; hm's own 18‑byte header (source, session, index) sits in
+  the information field under the block code (t=8 with maximum FEC). A
+  miscorrected type‑1 header mostly fails the destination/PID filter, and a bad
+  symbol that gets through is caught by the object hash at the cost of a decoder
+  restart. Airtime, not integrity.
+- §3 suggested making CLOSE refused advisory: the daemon already treats a
+  refused or too‑large transfer as a failed attempt to retry, and gives up at
+  once only for an empty or self‑addressed object.
+- P6 understated the beacon problem: the daemon re‑fed the whole heard table on
+  every report (at least every 30 s), so one beacon counted as some 20 fresh
+  successes, and a station last heard 20 hours ago still looked like a live
+  radio contact.
+
+The simulator numbers in the README were re‑measured after these changes, with
+an HF row added.
+
+---
+
 ## 0. Reproduced failures on `main` (fix before anything else)
 
 | # | What | Evidence |

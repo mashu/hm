@@ -48,6 +48,13 @@ The payload follows the header. The modem supplies synchronisation and inner FEC
 (IL2P Reed–Solomon or codec2 LDPC), so the header carries no checksum. The source
 callsign is always in clear.
 
+IL2P as NinoTNC and Direwolf send it has no CRC after the Reed–Solomon blocks,
+so a block with more errors than its parity can correct may be "corrected" into
+wrong bytes and passed up. Nothing above needs to trust a symbol: the receiver
+checks every decoded object against the hash in its OFFER and, on a mismatch,
+drops its symbols and collects them again (section 7). A corrupted frame costs
+airtime, never a wrong object.
+
 | Type | Name | Payload |
 | --- | --- | --- |
 | 0 | DATA | preamble and one RaptorQ symbol (section 7) |
@@ -322,6 +329,14 @@ Rules:
   gives a limit below the object's length; otherwise the CLOSE answered a
   corrupted OFFER, and the sender sends its OPEN and OFFER again.
 
+**CTRL and ACK frames are not signed.** Only the receipt in an ACK is. On an
+open channel anyone can send a frame with another station's callsign, so a
+forged CLOSE refused or too large, or an OPEN with a tiny limit, can end a
+transfer. That is a nuisance, not a loss: custody moves only on a verified
+receipt, and a station SHOULD treat a failed transfer as a failed attempt to
+be retried later (the reference daemon does so for refused and too large),
+never as a verdict on the bundle.
+
 ## 8. Beacons
 
 A station announces itself with a BEACON frame: destination broadcast, session
@@ -392,6 +407,14 @@ with TLS 1.3, ALPN `hm-net/1`, and mutual authentication by station key:
   dialer that presents a valid station certificate and names the peer from the
   certificate callsign (a public core hub). Issuers and validity periods carry
   no meaning.
+- An open hub knows a stranger only by its key, so the callsign in its
+  certificate is a claim. The hub refuses a certificate that claims a callsign
+  (or the base of one) it trusts under another key, or one another stranger
+  holds a live link under with another key.
+- An open hub bounds what strangers can make it hold. The reference
+  implementation keeps at most 256 links, lets a peer have at most 16 streams
+  open at once within a 4 MiB receive window per link, and expects each message
+  within 30 s of its stream opening.
 - The dialer's TLS 1.3 handshake completes before the listener has checked the
   dialer's certificate. Once the listener has accepted the dialer, it opens a
   unidirectional stream and sends `"HMOK"`. The dialer counts the link as up
@@ -467,6 +490,20 @@ so the next hop can pull again. It schedules a custody suspect timer (default
 receipt, it reclaims custody (`Queued` again) while the bundle is still valid,
 or marks origin traffic `DeliveredUnconfirmed` / relay traffic `Failed` when
 expired.
+
+A relay that accepts custody of a verified end-to-end receipt (section 11.3)
+for a bundle it holds or handed on, signed by that bundle's destination, closes
+its holding: the bundle arrived, so it is neither sent on nor resent when the
+suspect timer fires. A relay that had given a holding up (`Failed`) and is
+offered custody of the same bundle again takes it back on with the new routing
+metadata, rather than answering it as a duplicate.
+
+Retries are bounded by the bundle's lifetime, not by a count alone. When a
+message has used up its retry budget, the reference daemon keeps an origin
+message, and a holding of a mailbox relay, queued until the bundle expires:
+tried again at the longest retry interval, and at once when its destination is
+heard on the radio or links over the internet. A plain relay gives up and sends
+a custody-fail, so the custodian before it can try another path.
 
 A verified kind-6 custody-fail from the station that accepted custody MUST
 trigger the same reclaim path. End-to-end receipts SHOULD use a longer retry
