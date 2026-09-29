@@ -50,6 +50,7 @@ impl Live {
             relay: self.relay.clone(),
             beacon_secs: self.beacon_secs,
             radio_bitrate: self.radio.bitrate,
+            locator: self.locator,
         }
     }
 

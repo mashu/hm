@@ -1,5 +1,6 @@
 //! Where the node's log lines go, and small formatting helpers.
 
+use std::cell::Cell;
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8,6 +9,22 @@ use hm_wire::{Callsign, ObjectId};
 type Sink = Box<dyn Fn(&str) + Send + Sync>;
 
 static SINK: RwLock<Option<Sink>> = RwLock::new(None);
+
+thread_local! {
+    /// The station whose work this thread is doing, when several share it,
+    /// and its time.
+    static STATION: Cell<Option<(Callsign, u64)>> = const { Cell::new(None) };
+}
+
+/// Run `f` as `station`'s work at `now` (Unix seconds): its log lines name
+/// the station and the time. For a simulation, where many stations share a
+/// thread and time is simulated.
+pub fn as_station<R>(station: Callsign, now: u64, f: impl FnOnce() -> R) -> R {
+    let outer = STATION.replace(Some((station, now)));
+    let result = f();
+    STATION.set(outer);
+    result
+}
 
 /// Send log lines to `sink` instead of standard error (a simulation of many
 /// nodes over weeks may drop them).
@@ -18,7 +35,14 @@ pub fn set_log(sink: impl Fn(&str) + Send + Sync + 'static) {
 /// One log line: to the sink set with [`set_log`], else to standard error
 /// with the time.
 pub fn log(msg: impl AsRef<str>) {
-    let msg = msg.as_ref();
+    let named;
+    let msg = match STATION.get() {
+        Some((station, now)) => {
+            named = format!("{} {station}: {}", utc_clock(now), msg.as_ref());
+            named.as_str()
+        }
+        None => msg.as_ref(),
+    };
     match SINK.read().expect("log sink").as_ref() {
         Some(sink) => sink(msg),
         None => {

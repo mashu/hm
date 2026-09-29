@@ -1,6 +1,7 @@
 //! The settings the node decides with, which may change while it runs.
 
 use hm_store::RetryPolicy;
+use hm_wire::Locator;
 use serde::{Deserialize, Serialize};
 
 use crate::Trust;
@@ -107,4 +108,6 @@ pub struct Settings {
     pub beacon_secs: u64,
     /// Rate of the radio link.
     pub radio_bitrate: u32,
+    /// Grid locator our beacons carry.
+    pub locator: Option<Locator>,
 }

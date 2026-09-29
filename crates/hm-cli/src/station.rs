@@ -17,23 +17,12 @@ use hm_xfer::{Command, Config, Event, Failure, Receipt, Xfer};
 use crate::driver::{run, End, Flow, Link};
 use crate::files::{KeyFile, Trust};
 
-/// Chat expires after an hour; mail after a week. Relays use this; the local
-/// queue retries on its own schedule.
-const CHAT_TTL: u32 = 3600;
-const MAIL_TTL: u32 = 7 * 86_400;
 /// Bulletins stay useful for a day on a shared channel.
 pub const BULLETIN_TTL: u32 = 86_400;
 /// Local publishes allowed in a rolling hour.
 pub const MAX_BULLETINS_PER_HOUR: usize = 4;
 
-/// Link parameters the transfer engine uses to time overs.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct LinkTiming {
-    pub bitrate_bps: u32,
-    pub txdelay_ms: u64,
-    pub guard_ms: u64,
-    pub max_rounds: u8,
-}
+pub use hm_node::LinkTiming;
 
 /// One station's key, trust and link timing, borrowed for a send or a listen.
 pub struct Station<'a> {
@@ -56,7 +45,7 @@ pub enum SendOutcome {
 }
 
 pub use hm_node::message::{
-    open_message, Message, Verification, MAX_BULLETIN_BYTES, MAX_INBOUND_BULLETINS_PER_ORIGIN_HOUR,
+    open_message, Draft, Message, Verification, MAX_BULLETIN_BYTES, MAX_INBOUND_BULLETINS_PER_ORIGIN_HOUR,
 };
 pub use hm_node::utc_clock;
 
@@ -159,23 +148,14 @@ pub fn build_bundle(
     prec: Precedence,
     seq: Option<u64>,
 ) -> Result<SignedBundle, BundleError> {
-    let (kind, ttl) = match subject {
-        Some(_) => (Kind::Mail, MAIL_TTL),
-        None => (Kind::Chat, CHAT_TTL),
-    };
-    let mut bundle = Bundle::new(me, kind, unix_now(), ttl)
-        .to(Address::Station(to))
-        .with_text(text)
-        .with_precedence(prec);
-    if let Some(subject) = subject {
-        bundle = bundle.with_subject(subject);
+    Draft {
+        to,
+        text,
+        subject,
+        precedence: prec,
+        seq,
     }
-    if kind == Kind::Chat {
-        if let Some(seq) = seq {
-            bundle = bundle.with_seq(seq);
-        }
-    }
-    bundle.seal(&key.identity)
+    .seal(&key.identity, me, unix_now())
 }
 
 /// Seal an RF bulletin to a named group. Always routine precedence; no station

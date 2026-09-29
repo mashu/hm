@@ -401,7 +401,17 @@ impl Store {
 
     /// Open the store at `path`, creating it if needed.
     pub fn open(path: impl AsRef<Path>) -> Result<Store> {
-        let db = Self::builder().create(path)?;
+        Self::init(Self::builder().create(path)?)
+    }
+
+    /// A store in memory, gone when dropped: for simulations, which give each
+    /// of many stations a store of its own.
+    pub fn in_memory() -> Result<Store> {
+        // One process only: the shared-file concurrency mode needs a file.
+        Self::init(redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?)
+    }
+
+    fn init(db: Database) -> Result<Store> {
         let tx = db.begin_write()?;
         {
             tx.open_table(OBJECTS)?;
