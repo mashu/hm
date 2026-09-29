@@ -30,15 +30,15 @@ running them against the old code), and the workspace passes `cargo fmt`, `clipp
 | P2 HF not modelled | fixed | `e052e51`, `7697840` | `Config::for_link` sizes by bit rate; `hf_300` profile (64‑byte symbols, overs up to 60 s, chosen from a measured grid); Watterson fading channel in `hm-sim` with a statistical test against theory; `RadioParams::HF_300` |
 | P3 head‑of‑line blocking | fixed | `e052e51` | several transfers to different peers at once, one over awaiting an ACK; 1 kB behind a silent station: 16 min → 45 s |
 | P4 header overhead | **open** | — | needs a wire‑format decision (compact HF header); symbol fitting removes padding waste meanwhile |
-| P5 IL2P no CRC | documented | this commit | SPEC §2; see correction below |
+| P5 IL2P no CRC | documented | `4492dcf` | SPEC §2; see correction below |
 | P6 evidence | fixed | `1c0b8e5`, `f0a6ac5` | each beacon once, dated when heard, weight 0.25; heard lists deduplicated; per‑UTC‑hour evidence with other hours pooled at 0.25; blackhole penalty when our message's custody times out with no e2e receipt |
 | P7 route search | fixed | `1c0b8e5` | dominance pruning keyed by first hop; best‑found routes on budget exhaustion |
 | P8 duplicate ⇒ custody | fixed | `f0a6ac5` | a `Failed` relay holding re‑offered is revived with the new metadata |
 | P9 wall‑clock retries | fixed | `f0a6ac5` | own and mailbox messages held until bundle expiry, retried at the longest interval and woken when the destination is heard or links |
 | P10 broadcast repair | **open** | — | fountain‑coded multicast repair is future work |
-| §3 unauthenticated CTRL | documented | this commit | SPEC §7; the daemon already retries after CLOSE refused/too large |
+| §3 unauthenticated CTRL | documented | `4492dcf` | SPEC §7; the daemon already retries after CLOSE refused/too large |
 | §3 open‑hub quotas | fixed | `da9236b` | 256 links, 16 streams and 4 MiB per link, 30 s per message, no up‑front allocation |
-| §3 `supersedes` | fixed | this commit | requires the same key as well |
+| §3 `supersedes` | fixed | `4492dcf` | requires the same key as well |
 | §4 fuzz gaps | mostly fixed | `da9236b` | `ctrl`, `il2p` in the nightly matrix; new `sync` and `routed` targets with seed corpora. Still no fuzzing of the `HMD0` stream reader or the HTTP API |
 
 **Found while fixing (not in the original review):**
