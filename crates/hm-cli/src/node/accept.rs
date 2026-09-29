@@ -3,7 +3,7 @@
 use hm_bundle::{Address, Bundle, Kind, Opened};
 use hm_ident::{Identity, PublicKey};
 use hm_net::Verdict;
-use hm_store::{AdmissionLimits, Direction, QueuedMessage, ReceivedMessage, RelayMetadata, Store};
+use hm_store::{AdmissionLimits, Direction, QueuedMessage, ReceivedMessage, RelayMetadata, State, Store};
 use hm_wire::{unwrap_routed, Callsign};
 
 use super::types::{addressed_to_us, log, short, Notify};
@@ -182,11 +182,15 @@ pub(crate) fn accept(
         if hop_count >= max_hops || visited.contains(&me) {
             return Acceptance::Rejected("hop limit or routing loop".into());
         }
-        match store.record(m.id) {
+        // A holding this node gave up on is taken on again when custody is
+        // offered anew: the sender has a reason to believe it is reachable
+        // now. Anything else already held is a duplicate.
+        let revive = match store.record(m.id) {
+            Ok(Some(record)) if record.direction == Direction::Relay && record.state == State::Failed => true,
             Ok(Some(_)) => return Acceptance::Duplicate,
-            Ok(None) => {}
+            Ok(None) => false,
             Err(error) => return Acceptance::Rejected(format!("store: {error}")),
-        }
+        };
         let usage = match store.relay_usage(now) {
             Ok(usage) => usage,
             Err(error) => return Acceptance::Rejected(format!("store: {error}")),
@@ -208,11 +212,17 @@ pub(crate) fn accept(
             expires_at: bundle.expires_at(),
             wire_seq: bundle.seq,
         };
-        return match store.enqueue_relay(m.id, inner, metadata, now) {
+        let stored = if revive {
+            store.revive_relay(m.id, metadata, now)
+        } else {
+            store.enqueue_relay(m.id, inner, metadata, now)
+        };
+        let acceptance = match stored {
             Ok(true) => {
                 log(format!(
-                    "accepted custody of {} from {via} for {destination}",
-                    short(&m.id)
+                    "accepted custody of {} from {via} for {destination}{}",
+                    short(&m.id),
+                    if revive { " again" } else { "" }
                 ));
                 notify.send("message");
                 Acceptance::Stored
@@ -220,6 +230,22 @@ pub(crate) fn accept(
             Ok(false) => Acceptance::Duplicate,
             Err(error) => Acceptance::Rejected(format!("store: {error}")),
         };
+        // A destination's receipt on its way back to the origin closes the
+        // holding it answers, if it passed this way.
+        if bundle.kind == Kind::Receipt && acceptance.custody_accepted() {
+            if let Some(original) = bundle.reply_to {
+                match store.relay_receipted(original, m.id, bundle.from, now) {
+                    Ok(true) => log(format!(
+                        "relayed {} delivered to {}; holding closed",
+                        short(&original),
+                        bundle.from
+                    )),
+                    Ok(false) => {}
+                    Err(error) => log(format!("could not apply receipt {}: {error}", short(&m.id))),
+                }
+            }
+        }
+        return acceptance;
     }
     if bundle.kind == Kind::CustodyFail {
         let stored = match store.put_received(m.id, inner, via, verified, now) {

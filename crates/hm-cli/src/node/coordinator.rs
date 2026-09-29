@@ -122,6 +122,39 @@ fn retry_policy_for(store: &Store, id: ObjectId, live: &super::live::Live) -> hm
     }
 }
 
+/// Whether a message that has used up its retries is held until its bundle
+/// expires rather than given up: our own messages, and holdings of a mailbox
+/// relay, whose job is to wait for a destination that is rarely in reach.
+/// A plain relay gives up so the custodian before it can try another path.
+fn holds_until_expiry(store: &Store, id: ObjectId, live: &super::live::Live) -> bool {
+    match store.record(id) {
+        Ok(Some(record)) => match record.direction {
+            Direction::Out => true,
+            Direction::Relay => live.relay.mailbox,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// `station` is in reach: try its queued messages now rather than at their
+/// next scheduled retry, which may be an hour away.
+fn wake_for(store: &Store, station: Callsign, how: &str, now: u64) {
+    match store.wake(station, now) {
+        Ok(0) => {}
+        Ok(woken) => log(format!("{station} {how}: trying {woken} queued message(s) now")),
+        Err(error) => log(format!("store: {error}")),
+    }
+}
+
+/// The routing bearer a handoff went over, from the name the store keeps.
+fn bearer_named(name: &str) -> Option<RouteBearer> {
+    [Bearer::Radio, Bearer::Internet, Bearer::Modem]
+        .into_iter()
+        .find(|bearer| bearer.name() == name)
+        .map(route_bearer)
+}
+
 /// Publish signed claims for our own scheduled contacts, numbered from `base`.
 /// Peers keep the claim with the newest sequence number, so republishing with
 /// a higher base replaces what they hold, for example after the relay or
@@ -276,11 +309,19 @@ pub(crate) async fn coordinator(
                 if let Err(error) = store.clear_next_hop(id, peer) {
                     log(format!("store: {error}"));
                 }
-                let policy = retry_policy_for(store, id, &live.get());
+                let settings = live.get();
+                let policy = retry_policy_for(store, id, &settings);
                 let r = if permanent {
                     store.abandon(id, &reason).map(|notify| (Retry::GaveUp, notify))
                 } else {
-                    store.attempt_failed(id, &format!("{reason} ({})", bearer.name()), policy, now)
+                    let hold = holds_until_expiry(store, id, &settings);
+                    store.attempt_failed_or_hold(
+                        id,
+                        &format!("{reason} ({})", bearer.name()),
+                        policy,
+                        now,
+                        hold,
+                    )
                 };
                 match r {
                     Ok((Retry::At(t), _)) => log(format!(
@@ -419,6 +460,7 @@ pub(crate) async fn coordinator(
                             continue;
                         }
                         beacons_seen.insert(station.call, beacon.at);
+                        wake_for(store, station.call, "heard", now);
                         let advert_key = (station.call, RouteBearer::Radio);
                         let advertised_at = advertised_live.get(&advert_key).copied().unwrap_or(0);
                         if now.saturating_sub(advertised_at) >= 10 * 60 {
@@ -764,6 +806,7 @@ pub(crate) async fn coordinator(
                     }
                     if !known_internet_links.contains(peer) {
                         graph.record_delivery(cfg.me, *peer, RouteBearer::Internet, true, now);
+                        wake_for(store, *peer, "linked", now);
                         match control.contact_messages() {
                             Ok(messages) => {
                                 for payload in messages {
@@ -845,6 +888,18 @@ pub(crate) async fn coordinator(
                         for record in suspects {
                             if in_flight.keys().any(|(id, _)| *id == record.id) {
                                 continue;
+                            }
+                            // Our own message went to a custodian and no receipt
+                            // came back in all that time, by any path: count it
+                            // against that hop, so a station that takes custody
+                            // and drops it stops attracting traffic.
+                            if record.direction == Direction::Out {
+                                if let (Some(custodian), Some(bearer)) = (
+                                    record.custody_by,
+                                    record.by.as_deref().and_then(bearer_named),
+                                ) {
+                                    graph.record_delivery(cfg.me, custodian, bearer, false, now);
+                                }
                             }
                             match store.reclaim_custody(
                                 record.id,

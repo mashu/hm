@@ -488,7 +488,10 @@ fn four_internet_nodes_relay_end_to_end_without_flooding() {
             .iter()
             .find(|record| record.final_destination() == bob.call)
             .expect("relay retained one audit copy of the original");
-        assert_eq!(original.state, State::InTransit);
+        // Bob's receipt came back the same way and closed each holding, so
+        // no relay resends the message when its suspect timer fires.
+        assert_eq!(original.state, State::Delivered);
+        assert!(original.e2e_receipt.is_some());
     }
 }
 
