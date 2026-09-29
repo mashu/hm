@@ -1,9 +1,49 @@
+//! Route choice as a decision: the route that maximises expected utility.
+//!
+//! A route delivers with probability `P` (each hop's link completes, its
+//! custodian accepts, intermediate custodians do their part, all estimated
+//! from the station's beliefs), arrives at `a`, and costs airtime and money
+//! on each hop it reaches. Its utility is
+//!
+//! ```text
+//! U(r) = P · u(a) − C,     C = Σ_h P(reach hop h) · cost(bearer_h)
+//! ```
+//!
+//! where `u` is the value of delivering at `a` relative to delivering now:
+//! falling linearly to nothing at the message's expiry, or halving every
+//! [`URGENT_HALF_LIFE`] for urgent traffic. Costs are in units of one
+//! delivered message's value.
+//!
+//! The search is A* over partial routes (labels) with the bound
+//! `P·u(arrival) − C`, which can only fall as a label is extended: the first
+//! complete routes out of the queue are the best. Labels dominated in every
+//! respect (less likely, later, dearer, more airtime, fewer stations still
+//! open to them) by one already expanded at the same station through the
+//! same first hop are dropped.
+//!
+//! A route that fails is not the end: the custodian tries another. A failed
+//! first hop is known within the transfer; a loss further on only when the
+//! custody suspect timer fires, much later. The final ranking counts the
+//! first: `U(r) + (1 − p₁) · U(best other way still open once r's first hop
+//! has failed)`, with `p₁` the first hop's chance. A cheap, likely radio hop
+//! that has the internet to fall back on can beat going to the internet
+//! straight away, and a slow sure route can beat a fast doubtful one that has
+//! no fallback.
+//!
+//! Urgent traffic may go two ways at once when the time saved outweighs the
+//! cost of the second copy (compared by utility, not by a threshold on the
+//! gain in probability).
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 
+use hm_model::Estimate;
 use hm_wire::Callsign;
 
 use crate::{Bearer, ContactGraph, ContactKey, GraphError};
+
+/// An urgent message loses half its value every this many seconds.
+pub const URGENT_HALF_LIFE: u64 = 600;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteHop {
@@ -19,8 +59,16 @@ pub struct Route {
     pub hops: Vec<RouteHop>,
     pub arrival: u64,
     pub airtime_millis: u64,
+    /// Chance the route delivers.
     pub success_probability: f64,
+    /// Chance its first hop completes (the link, and the custodian accepting).
+    pub first_hop_probability: f64,
+    /// `−ln P`.
     pub risk_cost: f64,
+    /// Expected attempt cost, in delivered messages' value.
+    pub attempt_cost: f64,
+    /// Expected utility, fallbacks counted.
+    pub utility: f64,
 }
 
 impl Route {
@@ -49,7 +97,22 @@ pub struct RouteRequest<'a> {
     pub airtime_budget_millis: u64,
     pub visited: &'a [Callsign],
     pub excluded_contacts: &'a [ContactKey],
+    /// Time-critical: value halves every [`URGENT_HALF_LIFE`], and two copies
+    /// may go two ways at once.
     pub urgent: bool,
+}
+
+impl RouteRequest<'_> {
+    /// Value of delivering at `t` relative to delivering now.
+    pub fn value_at(&self, t: u64) -> f64 {
+        let elapsed = t.saturating_sub(self.now) as f64;
+        if self.urgent {
+            (-elapsed / URGENT_HALF_LIFE as f64).exp2()
+        } else {
+            let life = self.expires_at.saturating_sub(self.now).max(1) as f64;
+            (1.0 - elapsed / life).clamp(0.0, 1.0)
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -57,7 +120,9 @@ pub struct RoutingPolicy {
     pub max_candidates: usize,
     pub max_alternatives: usize,
     pub max_labels: usize,
-    pub urgent_min_gain: f64,
+    /// Cost of an attempt on each bearer ([`Bearer::index`]), in delivered
+    /// messages' value.
+    pub attempt_cost: [f64; 3],
 }
 
 impl Default for RoutingPolicy {
@@ -66,7 +131,7 @@ impl Default for RoutingPolicy {
             max_candidates: 32,
             max_alternatives: 3,
             max_labels: 16_384,
-            urgent_min_gain: 0.05,
+            attempt_cost: [0.01, 0.02, 0.015],
         }
     }
 }
@@ -77,7 +142,9 @@ pub struct RoutePlan {
     pub active: Vec<Route>,
     /// Ordered routes activated one at a time after a handoff failure.
     pub alternatives: Vec<Route>,
+    /// Chance of delivery with the active routes and the best fallback.
     pub combined_success_probability: f64,
+    pub expected_utility: f64,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -107,6 +174,10 @@ struct Label {
     arrival: u64,
     airtime_millis: u64,
     risk_cost: f64,
+    attempt_cost: f64,
+    first_probability: f64,
+    /// Upper bound on the utility of any route through this label.
+    bound: f64,
     hops: Vec<RouteHop>,
     visited: Vec<Callsign>,
 }
@@ -127,37 +198,54 @@ impl PartialOrd for Label {
 
 impl Ord for Label {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Reverse the natural route order: BinaryHeap pops the best label.
+        // BinaryHeap pops the greatest: the best label is the greatest.
         label_order(other, self)
     }
 }
 
 pub fn plan_routes(
     graph: &ContactGraph,
+    estimate: &mut dyn Estimate,
     request: &RouteRequest<'_>,
     policy: RoutingPolicy,
 ) -> Result<RoutePlan, RouteError> {
     validate_request(request, policy)?;
-    let candidates = find_candidates(graph, request, policy)?;
+    let mut candidates = find_candidates(graph, estimate, request, policy)?;
+    rank_with_fallbacks(graph, request, &mut candidates);
     let Some(primary) = candidates.first().cloned() else {
         return Err(RouteError::NoRoute);
     };
+    let fallback = best_fallback(graph, request, &primary, &candidates);
     let mut active = vec![primary.clone()];
     let mut used = vec![0_usize];
-    let mut combined = primary.success_probability;
+    let mut combined = primary.success_probability
+        + (1.0 - primary.first_hop_probability) * fallback.map_or(0.0, |f| f.success_probability);
+    let mut expected_utility = primary.utility;
     if request.urgent {
-        if let Some((index, secondary)) = candidates.iter().enumerate().skip(1).find(|(_, route)| {
-            if !primary.edge_disjoint(route)
-                || primary.airtime_millis.saturating_add(route.airtime_millis) > request.airtime_budget_millis
-            {
-                return false;
+        let p1 = primary.success_probability;
+        let first = p1 * request.value_at(primary.arrival) - primary.attempt_cost;
+        let best = candidates
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(_, route)| {
+                primary.edge_disjoint(route)
+                    && primary.airtime_millis.saturating_add(route.airtime_millis)
+                        <= request.airtime_budget_millis
+            })
+            .map(|(index, route)| {
+                let both = first + (1.0 - p1) * route.success_probability * request.value_at(route.arrival)
+                    - route.attempt_cost;
+                (index, route, both)
+            })
+            .max_by(|a, b| a.2.total_cmp(&b.2));
+        if let Some((index, secondary, both)) = best {
+            if both > primary.utility {
+                combined = 1.0 - (1.0 - p1) * (1.0 - secondary.success_probability);
+                expected_utility = both;
+                active.push(secondary.clone());
+                used.push(index);
             }
-            let probability = 1.0 - (1.0 - primary.success_probability) * (1.0 - route.success_probability);
-            probability - primary.success_probability >= policy.urgent_min_gain
-        }) {
-            combined = 1.0 - (1.0 - primary.success_probability) * (1.0 - secondary.success_probability);
-            active.push(secondary.clone());
-            used.push(index);
         }
     }
     let alternatives = candidates
@@ -170,7 +258,8 @@ pub fn plan_routes(
     Ok(RoutePlan {
         active,
         alternatives,
-        combined_success_probability: combined,
+        combined_success_probability: combined.clamp(0.0, 1.0),
+        expected_utility,
     })
 }
 
@@ -199,9 +288,69 @@ pub fn release_active(graph: &mut ContactGraph, plan: &RoutePlan, object_bytes: 
     }
 }
 
+/// Utility of `route` on its own: `P·u(a) − C`.
+fn own_utility(request: &RouteRequest<'_>, route: &Route, delay: u64) -> f64 {
+    route.success_probability * request.value_at(route.arrival.saturating_add(delay)) - route.attempt_cost
+}
+
+/// The best other way once `route`'s first hop has failed: a route whose
+/// first contact differs and is still open when `route`'s first hop would
+/// have arrived, its arrival pushed back by the wait.
+fn best_fallback<'r>(
+    graph: &ContactGraph,
+    request: &RouteRequest<'_>,
+    route: &Route,
+    candidates: &'r [Route],
+) -> Option<&'r Route> {
+    let first = route.hops.first()?;
+    candidates
+        .iter()
+        .filter(|other| {
+            other.hops.first().is_some_and(|hop| {
+                hop.contact != first.contact
+                    && graph
+                        .contact(hop.contact)
+                        .is_some_and(|contact| contact.end > first.arrive.max(hop.depart))
+            })
+        })
+        .max_by(|a, b| {
+            fallback_utility(request, first.arrive, a).total_cmp(&fallback_utility(request, first.arrive, b))
+        })
+}
+
+fn fallback_utility(request: &RouteRequest<'_>, failed_at: u64, route: &Route) -> f64 {
+    let delay = route
+        .hops
+        .first()
+        .map_or(0, |hop| failed_at.saturating_sub(hop.depart));
+    own_utility(request, route, delay).max(0.0)
+}
+
+/// Rank candidates by utility with the best fallback counted.
+fn rank_with_fallbacks(graph: &ContactGraph, request: &RouteRequest<'_>, candidates: &mut [Route]) {
+    let utilities: Vec<f64> = candidates
+        .iter()
+        .map(|route| {
+            let fallback = best_fallback(graph, request, route, candidates).map_or(0.0, |other| {
+                fallback_utility(
+                    request,
+                    route.hops.first().map_or(request.now, |h| h.arrive),
+                    other,
+                )
+            });
+            own_utility(request, route, 0) + (1.0 - route.first_hop_probability) * fallback
+        })
+        .collect();
+    for (route, utility) in candidates.iter_mut().zip(utilities) {
+        route.utility = utility;
+    }
+    candidates.sort_by(route_order);
+}
+
 /// What a label that was expanded left for later labels to be compared with.
 struct Expanded {
     risk_cost: f64,
+    attempt_cost: f64,
     arrival: u64,
     airtime_millis: u64,
     visited: Vec<Callsign>,
@@ -209,24 +358,26 @@ struct Expanded {
 
 impl Expanded {
     /// Whatever `label` could still reach, this one reached no later, with no
-    /// more risk or airtime, and with no more stations ruled out on the way:
-    /// every route through `label` has one at least as good through this.
+    /// more risk, cost or airtime, and with no more stations ruled out on the
+    /// way: every route through `label` has one at least as good through this.
     fn dominates(&self, label: &Label) -> bool {
         self.risk_cost <= label.risk_cost
+            && self.attempt_cost <= label.attempt_cost
             && self.arrival <= label.arrival
             && self.airtime_millis <= label.airtime_millis
             && self.visited.iter().all(|station| label.visited.contains(station))
     }
 }
 
-/// Routes to the destination, best first. A best-first search over labels
-/// (partial routes), pruned by dominance: a label is not expanded when an
-/// expanded one at the same station, with the same first hop, dominates it.
-/// Keeping first hops apart keeps alternatives through other neighbours for
-/// failover and urgent copies. When the label budget runs out, the routes
-/// found so far are returned; only a search that found none fails.
+/// Routes to the destination, best bound first. A* over labels, pruned by
+/// dominance: a label is not expanded when an expanded one at the same
+/// station, with the same first hop, dominates it. Keeping first hops apart
+/// keeps alternatives through other neighbours for failover and urgent
+/// copies. When the label budget runs out, the routes found so far are
+/// returned; only a search that found none fails.
 fn find_candidates(
     graph: &ContactGraph,
+    estimate: &mut dyn Estimate,
     request: &RouteRequest<'_>,
     policy: RoutingPolicy,
 ) -> Result<Vec<Route>, RouteError> {
@@ -241,6 +392,9 @@ fn find_candidates(
         arrival: request.now,
         airtime_millis: 0,
         risk_cost: 0.0,
+        attempt_cost: 0.0,
+        first_probability: 1.0,
+        bound: 1.0,
         hops: Vec::new(),
         visited,
     });
@@ -272,11 +426,13 @@ fn find_candidates(
             }
             seen.push(Expanded {
                 risk_cost: label.risk_cost,
+                attempt_cost: label.attempt_cost,
                 arrival: label.arrival,
                 airtime_millis: label.airtime_millis,
                 visited: label.visited.clone(),
             });
         }
+        let reach = (-label.risk_cost).exp();
         for contact in graph.outgoing(label.station, request.now) {
             if request.excluded_contacts.contains(&contact.key)
                 || label.visited.contains(&contact.key.to)
@@ -311,7 +467,22 @@ fn find_candidates(
             if airtime_millis > request.airtime_budget_millis {
                 continue;
             }
-            let probability = graph.conservative_probability(contact, depart);
+            let to = contact.key.to;
+            let handed = (estimate.link(contact.key.link(), depart, contact.stated())
+                * estimate.accepts(to, arrive))
+            .clamp(1.0e-9, 1.0);
+            let probability = if to == request.destination {
+                handed
+            } else {
+                (handed * estimate.delivers(to)).clamp(1.0e-9, 1.0)
+            };
+            let first_probability = if label.hops.is_empty() {
+                handed
+            } else {
+                label.first_probability
+            };
+            let risk_cost = label.risk_cost - probability.ln();
+            let attempt_cost = label.attempt_cost + reach * policy.attempt_cost[contact.key.bearer.index()];
             let mut hops = label.hops.clone();
             hops.push(RouteHop {
                 contact: contact.key,
@@ -321,12 +492,15 @@ fn find_candidates(
                 probability_permillion: (probability * 1_000_000.0).round() as u32,
             });
             let mut path = label.visited.clone();
-            path.push(contact.key.to);
+            path.push(to);
             let next = Label {
-                station: contact.key.to,
+                station: to,
                 arrival: arrive,
                 airtime_millis,
-                risk_cost: label.risk_cost - probability.ln(),
+                risk_cost,
+                attempt_cost,
+                first_probability,
+                bound: (-risk_cost).exp() * request.value_at(arrive) - attempt_cost,
                 hops,
                 visited: path,
             };
@@ -339,7 +513,6 @@ fn find_candidates(
             }
         }
     }
-    routes.sort_by(route_order);
     routes.dedup_by(|left, right| {
         left.hops
             .iter()
@@ -365,7 +538,10 @@ fn validate_request(request: &RouteRequest<'_>, policy: RoutingPolicy) -> Result
     if policy.max_candidates == 0
         || policy.max_alternatives == 0
         || policy.max_labels == 0
-        || !(0.0..1.0).contains(&policy.urgent_min_gain)
+        || policy
+            .attempt_cost
+            .iter()
+            .any(|cost| !cost.is_finite() || *cost < 0.0)
     {
         return Err(RouteError::InvalidRequest("routing policy"));
     }
@@ -383,16 +559,21 @@ fn validate_request(request: &RouteRequest<'_>, policy: RoutingPolicy) -> Result
 fn route_from_label(label: Label) -> Route {
     Route {
         success_probability: (-label.risk_cost).exp(),
+        first_hop_probability: label.first_probability,
         risk_cost: label.risk_cost,
+        attempt_cost: label.attempt_cost,
+        utility: label.bound,
         arrival: label.arrival,
         airtime_millis: label.airtime_millis,
         hops: label.hops,
     }
 }
 
+/// Best first: higher utility, then earlier, less airtime, fewer hops.
 fn route_order(left: &Route, right: &Route) -> Ordering {
-    left.risk_cost
-        .total_cmp(&right.risk_cost)
+    right
+        .utility
+        .total_cmp(&left.utility)
         .then(left.arrival.cmp(&right.arrival))
         .then(left.airtime_millis.cmp(&right.airtime_millis))
         .then(left.hops.len().cmp(&right.hops.len()))
@@ -404,9 +585,11 @@ fn route_order(left: &Route, right: &Route) -> Ordering {
         })
 }
 
+/// Best first: higher bound, then earlier, less airtime, fewer hops.
 fn label_order(left: &Label, right: &Label) -> Ordering {
-    left.risk_cost
-        .total_cmp(&right.risk_cost)
+    right
+        .bound
+        .total_cmp(&left.bound)
         .then(left.arrival.cmp(&right.arrival))
         .then(left.airtime_millis.cmp(&right.airtime_millis))
         .then(left.hops.len().cmp(&right.hops.len()))
@@ -414,310 +597,4 @@ fn label_order(left: &Label, right: &Label) -> Ordering {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{GraphConfig, ScheduledContact};
-
-    fn call(value: &str) -> Callsign {
-        value.parse().unwrap()
-    }
-
-    fn add(
-        graph: &mut ContactGraph,
-        from: &str,
-        to: &str,
-        bearer: Bearer,
-        spec: (u64, u64, u64, u16),
-    ) -> ContactKey {
-        let (start, end, capacity, probability) = spec;
-        graph
-            .add_schedule(ScheduledContact {
-                from: call(from),
-                to: call(to),
-                bearer,
-                start,
-                end,
-                rate_bps: 8_000,
-                capacity_bytes: capacity,
-                success_permyriad: Some(probability),
-                flags: 0,
-            })
-            .unwrap()
-    }
-
-    fn request<'a>(visited: &'a [Callsign], excluded: &'a [ContactKey]) -> RouteRequest<'a> {
-        RouteRequest {
-            source: call("M0AAA"),
-            destination: call("M0DDD"),
-            now: 0,
-            expires_at: 1_000,
-            object_bytes: 1_000,
-            max_hops: 8,
-            airtime_budget_millis: 10_000,
-            visited,
-            excluded_contacts: excluded,
-            urgent: false,
-        }
-    }
-
-    #[test]
-    fn chooses_probability_then_eta_and_keeps_failovers() {
-        let mut graph = ContactGraph::new(GraphConfig::default()).unwrap();
-        add(
-            &mut graph,
-            "M0AAA",
-            "M0BBB",
-            Bearer::Internet,
-            (0, 500, 5_000, 10_000),
-        );
-        add(
-            &mut graph,
-            "M0BBB",
-            "M0DDD",
-            Bearer::Internet,
-            (0, 500, 5_000, 10_000),
-        );
-        add(
-            &mut graph,
-            "M0AAA",
-            "M0CCC",
-            Bearer::Internet,
-            (0, 300, 5_000, 7_000),
-        );
-        add(
-            &mut graph,
-            "M0CCC",
-            "M0DDD",
-            Bearer::Internet,
-            (0, 300, 5_000, 7_000),
-        );
-        add(
-            &mut graph,
-            "M0AAA",
-            "M0DDD",
-            Bearer::Internet,
-            (100, 500, 5_000, 0),
-        );
-        let plan = plan_routes(&graph, &request(&[], &[]), RoutingPolicy::default()).unwrap();
-        assert_eq!(plan.active.len(), 1);
-        assert_eq!(plan.active[0].next_hop(), Some(call("M0BBB")));
-        assert_eq!(plan.alternatives.len(), 2);
-    }
-
-    #[test]
-    fn rejects_capacity_deadline_airtime_loops_and_hop_limit() {
-        let mut graph = ContactGraph::new(GraphConfig::default()).unwrap();
-        add(&mut graph, "M0AAA", "M0BBB", Bearer::Radio, (0, 100, 999, 9_000));
-        add(
-            &mut graph,
-            "M0BBB",
-            "M0DDD",
-            Bearer::Radio,
-            (0, 100, 10_000, 9_000),
-        );
-        assert_eq!(
-            plan_routes(&graph, &request(&[], &[]), RoutingPolicy::default()),
-            Err(RouteError::NoRoute)
-        );
-
-        let mut graph = ContactGraph::new(GraphConfig::default()).unwrap();
-        add(
-            &mut graph,
-            "M0AAA",
-            "M0BBB",
-            Bearer::Internet,
-            (0, 100, 10_000, 9_000),
-        );
-        add(
-            &mut graph,
-            "M0BBB",
-            "M0AAA",
-            Bearer::Internet,
-            (0, 100, 10_000, 9_000),
-        );
-        add(
-            &mut graph,
-            "M0BBB",
-            "M0DDD",
-            Bearer::Internet,
-            (200, 201, 10_000, 9_000),
-        );
-        let mut deadline = request(&[], &[]);
-        deadline.expires_at = 199;
-        assert_eq!(
-            plan_routes(&graph, &deadline, RoutingPolicy::default()),
-            Err(RouteError::NoRoute)
-        );
-    }
-
-    #[test]
-    fn urgent_replication_is_two_edge_disjoint_copies_only() {
-        let mut graph = ContactGraph::new(GraphConfig::default()).unwrap();
-        for middle in ["M0BBB", "M0CCC", "M0EEE"] {
-            add(
-                &mut graph,
-                "M0AAA",
-                middle,
-                Bearer::Internet,
-                (0, 500, 5_000, 7_000),
-            );
-            add(
-                &mut graph,
-                middle,
-                "M0DDD",
-                Bearer::Internet,
-                (0, 500, 5_000, 7_000),
-            );
-        }
-        let mut request = request(&[], &[]);
-        request.urgent = true;
-        let plan = plan_routes(
-            &graph,
-            &request,
-            RoutingPolicy {
-                urgent_min_gain: 0.01,
-                ..RoutingPolicy::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(plan.active.len(), 2);
-        assert!(plan.active[0].edge_disjoint(&plan.active[1]));
-        assert!(plan.combined_success_probability > plan.active[0].success_probability);
-    }
-
-    #[test]
-    fn reservation_is_all_or_nothing() {
-        let mut graph = ContactGraph::new(GraphConfig::default()).unwrap();
-        let first = add(
-            &mut graph,
-            "M0AAA",
-            "M0BBB",
-            Bearer::Internet,
-            (0, 500, 1_000, 9_000),
-        );
-        let second = add(
-            &mut graph,
-            "M0BBB",
-            "M0DDD",
-            Bearer::Internet,
-            (0, 500, 1_000, 9_000),
-        );
-        let plan = plan_routes(&graph, &request(&[], &[]), RoutingPolicy::default()).unwrap();
-        reserve_active(&mut graph, &plan, 1_000).unwrap();
-        assert_eq!(graph.contact(first).unwrap().residual_capacity(), 0);
-        assert_eq!(graph.contact(second).unwrap().residual_capacity(), 0);
-        release_active(&mut graph, &plan, 1_000);
-        assert_eq!(graph.contact(first).unwrap().residual_capacity(), 1_000);
-        assert_eq!(graph.contact(second).unwrap().residual_capacity(), 1_000);
-    }
-}
-
-#[cfg(test)]
-mod search_limit {
-    use super::*;
-    use crate::{GraphConfig, ScheduledContact};
-
-    fn call(value: &str) -> Callsign {
-        value.parse().unwrap()
-    }
-
-    /// A reliable internet cluster of nine stations, all linked to each
-    /// other, and the destination reachable only by radio from one of them.
-    fn cluster_with_radio_last_hop() -> ContactGraph {
-        let mut graph = ContactGraph::new(GraphConfig::default()).unwrap();
-        let cluster: Vec<Callsign> = (1..=9).map(|i| call(&format!("M0C{i}"))).collect();
-        let mut add = |from: Callsign, to: Callsign, bearer: Bearer, success: u16| {
-            graph
-                .add_schedule(ScheduledContact {
-                    from,
-                    to,
-                    bearer,
-                    start: 0,
-                    end: 10_000,
-                    rate_bps: 1_200,
-                    capacity_bytes: 1_000_000,
-                    success_permyriad: Some(success),
-                    flags: 0,
-                })
-                .unwrap();
-        };
-        for &a in &cluster {
-            add(call("M0SRC"), a, Bearer::Internet, 9_900);
-            for &b in &cluster {
-                if a != b {
-                    add(a, b, Bearer::Internet, 9_900);
-                }
-            }
-        }
-        add(cluster[8], call("M0DST"), Bearer::Radio, 3_000);
-        graph
-    }
-
-    #[test]
-    fn a_dense_cluster_still_yields_the_route_through_it() {
-        let graph = cluster_with_radio_last_hop();
-        let request = RouteRequest {
-            source: call("M0SRC"),
-            destination: call("M0DST"),
-            now: 0,
-            expires_at: 10_000,
-            object_bytes: 1_000,
-            max_hops: 8,
-            airtime_budget_millis: 60_000,
-            visited: &[],
-            excluded_contacts: &[],
-            urgent: false,
-        };
-        let plan = plan_routes(&graph, &request, RoutingPolicy::default()).expect("a route exists");
-        let best = &plan.active[0];
-        assert_eq!(best.hops.len(), 2, "straight to the gateway, then radio");
-        assert_eq!(best.hops[1].contact.to, call("M0DST"));
-    }
-
-    /// A label budget that runs out before the search is done leaves the
-    /// routes found by then as the answer, best first; only a search that
-    /// found none fails.
-    #[test]
-    fn a_search_cut_short_returns_what_it_found() {
-        let mut graph = cluster_with_radio_last_hop();
-        graph
-            .add_schedule(ScheduledContact {
-                from: call("M0SRC"),
-                to: call("M0DST"),
-                bearer: Bearer::Internet,
-                start: 0,
-                end: 10_000,
-                rate_bps: 1_200,
-                capacity_bytes: 1_000_000,
-                success_permyriad: Some(9_900),
-                flags: 0,
-            })
-            .unwrap();
-        let request = RouteRequest {
-            source: call("M0SRC"),
-            destination: call("M0DST"),
-            now: 0,
-            expires_at: 10_000,
-            object_bytes: 1_000,
-            max_hops: 8,
-            airtime_budget_millis: 60_000,
-            visited: &[],
-            excluded_contacts: &[],
-            urgent: false,
-        };
-        let tight = RoutingPolicy {
-            max_labels: 20,
-            ..RoutingPolicy::default()
-        };
-        let plan = plan_routes(&graph, &request, tight).expect("the direct route was found in time");
-        assert_eq!(plan.active[0].hops.len(), 1);
-        let starved = RoutingPolicy {
-            max_labels: 1,
-            ..RoutingPolicy::default()
-        };
-        assert_eq!(
-            plan_routes(&graph, &request, starved),
-            Err(RouteError::SearchLimit)
-        );
-    }
-}
+mod tests;

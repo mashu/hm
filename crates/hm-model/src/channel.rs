@@ -21,18 +21,19 @@ use crate::evidence::{Beta, Evidence, Prior};
 
 /// Memory of channel activity.
 pub const CHANNEL_HALF_LIFE: u64 = 3_600;
-/// Gamma prior on the number of other active stations: about two, worth one window.
-const CONTENDER_PRIOR: (f64, f64) = (2.0, 1.0);
-/// Busy share of the carrier before anything is measured, worth ten minutes.
-const BUSY_PRIOR: Prior = Prior::new(0.1, 600.0);
+/// Gamma prior on the number of other active stations: about two, worth a
+/// tenth of a window (so a few minutes of listening outweigh it).
+const CONTENDER_PRIOR: (f64, f64) = (0.2, 0.1);
+/// Busy share of the carrier before anything is measured, worth a minute.
+const BUSY_PRIOR: Prior = Prior::new(0.1, 60_000.0);
 
 /// Something seen on the channel.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ChannelObservation {
     /// Distinct other stations heard in the latest window.
     Active { stations: u32 },
-    /// The carrier was busy `busy_secs` of the last `total_secs`.
-    Occupancy { busy_secs: u64, total_secs: u64 },
+    /// Others kept the carrier busy `busy_ms` of the last `total_ms`.
+    Occupancy { busy_ms: u64, total_ms: u64 },
 }
 
 /// Belief about one channel.
@@ -41,25 +42,32 @@ pub struct ChannelModel {
     /// Stations counted (yes) over windows (no), as Gamma-Poisson statistics.
     #[n(0)]
     contenders: Evidence,
-    /// Busy (yes) and idle (no) seconds.
+    /// Busy (yes) and idle (no) milliseconds.
     #[n(1)]
     busy: Evidence,
 }
 
 impl ChannelModel {
+    /// `stations` other stations heard within the latest window, looked at
+    /// after `exposure` windows since the last look: counts taken more often
+    /// than once a window overlap, and count for the share of a window that
+    /// is new.
+    pub fn observe_active(&mut self, at: u64, stations: u32, exposure: f64) {
+        let exposure = exposure.clamp(0.0, 1.0);
+        self.contenders
+            .add(f64::from(stations) * exposure, exposure, at, CHANNEL_HALF_LIFE);
+    }
+
     pub fn observe(&mut self, at: u64, observation: ChannelObservation) {
         match observation {
             ChannelObservation::Active { stations } => {
                 self.contenders
                     .add(f64::from(stations), 1.0, at, CHANNEL_HALF_LIFE)
             }
-            ChannelObservation::Occupancy {
-                busy_secs,
-                total_secs,
-            } => {
-                let busy = busy_secs.min(total_secs);
+            ChannelObservation::Occupancy { busy_ms, total_ms } => {
+                let busy = busy_ms.min(total_ms);
                 self.busy
-                    .add(busy as f64, (total_secs - busy) as f64, at, CHANNEL_HALF_LIFE);
+                    .add(busy as f64, (total_ms - busy) as f64, at, CHANNEL_HALF_LIFE);
             }
         }
     }
@@ -78,6 +86,15 @@ impl ChannelModel {
 
     pub fn occupancy(&self, now: u64) -> Beta {
         self.busy.posterior(BUSY_PRIOR, now, CHANNEL_HALF_LIFE)
+    }
+
+    /// Expected wait for a clear channel, in units of the others' typical
+    /// transmission `busy_period`: arriving at a random moment the carrier is
+    /// busy with chance β, and on a channel busy a share β of the time the
+    /// wait for it to clear is about `β / (1 − β)` busy periods.
+    pub fn access_wait(&self, now: u64, busy_period: f64) -> f64 {
+        let beta = self.occupancy(now).mean().min(0.95);
+        beta / (1.0 - beta) * busy_period
     }
 
     /// KISS persistence byte for p-persistent CSMA: transmit with probability
@@ -109,6 +126,16 @@ mod tests {
         assert_eq!(c.sharing(now), 10);
         // A day later the channel is believed as at first.
         assert!((c.contenders(now + 86_400) - 2.0).abs() < 0.1);
+        // Looking every minute at an hour's count counts an hour once an hour.
+        let mut looked = ChannelModel::default();
+        for t in 0..60 {
+            looked.observe_active(t * 60, 9, 1.0 / 60.0);
+        }
+        assert!(
+            (looked.contenders(3_600) - 8.4).abs() < 0.5,
+            "{}",
+            looked.contenders(3_600)
+        );
     }
 
     #[test]
@@ -129,12 +156,13 @@ mod tests {
         c.observe(
             0,
             ChannelObservation::Occupancy {
-                busy_secs: 1_800,
-                total_secs: 3_600,
+                busy_ms: 1_800_000,
+                total_ms: 3_600_000,
             },
         );
         let busy = c.occupancy(0).mean();
-        assert!(busy > 0.4 && busy < 0.5, "{busy}");
+        assert!(busy > 0.45 && busy < 0.5, "{busy}");
+        assert!(c.access_wait(0, 10.0) > 8.0);
         assert!((clear_slot(0.0, 0.5) - 1.0).abs() < 1e-12);
     }
 }

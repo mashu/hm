@@ -731,7 +731,6 @@
               <div><label for="custody_grace_secs">Shadow grace <span class="hint">(s)</span></label><input id="custody_grace_secs" type="number" min="1" step="1" value="21600" required></div>
               <div><label for="custody_suspect_secs">Suspect after <span class="hint">(s)</span></label><input id="custody_suspect_secs" type="number" min="1" step="1" value="86400" required></div>
               <div><label for="receipt_retry_attempts">Receipt attempts</label><input id="receipt_retry_attempts" type="number" min="1" step="1" value="24" required></div>
-              <div><label for="evidence_half_life_secs">Evidence half-life <span class="hint">(s)</span></label><input id="evidence_half_life_secs" type="number" min="1" step="1" value="3600" required></div>
             </div>
           </details>
         </section>
@@ -760,7 +759,6 @@
               <div><label for="relay_max_bytes">Max bytes</label><input id="relay_max_bytes" type="number" min="1" step="1" value="16777216" required></div>
               <div><label for="relay_max_hops">Max hops</label><input id="relay_max_hops" type="number" min="1" max="16" step="1" value="8" required></div>
               <div><label for="relay_airtime_budget_secs">Airtime budget <span class="hint">(s)</span></label><input id="relay_airtime_budget_secs" type="number" min="1" step="1" value="300" required></div>
-              <div><label for="relay_urgent_min_gain">Urgent dual-copy gain</label><input id="relay_urgent_min_gain" type="number" min="0" max="0.999" step="0.01" value="0.05" required></div>
               <div><label for="relay_control_airtime_fraction">Control airtime fraction</label><input id="relay_control_airtime_fraction" type="number" min="0" max="1" step="0.001" value="0.02" required></div>
             </div>
           </details>
@@ -1701,7 +1699,6 @@ const liveFields = [
   "beacon_minutes", "radio_cost", "internet_cost", "modem_cost",
   "retry_first_secs", "retry_max_secs", "retry_attempts",
   "custody_grace_secs", "custody_suspect_secs", "receipt_retry_attempts",
-  "evidence_half_life_secs",
 ];
 const liveDefaults = {
   beacon_minutes: 10,
@@ -1714,18 +1711,16 @@ const liveDefaults = {
   custody_grace_secs: 21600,
   custody_suspect_secs: 86400,
   receipt_retry_attempts: 24,
-  evidence_half_life_secs: 3600,
 };
 const relayNumbers = [
   "max_holdings", "max_bytes", "max_hops", "airtime_budget_secs",
-  "urgent_min_gain", "control_airtime_fraction",
+  "control_airtime_fraction",
 ];
 const relayDefaults = {
   max_holdings: 256,
   max_bytes: 16777216,
   max_hops: 8,
   airtime_budget_secs: 300,
-  urgent_min_gain: 0.05,
   control_airtime_fraction: 0.02,
 };
 const radioDefaults = {
@@ -2243,7 +2238,6 @@ $("settings-form").addEventListener("submit", async (ev) => {
     ["custody_grace_secs", "Shadow grace", 1],
     ["custody_suspect_secs", "Suspect after", 1],
     ["receipt_retry_attempts", "Receipt attempts", 1],
-    ["evidence_half_life_secs", "Evidence half-life", 1],
   ]) if (!requireFinite(id, label, min)) return;
   if (num("retry_max_secs") < num("retry_first_secs")) {
     fail($("retry_max_secs"), "Longest wait must be ≥ first retry");
@@ -2254,7 +2248,6 @@ $("settings-form").addEventListener("submit", async (ev) => {
     ["relay_max_bytes", "Max bytes", 1],
     ["relay_max_hops", "Max hops", 1, 16],
     ["relay_airtime_budget_secs", "Airtime budget", 1],
-    ["relay_urgent_min_gain", "Urgent dual-copy gain", 0, 0.999],
     ["relay_control_airtime_fraction", "Control airtime fraction", 0, 1],
   ]) if (!requireFinite(id, label, min, max)) return;
   if ($("f-modem-enabled").checked) {

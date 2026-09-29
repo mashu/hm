@@ -50,7 +50,7 @@ pub use beliefs::{
 };
 pub use channel::{clear_slot, ChannelModel, ChannelObservation, CHANNEL_HALF_LIFE};
 pub use custodian::{CustodianModel, CustodianObservation, CustodianPrior, CUSTODIAN_HALF_LIFE};
-pub use erasure::{burst_size, plan_overs, Erasure, OverCost};
+pub use erasure::{broadcast_burst, burst_size, plan_overs, Erasure, OverCost};
 pub use evidence::{Beta, Evidence, Prior};
 pub use link::{LinkModel, LinkObservation, LinkPrior, SampledLink, ERASURE_HALF_LIFE, HANDOFF_HALF_LIFE};
 

@@ -534,26 +534,54 @@ fn legacy_records_decode_with_empty_relay_metadata() {
     assert_eq!(record.max_hops, None);
 }
 
+/// A receipt for a message that went through a custodian leaves a custody
+/// outcome for the node to learn from, once.
 #[test]
-fn bayesian_contact_evidence_survives_restart() {
-    let db = TempDb::new("contact-evidence");
-    let key = EdgeKey {
-        from: call("M0AAA"),
-        to: call("M0BBB"),
-        bearer: Bearer::Radio,
-        utc_hour: Some(17),
-    };
-    let evidence = Evidence {
-        successes: 4.5,
-        failures: 1.25,
-        at: 1234,
-    };
+fn end_to_end_receipts_report_custody_outcomes_once() {
+    let db = TempDb::new("custody-outcomes");
+    let store = Store::open(&db.0).unwrap();
+    let (me, relay, dest) = (call("M0AAA"), call("M0BBB"), call("M0CCC"));
+    let _ = me;
+    store.enqueue(id(1), b"mail", dest, 0, 100).unwrap();
+    assert!(store.set_next_hop(id(1), relay).unwrap());
+    assert!(store
+        .custody_transferred(
+            id(1),
+            CustodyHandoff {
+                next_hop: relay,
+                receipt_verified: true,
+                by: "radio",
+                now: 200,
+                grace_secs: 60,
+                suspect_secs: 3_600,
+            },
+        )
+        .unwrap());
+    assert!(store.e2e_delivered(id(1), id(2), dest, 900).unwrap());
+    assert_eq!(
+        store.take_custody_outcomes().unwrap(),
+        vec![CustodyOutcome {
+            id: id(1),
+            custodian: relay,
+            handed_at: 200,
+            delivered_at: 900,
+        }]
+    );
+    assert!(store.take_custody_outcomes().unwrap().is_empty());
+}
+
+#[test]
+fn belief_records_survive_restart_and_can_be_deleted() {
+    let db = TempDb::new("beliefs");
     {
         let store = Store::open(&db.0).unwrap();
-        store.save_contact_evidence(key, evidence).unwrap();
+        store
+            .save_beliefs(&[(vec![1, 2, 3], Some(vec![9, 9])), (vec![4], Some(vec![8]))])
+            .unwrap();
+        store.save_beliefs(&[(vec![4], None)]).unwrap();
     }
     let store = Store::open(&db.0).unwrap();
-    assert_eq!(store.contact_evidence().unwrap(), vec![(key, evidence)]);
+    assert_eq!(store.beliefs().unwrap(), vec![(vec![1, 2, 3], vec![9, 9])]);
 }
 
 #[test]

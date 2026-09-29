@@ -140,7 +140,7 @@ impl Station<'_> {
                     outcome = Some(SendOutcome::Failed(reason));
                     Flow::Stop
                 }
-                Event::Received { .. } => Flow::Continue,
+                Event::Received { .. } | Event::Over { .. } => Flow::Continue,
             },
         )?;
         Ok(match end {
@@ -169,7 +169,7 @@ impl Station<'_> {
             stop,
             |_now, event| match event {
                 Event::Received { from, object, .. } => on_message(open_message(from, &object, trust, None)),
-                Event::Delivered { .. } | Event::Failed { .. } => Flow::Continue,
+                Event::Delivered { .. } | Event::Failed { .. } | Event::Over { .. } => Flow::Continue,
             },
         )?;
         Ok(())

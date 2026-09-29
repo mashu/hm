@@ -718,6 +718,7 @@ dependencies = [
  "hm-bundle",
  "hm-core",
  "hm-ident",
+ "hm-model",
  "hm-modem-afsk",
  "hm-net",
  "hm-rig",
@@ -794,6 +795,8 @@ dependencies = [
 name = "hm-route"
 version = "0.1.0"
 dependencies = [
+ "hm-core",
+ "hm-model",
  "hm-wire",
  "proptest",
 ]
@@ -804,6 +807,7 @@ version = "0.1.0"
 dependencies = [
  "hm-bearer",
  "hm-core",
+ "hm-model",
  "hm-modem-afsk",
  "hm-route",
  "hm-wire",
@@ -814,7 +818,6 @@ dependencies = [
 name = "hm-store"
 version = "0.1.0"
 dependencies = [
- "hm-route",
  "hm-wire",
  "minicbor",
  "redb",
@@ -836,6 +839,7 @@ dependencies = [
  "blake3",
  "hm-core",
  "hm-ident",
+ "hm-model",
  "hm-sim",
  "hm-wire",
  "raptorq",

@@ -4,16 +4,16 @@ use std::collections::BTreeSet;
 use std::sync::{mpsc, Arc};
 
 use hm_net::Net;
-use hm_route::{Bearer as RouteBearer, ContactGraph, ScheduledContact};
+use hm_route::{ContactGraph, ScheduledContact};
 use hm_store::Store;
 use hm_wire::{Callsign, ContactAdvert, ContactBearer, Dest, FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY};
 
-use super::choose::Bearer;
 use super::control::{sign_contact, ControlAction, ControlPlane, LIVE_ADVERT_VALIDITY_SECS};
 use super::live::LiveConfig;
 use super::radio::RadioCmd;
 use super::types::{log, short, NodeConfig};
 use crate::station::unix_now;
+use hm_model::Bearer;
 
 pub(crate) fn send_sync(
     net: Option<&Arc<Net>>,
@@ -161,13 +161,15 @@ pub(crate) fn scheduled_advert(
 }
 
 /// Our signed claim of a live contact to `peer`, lasting since `since`:
-/// numbered by `now`, valid for [`LIVE_ADVERT_VALIDITY_SECS`] from now.
+/// numbered by `now`, valid for [`LIVE_ADVERT_VALIDITY_SECS`] from now, with
+/// our belief that a handoff over it completes (`success`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn live_advert(
     cfg: &NodeConfig,
     relay: &crate::config::RelaySettings,
     peer: Callsign,
-    bearer: RouteBearer,
+    bearer: Bearer,
+    success: f64,
     rate_bps: u32,
     capacity_bytes: u64,
     since: u64,
@@ -187,11 +189,7 @@ pub(crate) fn live_advert(
             end,
             peer,
             bearer: ContactBearer::from(bearer),
-            success_permyriad: if bearer == RouteBearer::Internet {
-                9_900
-            } else {
-                7_000
-            },
+            success_permyriad: (success.clamp(0.0, 1.0) * 10_000.0).round() as u16,
             rate_bps,
             capacity_bytes,
             flags: advertised_flags(cfg.internet.is_some(), relay),

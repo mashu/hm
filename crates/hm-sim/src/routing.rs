@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use hm_model::{Beliefs, CustodianObservation, LinkObservation};
 use hm_route::{
     plan_routes, Bearer, ContactGraph, ContactKey, GraphConfig, RouteRequest, RoutingPolicy, ScheduledContact,
 };
@@ -349,6 +350,8 @@ impl Decision {
 enum Model {
     BayesianCgr {
         graph: Box<ContactGraph>,
+        /// What the stations have learned about links from handoffs.
+        beliefs: Box<Beliefs>,
         /// Each scenario contact's key, once the graph knows it.
         contacts: Vec<Option<ContactKey>>,
         advertised: BTreeSet<(NodeId, NodeId, Bearer)>,
@@ -376,6 +379,7 @@ impl Model {
                 }
                 Self::BayesianCgr {
                     graph: Box::new(graph),
+                    beliefs: Box::new(Beliefs::new()),
                     contacts,
                     advertised: BTreeSet::new(),
                     live,
@@ -461,7 +465,12 @@ impl Model {
                 let receiver = state.distance(contact.to, destination, nodes);
                 (receiver < sender).then(|| Decision::custody(None))
             }
-            Self::BayesianCgr { graph, contacts, .. } => {
+            Self::BayesianCgr {
+                graph,
+                beliefs,
+                contacts,
+                ..
+            } => {
                 graph.prune(contact.start);
                 let request = RouteRequest {
                     source: station(contact.from).ok()?,
@@ -475,7 +484,8 @@ impl Model {
                     excluded_contacts: &[],
                     urgent: message.bundle.urgent,
                 };
-                let plan = plan_routes(graph, &request, RoutingPolicy::default()).ok()?;
+                let mut estimate = beliefs.mean(contact.start);
+                let plan = plan_routes(graph, &mut estimate, &request, RoutingPolicy::default()).ok()?;
                 let current = (*contacts.get(contact_index)?)?;
                 if !plan
                     .active
@@ -495,16 +505,16 @@ impl Model {
     }
 
     fn outcome(&mut self, bundle: SimBundle, contact: ContactOpportunity, success: bool) {
-        if let Self::BayesianCgr { graph, .. } = self {
-            graph.record_delivery(
-                station(contact.from).expect("validated node id"),
-                station(contact.to).expect("validated node id"),
-                contact.bearer,
-                success,
-                contact.start,
-            );
+        let _ = bundle;
+        if let Self::BayesianCgr { beliefs, .. } = self {
+            let link = hm_model::LinkKey {
+                from: station(contact.from).expect("validated node id"),
+                to: station(contact.to).expect("validated node id"),
+                bearer: contact.bearer,
+            };
+            beliefs.observe_link(link, contact.start, LinkObservation::Handoff { ok: success });
             if success {
-                let _ = bundle;
+                beliefs.observe_custodian(link.to, contact.start, CustodianObservation::Accepted);
             }
         }
     }

@@ -12,9 +12,40 @@ use hm_ident::PublicKey;
 use hm_store::RetryPolicy;
 use hm_wire::{Callsign, Locator};
 
-use super::choose::Costs;
 use crate::config::{self, Config, RadioSettings, RelaySettings};
 use crate::files::Trust;
+
+/// Cost of a delivery attempt on each bearer, in hundredths of a delivered
+/// message's value (`[delivery] *_cost`).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Costs {
+    pub radio: f64,
+    pub internet: f64,
+    pub modem: f64,
+}
+
+impl Default for Costs {
+    fn default() -> Self {
+        let delivery = crate::config::DeliverySettings::default();
+        Costs {
+            radio: delivery.radio_cost,
+            internet: delivery.internet_cost,
+            modem: delivery.modem_cost,
+        }
+    }
+}
+
+impl Costs {
+    /// The costs in a delivered message's value, by [`hm_model::Bearer::index`],
+    /// for route choice.
+    pub fn attempt_cost(&self) -> [f64; 3] {
+        [self.radio, self.internet, self.modem].map(|c| c / 100.0)
+    }
+
+    pub fn of(&self, bearer: hm_model::Bearer) -> f64 {
+        self.attempt_cost()[bearer.index()]
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Live {
@@ -26,7 +57,6 @@ pub struct Live {
     pub receipt_retry: RetryPolicy,
     pub custody_grace_secs: u64,
     pub custody_suspect_secs: u64,
-    pub evidence_half_life_secs: u64,
     pub relay: RelaySettings,
     /// Seconds between beacons; 0 sends none. (Minutes in station.toml.)
     pub beacon_secs: u64,
@@ -64,7 +94,6 @@ impl Live {
             },
             custody_grace_secs: c.delivery.custody_grace_secs,
             custody_suspect_secs: c.delivery.custody_suspect_secs,
-            evidence_half_life_secs: c.delivery.evidence_half_life_secs,
             relay: c.relay.clone(),
             beacon_secs: c.radio.beacon_minutes.saturating_mul(60),
             peers: c.peers()?,
@@ -94,7 +123,6 @@ pub struct Change {
     pub custody_grace_secs: Option<u64>,
     pub custody_suspect_secs: Option<u64>,
     pub receipt_retry_attempts: Option<u32>,
-    pub evidence_half_life_secs: Option<u64>,
     pub relay: Option<RelaySettings>,
     pub peers: Option<Vec<(Callsign, String)>>,
     /// `Some(None)` removes the locator.
@@ -266,9 +294,6 @@ impl LiveConfig {
         if c.custody_grace_secs == Some(0) || c.custody_suspect_secs == Some(0) {
             return bad("custody_grace_secs and custody_suspect_secs must be positive");
         }
-        if c.evidence_half_life_secs == Some(0) {
-            return bad("evidence_half_life_secs must be positive");
-        }
         if let Some(r) = &c.radio {
             if let Err(e) = r.check() {
                 return bad(&e);
@@ -301,7 +326,6 @@ impl LiveConfig {
                 ("custody_grace_secs", c.custody_grace_secs),
                 ("custody_suspect_secs", c.custody_suspect_secs),
                 ("receipt_retry_attempts", c.receipt_retry_attempts.map(u64::from)),
-                ("evidence_half_life_secs", c.evidence_half_life_secs),
             ] {
                 if let Some(v) = v {
                     config::set_value(p, "delivery", k, v as i64)?;
@@ -356,9 +380,6 @@ impl LiveConfig {
             }
             if let Some(v) = c2.custody_suspect_secs {
                 l.custody_suspect_secs = v;
-            }
-            if let Some(v) = c2.evidence_half_life_secs {
-                l.evidence_half_life_secs = v;
             }
             if let Some(r) = c2.relay {
                 l.relay = r;

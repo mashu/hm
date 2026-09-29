@@ -6,7 +6,12 @@
 //! size), so lost frames are never retransmitted: the next over simply
 //! carries fresh repair symbols. After each over the receiver sends one ACK
 //! saying how many symbols it still needs; the sender sizes its next burst from
-//! that and from its running estimate of the link's loss rate.
+//! that and from its belief about the link's frame loss ([`hm_model::Erasure`]):
+//! the burst that minimises the expected airtime to finish, under the
+//! Beta-binomial predictive of how many frames arrive. Each ACK's count is
+//! reported ([`Event::Over`]) so the station's link model learns from it, and
+//! the station hands its belief back ([`Command::Belief`]) for the next
+//! transfer.
 //!
 //! Every DATA frame says how many frames remain in the over, so the receiver
 //! knows when the sender will stop transmitting and it may answer. The object
@@ -41,6 +46,7 @@ use alloc::vec::Vec;
 
 use hm_core::{DetRng, Input, Machine, Millis, Output, Port};
 use hm_ident::{Identity, PublicKey};
+use hm_model::{Bearer, ChannelModel, ChannelObservation, Erasure, LinkPrior, OverCost, Prior};
 use hm_wire::{
     Ack, Callsign, Close, CloseReason, DataPreamble, Dest, FrameHeader, FrameType, ObjectId, Offer, Open,
     CTRL_CLOSE, CTRL_OFFER, CTRL_OPEN, DATA_PREAMBLE_LEN, HEADER_LEN, MAX_INDEX, MAX_OBJECT_LEN, NEED_OFFER,
@@ -56,8 +62,13 @@ pub const HASH_CONTEXT: &str = "hm-net 2026-09 xfer v0";
 pub const SYMBOL_ALIGNMENT: u16 = 8;
 /// Most source symbols per object, bounding decoder memory and time.
 pub const MAX_SOURCE_SYMBOLS: u32 = 8192;
-/// Loss estimates are capped here so burst sizes stay finite.
-const MAX_LOSS_PERMILLE: u32 = 800;
+/// Fade dispersion assumed at a broadcast's unknown listeners.
+const LOSS_PRIOR_DISPERSION: f64 = 0.1;
+/// Listeners a broadcast is sized for until the station says how many share
+/// the channel.
+const DEFAULT_LISTENERS: u32 = 4;
+/// Channel occupancy is taken into the belief at most this often.
+const OCCUPANCY_EVERY: Millis = Millis::from_secs(10);
 /// Largest "frames remaining" believed when predicting the end of a peer's over,
 /// so one corrupted byte cannot hold our answers back for minutes.
 const MAX_REMAINING_TRUSTED: u8 = 64;
@@ -65,10 +76,6 @@ const MAX_REMAINING_TRUSTED: u8 = 64;
 const MAX_SYMBOL_SIZE: u16 = u16::MAX - u16::MAX % SYMBOL_ALIGNMENT;
 /// Cap on the exponent of the retry backoff.
 const MAX_BACKOFF_DOUBLINGS: u32 = 5;
-/// Bursts are sized to deliver enough symbols with this probability. An extra
-/// symbol costs one frame of airtime, a failed over costs a turnaround and
-/// another over, so aiming for certainty wastes airtime.
-pub const BURST_SUCCESS_TARGET: f64 = 0.9;
 /// Smallest congestion window: a sender that keeps missing ACKs still sends
 /// overs of this many symbols once a probe gets through.
 const MIN_WINDOW: u32 = 2;
@@ -80,45 +87,6 @@ pub const SLOW_FRAME_SECS: u64 = 3;
 const MIN_SLOW_SYMBOL: usize = 32;
 /// Longest over on a link below 1200 bit/s.
 pub const SLOW_MAX_OVER: Millis = Millis::from_secs(60);
-
-/// `P[X >= k]` for `X ~ Binomial(n, q)`.
-fn prob_at_least(n: u32, k: u32, q: f64) -> f64 {
-    if k == 0 {
-        return 1.0;
-    }
-    if k > n {
-        return 0.0;
-    }
-    if q >= 1.0 {
-        return 1.0;
-    }
-    if q <= 0.0 {
-        return 0.0;
-    }
-    // pmf(0) = (1 - q)^n, then pmf(i + 1) = pmf(i) * (n - i) / (i + 1) * q / (1 - q).
-    let mut pmf = 1.0;
-    for _ in 0..n {
-        pmf *= 1.0 - q;
-    }
-    let ratio = q / (1.0 - q);
-    let mut below = 0.0;
-    for i in 0..k {
-        below += pmf;
-        pmf *= (n - i) as f64 / (i + 1) as f64 * ratio;
-    }
-    (1.0 - below).max(0.0)
-}
-
-/// Smallest burst `n >= need` (at most `cap`) that delivers `need` symbols with
-/// probability [`BURST_SUCCESS_TARGET`] when each frame is lost with `loss_permille`.
-pub fn burst_size(need: u32, loss_permille: u32, cap: u32) -> u32 {
-    let q = 1.0 - loss_permille.min(MAX_LOSS_PERMILLE) as f64 / 1000.0;
-    let mut n = need.max(1);
-    while n < cap && prob_at_least(n, need, q) < BURST_SUCCESS_TARGET {
-        n += 1;
-    }
-    n.min(cap)
-}
 
 /// The smallest symbol size, a multiple of 8 and at most `max`, that keeps an
 /// object of `len` bytes in as few symbols as `max` would. Every symbol,
@@ -144,8 +112,11 @@ pub fn broadcast_peer() -> Callsign {
     Callsign::parse("ALL").expect("ALL is a valid callsign")
 }
 
-/// Assumed frame loss when sizing a one-shot broadcast over, per mille.
-const BROADCAST_LOSS_PERMILLE: u32 = 300;
+/// Frame loss at a broadcast's listeners, until the station says what it has
+/// learned of its links: listeners are stations in range, whose loss rates
+/// spread moderately around the channel's (a Beta worth thirty frames: about
+/// ±8 %), not anywhere between none and all.
+const BROADCAST_LOSS: Prior = Prior::new(0.3, 30.0);
 /// Most overs a broadcast publish may take before it listens for repair requests.
 const BROADCAST_MAX_ROUNDS: u8 = 2;
 /// A listener missing symbols of a broadcast waits a random part of this many
@@ -203,8 +174,6 @@ pub struct Config {
     /// costs only the frames it overlaps however long the over is; the limit
     /// keeps one station from holding a shared channel too long.
     pub max_over: Millis,
-    /// Frame loss assumed at least, per mille, when sizing bursts.
-    pub redundancy_permille: u32,
     /// Overs in a row that bring no progress (no ACK, or an ACK that asks for
     /// no fewer symbols than the one before) before a transfer fails. Overs
     /// that do bring progress never count against it, so a large object, or
@@ -251,7 +220,6 @@ impl Config {
             stuffing_permille: 20,
             max_burst: 16,
             max_over: Millis::from_secs(30),
-            redundancy_permille: 20,
             max_rounds: 12,
             ack_guard: Millis(1500),
             max_object_len: 256 * 1024,
@@ -292,7 +260,6 @@ impl Config {
                 .clamp(MIN_SLOW_SYMBOL, cfg.symbol_size as usize);
             cfg.symbol_size = (symbol - symbol % SYMBOL_ALIGNMENT as usize) as u16;
             cfg.max_over = SLOW_MAX_OVER;
-            cfg.redundancy_permille = 50;
             cfg.idle_timeout = Millis::from_secs(900);
         }
         cfg
@@ -340,7 +307,7 @@ impl Config {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     /// Transfer `object` to `to`. Precedence as in bundles, 0 routine to 3 flash;
     /// higher precedence is sent first.
@@ -354,6 +321,9 @@ pub enum Command {
     /// locally as [`Event::Delivered`] to [`broadcast_peer`] with
     /// [`Receipt::Unverified`].
     Broadcast { object: Vec<u8>, precedence: u8 },
+    /// The station's belief about frame loss towards `peer`: overs to it are
+    /// sized from this until the next one.
+    Belief { peer: Callsign, erasure: Erasure },
     /// Application durably stored (or refused) a just-received object.
     Accept {
         from: Callsign,
@@ -387,6 +357,9 @@ pub enum Receipt {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Event {
+    /// An ACK said `got` of the `sent` frames of our last over to `to`
+    /// arrived: an observation of the link's frame loss.
+    Over { to: Callsign, sent: u32, got: u32 },
     /// A complete object arrived and matched its hash. Emitted once per object
     /// per `done_ttl`, however many times it is sent.
     Received {
@@ -552,13 +525,22 @@ pub struct Xfer {
     incoming: BTreeMap<(Callsign, u16), Incoming>,
     /// Objects delivered to our application recently, with their expiry.
     seen: BTreeMap<ObjectId, Millis>,
-    /// Estimated frame loss towards each peer, per mille, from what its ACKs
-    /// say arrived. A missed ACK is not counted as loss: it may as well mean a
-    /// busy or colliding channel, where larger overs would make things worse.
-    loss: BTreeMap<Callsign, u32>,
+    /// Belief about frame loss towards each peer: the station's, updated with
+    /// what each ACK says arrived. A missed ACK is not counted as loss: it may
+    /// as well mean a busy or colliding channel, where larger overs would make
+    /// things worse.
+    erasure: BTreeMap<Callsign, Erasure>,
     /// Congestion window towards each peer: most symbols in one over. Halved
     /// when an ACK does not come, grown by one with each ACK that does.
     window: BTreeMap<Callsign, u32>,
+    /// How busy other stations keep the channel, from the frames we hear:
+    /// every over we add waits for the channel to clear.
+    channel: ChannelModel,
+    /// Airtime of others' frames heard since `busy_since`.
+    busy_ms: u64,
+    busy_since: Millis,
+    /// Stations a broadcast is sized for.
+    listeners: u32,
     tokens_ms: i64,
     tokens_at: Millis,
     /// Each peer's latest OPEN, and when we heard it.
@@ -586,8 +568,12 @@ impl Xfer {
             active: Vec::new(),
             incoming: BTreeMap::new(),
             seen: BTreeMap::new(),
-            loss: BTreeMap::new(),
+            erasure: BTreeMap::new(),
             window: BTreeMap::new(),
+            channel: ChannelModel::default(),
+            busy_ms: 0,
+            busy_since: Millis::ZERO,
+            listeners: DEFAULT_LISTENERS,
             tokens_ms,
             tokens_at: Millis::ZERO,
             peers: BTreeMap::new(),
@@ -650,9 +636,29 @@ impl Xfer {
         self.rejected_receipts
     }
 
-    /// Estimated frame loss towards `peer`, per mille.
+    /// Belief about frame loss towards `peer`: what the station told us and
+    /// ACKs have said since, or, for a peer it told us nothing about, the
+    /// population prior for radio links. Broadcasts ([`broadcast_peer`]) use
+    /// the belief the station gave for them, or [`BROADCAST_LOSS`].
+    pub fn erasure(&self, peer: Callsign) -> Erasure {
+        self.erasure.get(&peer).copied().unwrap_or_else(|| {
+            if peer == broadcast_peer() {
+                Erasure::from_prior(BROADCAST_LOSS, LOSS_PRIOR_DISPERSION)
+            } else {
+                let prior = LinkPrior::for_bearer(Bearer::Radio);
+                Erasure::from_prior(prior.erasure, prior.dispersion)
+            }
+        })
+    }
+
+    /// Stations sharing the channel, whom a broadcast is sized for.
+    pub fn set_listeners(&mut self, listeners: u32) {
+        self.listeners = listeners.max(1);
+    }
+
+    /// Expected share of frames lost towards `peer`, per mille.
     pub fn loss_estimate(&self, peer: Callsign) -> u32 {
-        self.loss.get(&peer).copied().unwrap_or(0)
+        (self.erasure(peer).mean() * 1000.0 + 0.5) as u32
     }
 
     /// The congestion window towards `peer`: most symbols the next over to it
@@ -960,11 +966,7 @@ impl Xfer {
     fn send_over(&mut self, now: Millis, i: usize, out: &mut Vec<Output<Event>>) -> bool {
         let o = &self.active[i];
         let (to, session, broadcast) = (o.to, o.session, o.broadcast);
-        let loss = if o.broadcast {
-            BROADCAST_LOSS_PERMILLE.max(self.cfg.redundancy_permille)
-        } else {
-            self.loss_estimate(o.to).max(self.cfg.redundancy_permille)
-        };
+        let erasure = self.erasure(o.to);
         let window = if o.broadcast {
             self.cfg.max_burst as u32
         } else {
@@ -974,13 +976,19 @@ impl Xfer {
             .min(window)
             .min(MAX_INDEX - o.next_esi.min(MAX_INDEX))
             .max(1);
-        let n = if o.probe {
-            o.need.clamp(1, 2).min(cap)
-        } else {
-            burst_size(o.need, loss, cap)
-        };
         let t = o.t as usize;
         let frame_air = self.cfg.air(1, self.cfg.data_frame_len(t));
+        let (need, probe, is_broadcast) = (o.need, o.probe, o.broadcast);
+        self.note_occupancy(now);
+        let over_cost = self.over_cost(now, frame_air, cap, is_broadcast);
+        let n = if probe {
+            need.clamp(1, 2).min(cap)
+        } else if is_broadcast {
+            hm_model::broadcast_burst(need, cap, &erasure, over_cost, self.listeners)
+        } else {
+            hm_model::burst_size(need, cap, &erasure, over_cost)
+        };
+        let o = &self.active[i];
         let mut fixed = self.cfg.txdelay;
         if o.offer_next {
             fixed += self.cfg.air(1, HEADER_LEN + hm_wire::OFFER_LEN);
@@ -1141,8 +1149,11 @@ impl Xfer {
                 }
             };
             let o = self.active.remove(i);
-            let p = self.loss.entry(o.to).or_insert(0);
-            *p = *p * 9 / 10;
+            // The last over brought at least what was needed; how many more
+            // arrived is not known, so only an over that was all needed counts.
+            if o.sent_last_round > 0 && o.sent_last_round <= o.need {
+                self.observe_over(o.to, o.sent_last_round, o.sent_last_round, out);
+            }
             self.window.insert(o.to, grown);
             out.push(Output::Event(Event::Delivered {
                 to: o.to,
@@ -1160,15 +1171,17 @@ impl Xfer {
                 o.stalls = 0; // the over got something through
             }
             let sent = o.sent_last_round;
-            if sent > 0 && new_need <= o.need {
-                let got = (o.need - new_need).min(sent);
-                let observed = (sent - got) * 1000 / sent;
-                let p = self.loss.entry(o.to).or_insert(0);
-                *p = (*p * 7 + observed * 3) / 10;
-            }
+            // Every symbol that arrives is one fewer needed.
+            let got = (sent > 0 && new_need <= o.need).then(|| (o.need - new_need).min(sent));
             o.need = new_need;
+            o.state = OutState::Ready { at: now };
+            if let Some(got) = got {
+                self.observe_over(from, sent, got, out);
+            }
         }
-        o.state = OutState::Ready { at: now };
+        if let Some(o) = self.active.get_mut(i) {
+            o.state = OutState::Ready { at: now };
+        }
         self.window.insert(from, grown);
     }
 
@@ -1806,6 +1819,49 @@ impl Xfer {
     }
 
     /// Airtime of an ACK with a receipt, key-up included.
+    /// What an over costs besides its DATA frames: our key-up, the peer's
+    /// key-up and ACK, the guard between (for a broadcast, the repair window
+    /// listeners ask in), and the wait for the others on the channel to
+    /// finish, whose overs are taken to be as long as a full one of ours.
+    fn over_cost(&self, now: Millis, frame_air: Millis, cap: u32, broadcast: bool) -> OverCost {
+        let ack = self.ack_air().0 as f64;
+        let answer = if broadcast {
+            (NACK_SPREAD_ACKS + 1) as f64 * ack
+        } else {
+            ack
+        };
+        let full_over = (self.cfg.txdelay.0 + frame_air.0 * u64::from(cap)) as f64;
+        let wait = self.channel.access_wait(now.0 / 1_000, full_over);
+        OverCost {
+            frame_ms: frame_air.0 as f64,
+            turnaround_ms: 2.0 * self.cfg.txdelay.0 as f64 + self.cfg.ack_guard.0 as f64 + answer + wait,
+        }
+    }
+
+    /// Take the airtime of others' frames heard lately into the channel belief.
+    fn note_occupancy(&mut self, now: Millis) {
+        if now < self.busy_since + OCCUPANCY_EVERY {
+            return;
+        }
+        self.channel.observe(
+            now.0 / 1_000,
+            ChannelObservation::Occupancy {
+                busy_ms: self.busy_ms,
+                total_ms: now.0 - self.busy_since.0,
+            },
+        );
+        self.busy_ms = 0;
+        self.busy_since = now;
+    }
+
+    /// Take an ACK's count into the loss belief and report it.
+    fn observe_over(&mut self, to: Callsign, sent: u32, got: u32, out: &mut Vec<Output<Event>>) {
+        let mut erasure = self.erasure(to);
+        erasure.observe(sent, got);
+        self.erasure.insert(to, erasure);
+        out.push(Output::Event(Event::Over { to, sent, got }));
+    }
+
     fn ack_air(&self) -> Millis {
         self.cfg.txdelay + self.cfg.air(1, HEADER_LEN + 7 + 8 + hm_wire::RECEIPT_LEN)
     }
@@ -1817,6 +1873,7 @@ impl Xfer {
         if h.src == self.cfg.me {
             return;
         }
+        self.busy_ms += self.cfg.air(1, data.len()).0;
         self.hear_traffic(now, &h, payload);
         let for_me = h.dst == Dest::Station(self.cfg.me);
         let broadcast = h.dst == Dest::Broadcast;
@@ -1867,6 +1924,9 @@ impl Machine for Xfer {
                 accepted,
                 retry_after,
             }) => self.application_verdict(now, from, id, accepted, retry_after),
+            Input::Command(Command::Belief { peer, erasure }) => {
+                self.erasure.insert(peer, erasure);
+            }
             Input::Frame { port, data } if port == self.cfg.port => self.on_frame(now, &data, out),
             Input::Frame { .. } => {}
         }

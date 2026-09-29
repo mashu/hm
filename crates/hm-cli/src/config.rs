@@ -317,8 +317,9 @@ pub struct ContactEntry {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DeliverySettings {
-    /// Relative cost of a delivery attempt by radio, over the internet and
-    /// through an ARQ modem.
+    /// Cost of a delivery attempt by radio, over the internet and through an
+    /// ARQ modem, in hundredths of a delivered message's value: what route
+    /// choice weighs against a route's chance and speed.
     pub radio_cost: f64,
     pub internet_cost: f64,
     pub modem_cost: f64,
@@ -333,8 +334,10 @@ pub struct DeliverySettings {
     pub custody_suspect_secs: u64,
     /// Retry budget for destination-signed end-to-end receipts.
     pub receipt_retry_attempts: u32,
-    /// Half-life of bearer success/failure evidence used by path selection.
-    pub evidence_half_life_secs: u64,
+    /// Retired: what is learned about links keeps its own memory. Accepted
+    /// and ignored, so that older station files still load.
+    #[serde(skip_serializing)]
+    pub evidence_half_life_secs: Option<u64>,
 }
 
 impl Default for DeliverySettings {
@@ -349,7 +352,7 @@ impl Default for DeliverySettings {
             custody_grace_secs: 6 * 3600,
             custody_suspect_secs: 24 * 3600,
             receipt_retry_attempts: 24,
-            evidence_half_life_secs: 3600,
+            evidence_half_life_secs: None,
         }
     }
 }
@@ -377,9 +380,6 @@ impl DeliverySettings {
         if self.receipt_retry_attempts == 0 {
             return Err("delivery.receipt_retry_attempts must be positive".into());
         }
-        if self.evidence_half_life_secs == 0 {
-            return Err("delivery.evidence_half_life_secs must be positive".into());
-        }
         Ok(())
     }
 }
@@ -396,8 +396,11 @@ pub struct RelaySettings {
     pub max_hops: u8,
     /// Per-bundle radio airtime ceiling.
     pub airtime_budget_secs: u64,
-    /// Minimum modeled delivery-probability gain before making urgent copy two.
-    pub urgent_min_gain: f64,
+    /// Retired: whether urgent traffic goes two ways at once is decided by
+    /// expected utility. Accepted and ignored, so that older station files
+    /// still load.
+    #[serde(skip_serializing)]
+    pub urgent_min_gain: Option<f64>,
     /// Fraction of rolling radio airtime reserved for control.
     pub control_airtime_fraction: f64,
 }
@@ -411,7 +414,7 @@ impl Default for RelaySettings {
             max_bytes: 16 * 1024 * 1024,
             max_hops: 8,
             airtime_budget_secs: 300,
-            urgent_min_gain: 0.05,
+            urgent_min_gain: None,
             control_airtime_fraction: 0.02,
         }
     }
@@ -427,9 +430,6 @@ impl RelaySettings {
         }
         if self.airtime_budget_secs == 0 {
             return Err("relay.airtime_budget_secs must be positive".into());
-        }
-        if !self.urgent_min_gain.is_finite() || !(0.0..1.0).contains(&self.urgent_min_gain) {
-            return Err("relay.urgent_min_gain must be between 0 and 1".into());
         }
         if !self.control_airtime_fraction.is_finite() || !(0.0..=1.0).contains(&self.control_airtime_fraction)
         {
@@ -838,9 +838,6 @@ pub fn set_relay(path: &Path, old: &RelaySettings, new: &RelaySettings) -> io::R
     if old.airtime_budget_secs != new.airtime_budget_secs {
         put("airtime_budget_secs", (new.airtime_budget_secs as i64).into());
     }
-    if old.urgent_min_gain != new.urgent_min_gain {
-        put("urgent_min_gain", new.urgent_min_gain.into());
-    }
     if old.control_airtime_fraction != new.control_airtime_fraction {
         put("control_airtime_fraction", new.control_airtime_fraction.into());
     }
@@ -945,7 +942,6 @@ retry_attempts = 12
 custody_grace_secs = 21600
 custody_suspect_secs = 86400
 receipt_retry_attempts = 24
-# evidence_half_life_secs = 3600   bearer success/failure fade for path choice
 
 # Relaying is opt-in. `mailbox` holds traffic for intermittently connected
 # stations; `enabled` may forward it through another relay.
@@ -956,7 +952,6 @@ mailbox = false
 # max_bytes = 16777216
 # max_hops = 8
 # airtime_budget_secs = 300
-# urgent_min_gain = 0.05
 # control_airtime_fraction = 0.02
 
 # Stations whose messages you can verify. The public core hub is trusted by

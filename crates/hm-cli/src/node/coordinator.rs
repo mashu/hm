@@ -6,10 +6,11 @@ use std::time::Duration;
 
 use hm_bundle::{Bundle, Kind, Opened, Precedence};
 use hm_core::DetRng;
+use hm_model::{Bearer, Beliefs, CustodianObservation, LinkKey, LinkObservation};
 use hm_net::{Net, NetError};
 use hm_route::{
-    plan_routes, BeaconObservation, Bearer as RouteBearer, ContactGraph, ContactKey, GraphConfig,
-    LiveContact, Route, RouteRequest, RoutingPolicy,
+    plan_routes, BeaconObservation, ContactGraph, ContactKey, GraphConfig, LiveContact, Route, RouteRequest,
+    RoutingPolicy,
 };
 use hm_store::{Direction, ReclaimOutcome, Retry, Store};
 use hm_wire::{wrap_routed, Callsign, ObjectId, FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY};
@@ -17,7 +18,6 @@ use hm_xfer::{Failure, Receipt};
 
 use super::accept::{accept, Acceptance, AcceptanceGate};
 use super::arq;
-use super::choose::{Bearer, Chooser};
 use super::control::{
     live_window_secs, radio_pull_due, ControlPlane, LIVE_ADVERT_REFRESH_SECS, LIVE_ADVERT_VALIDITY_SECS,
 };
@@ -30,7 +30,7 @@ use super::sync::{
     advertised_flags, apply_sync_actions, broadcast_sync, live_advert, receive_sync, scheduled_advert,
     send_sync,
 };
-use super::types::{log, route_bearer, short, NodeConfig, Notify, Status};
+use super::types::{log, short, NodeConfig, Notify, Status};
 use crate::station::unix_now;
 
 pub(crate) struct InFlight {
@@ -38,6 +38,140 @@ pub(crate) struct InFlight {
     peer: Callsign,
     route: Route,
     object_bytes: u64,
+    /// The route's chance beyond its first hop, and the best other way's:
+    /// what the custody suspect time is decided from.
+    downstream: f64,
+    alternative: f64,
+    expires_at: u64,
+}
+
+impl InFlight {
+    /// A transfer not planned as a route (a bulletin, a requested copy).
+    fn direct(bearer: Bearer, peer: Callsign, object_bytes: u64, now: u64) -> InFlight {
+        InFlight {
+            bearer,
+            peer,
+            route: Route {
+                hops: Vec::new(),
+                arrival: now,
+                airtime_millis: 0,
+                success_probability: 1.0,
+                first_hop_probability: 1.0,
+                risk_cost: 0.0,
+                attempt_cost: 0.0,
+                utility: 0.0,
+            },
+            object_bytes,
+            downstream: 1.0,
+            alternative: 0.0,
+            expires_at: u64::MAX,
+        }
+    }
+}
+
+/// How a handoff ended, and so what it says about the link and the custodian.
+enum Outcome {
+    /// Custody taken, with a verified receipt.
+    Delivered,
+    /// The handoff failed for a reason of the link (no answer, lost session).
+    LinkFailed(String),
+    /// The custodian said no; permanent refusals are not retried.
+    Refused { reason: String, permanent: bool },
+    /// The custodian is busy for `retry_after` seconds.
+    Busy { reason: String, retry_after: u64 },
+    /// The link carried the object and the answer, but the receipt could not
+    /// be verified: custody stays here.
+    Unverified(String),
+    /// Our side failed (the radio went down, a bad object): no news about
+    /// the link or the custodian.
+    Local { reason: String, permanent: bool },
+}
+
+impl Outcome {
+    fn from_net(result: Result<(), NetError>) -> Outcome {
+        match result {
+            Ok(()) => Outcome::Delivered,
+            Err(NetError::Busy { retry_after, reason }) => Outcome::Busy {
+                reason: format!("busy for {retry_after} s: {reason}"),
+                retry_after: u64::from(retry_after),
+            },
+            Err(NetError::Rejected(r)) => Outcome::Refused {
+                reason: format!("rejected: {r}"),
+                permanent: false,
+            },
+            Err(e) => Outcome::LinkFailed(e.to_string()),
+        }
+    }
+
+    fn from_modem(result: Result<(), String>) -> Outcome {
+        match result {
+            Ok(()) => Outcome::Delivered,
+            Err(e) if e.starts_with("refused: busy for ") => {
+                let retry_after = e["refused: busy for ".len()..]
+                    .split(' ')
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(60);
+                Outcome::Busy {
+                    reason: e,
+                    retry_after,
+                }
+            }
+            Err(e) if e.starts_with("refused: ") => Outcome::Refused {
+                reason: e,
+                permanent: true,
+            },
+            Err(e) => Outcome::LinkFailed(e),
+        }
+    }
+
+    fn from_radio(reason: Failure) -> Outcome {
+        let text = format!("{reason:?}");
+        match reason {
+            Failure::NoAnswer => Outcome::LinkFailed(text),
+            Failure::Refused | Failure::TooLarge => Outcome::Refused {
+                reason: text,
+                permanent: false,
+            },
+            Failure::Empty | Failure::SelfAddressed => Outcome::Local {
+                reason: text,
+                permanent: true,
+            },
+        }
+    }
+}
+
+/// What a flight's outcome tells the beliefs: the link's part and the
+/// custodian's, each only where it bears.
+fn learn(beliefs: &mut Beliefs, me: Callsign, flight: &InFlight, outcome: &Outcome, now: u64) {
+    let link = LinkKey {
+        from: me,
+        to: flight.peer,
+        bearer: flight.bearer,
+    };
+    match outcome {
+        Outcome::Delivered => {
+            beliefs.observe_link(link, now, LinkObservation::Handoff { ok: true });
+            beliefs.observe_custodian(flight.peer, now, CustodianObservation::Accepted);
+        }
+        Outcome::LinkFailed(_) => beliefs.observe_link(link, now, LinkObservation::Handoff { ok: false }),
+        Outcome::Refused { .. } => {
+            beliefs.observe_link(link, now, LinkObservation::Heard);
+            beliefs.observe_custodian(flight.peer, now, CustodianObservation::Refused);
+        }
+        Outcome::Busy { retry_after, .. } => {
+            beliefs.observe_link(link, now, LinkObservation::Heard);
+            beliefs.observe_custodian(
+                flight.peer,
+                now,
+                CustodianObservation::Busy {
+                    retry_after: *retry_after,
+                },
+            );
+        }
+        Outcome::Unverified(_) => beliefs.observe_link(link, now, LinkObservation::Heard),
+        Outcome::Local { .. } => {}
+    }
 }
 
 pub(crate) type NetResult = (ObjectId, Callsign, Result<(), NetError>);
@@ -54,17 +188,19 @@ struct LiveClaim {
     claimed_at: u64,
 }
 
-/// Claim (or refresh) our live contact to `peer` over `bearer`. Live claims
-/// go to the internet core only: on the radio, beacons already tell every
-/// station in reach who hears whom.
+/// Claim (or refresh) our live contact to `peer` over `bearer`, with our
+/// belief that a handoff over it completes. Live claims go to the internet
+/// core only: on the radio, beacons already tell every station in reach who
+/// hears whom.
 #[allow(clippy::too_many_arguments)]
 fn claim_live(
     cfg: &NodeConfig,
     relay: &crate::config::RelaySettings,
     control: &mut ControlPlane,
-    claims: &mut BTreeMap<(Callsign, RouteBearer), LiveClaim>,
+    claims: &mut BTreeMap<(Callsign, Bearer), LiveClaim>,
     peer: Callsign,
-    bearer: RouteBearer,
+    bearer: Bearer,
+    success: f64,
     rate_bps: u32,
     capacity_bytes: u64,
     now: u64,
@@ -79,7 +215,17 @@ fn claim_live(
         Some(c) if now.saturating_sub(c.claimed_at) < LIVE_ADVERT_VALIDITY_SECS => c.since,
         _ => now,
     };
-    match live_advert(cfg, relay, peer, bearer, rate_bps, capacity_bytes, since, now) {
+    match live_advert(
+        cfg,
+        relay,
+        peer,
+        bearer,
+        success,
+        rate_bps,
+        capacity_bytes,
+        since,
+        now,
+    ) {
         Ok(advert) => match control.observe_local(advert, now.saturating_mul(1_000), false) {
             Ok(()) => {
                 claims.insert(
@@ -199,14 +345,6 @@ fn wake_for(store: &Store, station: Callsign, how: &str, now: u64) {
     }
 }
 
-/// The routing bearer a handoff went over, from the name the store keeps.
-fn bearer_named(name: &str) -> Option<RouteBearer> {
-    [Bearer::Radio, Bearer::Internet, Bearer::Modem]
-        .into_iter()
-        .find(|bearer| bearer.name() == name)
-        .map(route_bearer)
-}
-
 /// Publish signed claims for our own scheduled contacts, numbered from `base`.
 /// Peers keep the claim with the newest sequence number, so republishing with
 /// a higher base replaces what they hold, for example after the relay or
@@ -250,11 +388,10 @@ pub(crate) async fn coordinator(
     let seed = cfg
         .seed
         .unwrap_or_else(|| getrandom::u64().unwrap_or_else(|_| unix_now()));
-    let mut chooser = Chooser::new(
-        live.get().costs,
-        live.get().evidence_half_life_secs,
-        DetRng::from_seed(seed),
-    );
+    // Each route plan draws once from the beliefs (Thompson sampling), from
+    // its own stream.
+    let rng = DetRng::from_seed(seed);
+    let mut plans = 0_u64;
     let mut graph = ContactGraph::new(GraphConfig::default()).expect("default contact graph");
     for schedule in &cfg.schedules {
         if let Err(error) = graph.add_schedule(*schedule) {
@@ -268,36 +405,36 @@ pub(crate) async fn coordinator(
     let mut advertised = advertised_flags(cfg.internet.is_some(), &live.get().relay);
     let mut schedule_base = startup as u32;
     advertise_schedules(cfg, &live.get().relay, &mut control, schedule_base, startup);
-    match store.contact_evidence() {
+    // What this station has learned about links and custodians.
+    let mut beliefs = Beliefs::new();
+    match store.beliefs() {
         Ok(saved) => {
-            for (key, evidence) in saved {
-                graph.restore_evidence(key, evidence);
-                if key.from == cfg.me {
-                    let bearer = match key.bearer {
-                        RouteBearer::Radio => Bearer::Radio,
-                        RouteBearer::Internet => Bearer::Internet,
-                        RouteBearer::Modem => Bearer::Modem,
-                    };
-                    chooser.restore(key.to, bearer, evidence.successes, evidence.failures, evidence.at);
+            for (key, value) in saved {
+                if let Err(error) = beliefs.restore(&key, &value) {
+                    log(format!("ignored a saved belief: {error}"));
                 }
             }
         }
-        Err(error) => log(format!("could not restore contact evidence: {error}")),
+        Err(error) => log(format!("could not restore beliefs: {error}")),
     }
+    // Chance, beyond the custodian, of each message handed over lately: what
+    // a missing end-to-end receipt is weighed against.
+    let mut handed: BTreeMap<ObjectId, f64> = BTreeMap::new();
     let mut radio_up = false;
     let mut last_down: Option<String> = None;
     let mut radio_via = cfg.radio.as_ref().map(|r| r.describe());
     let mut in_flight: BTreeMap<(ObjectId, Callsign), InFlight> = BTreeMap::new();
     let mut radio_ids: BTreeMap<(ObjectId, Callsign), ObjectId> = BTreeMap::new();
-    let mut failed_contacts: BTreeMap<ObjectId, BTreeMap<ContactKey, u64>> = BTreeMap::new();
     let mut known_internet_links = BTreeSet::new();
     let mut last_pairwise_sync: BTreeMap<(Callsign, Bearer), u64> = BTreeMap::new();
     let mut last_sync_ignore: Option<(Callsign, u64)> = None;
-    let mut advertised_live: BTreeMap<(Callsign, RouteBearer), LiveClaim> = BTreeMap::new();
+    let mut advertised_live: BTreeMap<(Callsign, Bearer), LiveClaim> = BTreeMap::new();
     // A beacon heard this long ago no longer shows a live radio contact. It
     // follows our beacon interval, which grows as more stations share the channel.
     let mut live_window = live_window_secs(live.get().beacon_secs);
     graph.set_live_contact_secs(live_window);
+    // How often stations beacon: a beacon due and not heard is news too.
+    let mut beacon_interval = live.get().beacon_secs;
     let mut holding_sent: Option<bool> = None;
     let mut next_holding_check = 0u64;
     // When the beacon of each station last taken into the contact graph was heard.
@@ -309,17 +446,16 @@ pub(crate) async fn coordinator(
 
     let finish = |id: ObjectId,
                   flight: InFlight,
-                  outcome: Result<(), (String, bool)>,
-                  chooser: &mut Chooser,
+                  outcome: Outcome,
+                  beliefs: &mut Beliefs,
                   graph: &mut ContactGraph,
-                  failed_contacts: &mut BTreeMap<ObjectId, BTreeMap<ContactKey, u64>>| {
+                  handed: &mut BTreeMap<ObjectId, f64>| {
         let now = unix_now();
         let peer = flight.peer;
         let bearer = flight.bearer;
-        match outcome {
-            Ok(()) => {
-                chooser.record(peer, bearer, true, now);
-                graph.record_delivery(cfg.me, peer, route_bearer(bearer), true, now);
+        learn(beliefs, cfg.me, &flight, &outcome, now);
+        let (reason, permanent) = match outcome {
+            Outcome::Delivered => {
                 if let Some(first) = flight.route.hops.first() {
                     if let Err(error) = graph.consume(first.contact, flight.object_bytes) {
                         log(format!("route capacity: {error}"));
@@ -328,6 +464,25 @@ pub(crate) async fn coordinator(
                         let _ = graph.release(hop.contact, flight.object_bytes);
                     }
                 }
+                let settings = live.get();
+                // Wait for the end-to-end receipt as long as waiting pays:
+                // resending sooner risks a duplicate, later a lost message
+                // found out too late. The final destination itself cannot
+                // lose what it holds: from there, resending never pays.
+                let at_destination = store
+                    .record(id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|r| r.final_destination() == peer);
+                let suspect_secs = beliefs.suspect_after(
+                    peer,
+                    flight.downstream,
+                    if at_destination { 0.0 } else { flight.alternative },
+                    1.0 / settings.costs.of(bearer).max(1.0e-6),
+                    flight.expires_at.saturating_sub(now),
+                    (60, settings.custody_suspect_secs),
+                    now,
+                );
                 match store.custody_transferred(
                     id,
                     hm_store::CustodyHandoff {
@@ -335,70 +490,64 @@ pub(crate) async fn coordinator(
                         receipt_verified: true,
                         by: bearer.name(),
                         now,
-                        grace_secs: live.get().custody_grace_secs,
-                        suspect_secs: live.get().custody_suspect_secs,
+                        grace_secs: settings.custody_grace_secs,
+                        suspect_secs,
                     },
                 ) {
-                    Ok(true) => log(format!(
-                        "custody of {} transferred to {peer} by {}",
-                        short(&id),
-                        bearer.name()
-                    )),
+                    Ok(true) => {
+                        handed.insert(id, flight.downstream);
+                        log(format!(
+                            "custody of {} transferred to {peer} by {}; receipt expected within {} s",
+                            short(&id),
+                            bearer.name(),
+                            suspect_secs
+                        ))
+                    }
                     Ok(false) => log(format!(
                         "ignored late custody receipt for {} from {peer}",
                         short(&id)
                     )),
                     Err(e) => log(format!("store: {e}")),
                 }
+                notify.send("message");
+                return;
             }
-            Err((reason, permanent)) => {
-                chooser.record(peer, bearer, false, now);
-                graph.record_delivery(cfg.me, peer, route_bearer(bearer), false, now);
-                for hop in &flight.route.hops {
-                    let _ = graph.release(hop.contact, flight.object_bytes);
-                }
-                if let Some(first) = flight.route.hops.first() {
-                    let cooldown = live.get().retry.delay_after(1).clamp(5, 300);
-                    failed_contacts
-                        .entry(id)
-                        .or_default()
-                        .insert(first.contact, now.saturating_add(cooldown));
-                }
-                if let Err(error) = store.clear_next_hop(id, peer) {
-                    log(format!("store: {error}"));
-                }
-                let settings = live.get();
-                let policy = retry_policy_for(store, id, &settings);
-                let r = if permanent {
-                    store.abandon(id, &reason).map(|notify| (Retry::GaveUp, notify))
-                } else {
-                    let hold = holds_until_expiry(store, id, &settings);
-                    store.attempt_failed_or_hold(
-                        id,
-                        &format!("{reason} ({})", bearer.name()),
-                        policy,
-                        now,
-                        hold,
-                    )
-                };
-                match r {
-                    Ok((Retry::At(t), _)) => log(format!(
-                        "{} to {peer} by {} failed: {reason}; next try in {} s",
-                        short(&id),
-                        bearer.name(),
-                        t.saturating_sub(now)
-                    )),
-                    Ok((Retry::GaveUp, notify)) => {
-                        log(format!("gave up on {} to {peer}: {reason}", short(&id)));
-                        on_gave_up_receipt(store, id, now);
-                        if let Some(prior) = notify {
-                            enqueue_custody_fail(store, cfg.me, &cfg.key.identity, id, prior, &reason, now);
-                        }
-                    }
-                    Ok((Retry::Inactive, _)) => {}
-                    Err(e) => log(format!("store: {e}")),
+            Outcome::LinkFailed(reason) | Outcome::Unverified(reason) => (reason, false),
+            Outcome::Busy { reason, .. } => (reason, false),
+            Outcome::Refused { reason, permanent } | Outcome::Local { reason, permanent } => {
+                (reason, permanent)
+            }
+        };
+        for hop in &flight.route.hops {
+            let _ = graph.release(hop.contact, flight.object_bytes);
+        }
+        if let Err(error) = store.clear_next_hop(id, peer) {
+            log(format!("store: {error}"));
+        }
+        let settings = live.get();
+        let policy = retry_policy_for(store, id, &settings);
+        let r = if permanent {
+            store.abandon(id, &reason).map(|notify| (Retry::GaveUp, notify))
+        } else {
+            let hold = holds_until_expiry(store, id, &settings);
+            store.attempt_failed_or_hold(id, &format!("{reason} ({})", bearer.name()), policy, now, hold)
+        };
+        match r {
+            Ok((Retry::At(t), _)) => log(format!(
+                "{} to {peer} by {} failed: {reason}; next try in {} s",
+                short(&id),
+                bearer.name(),
+                t.saturating_sub(now)
+            )),
+            Ok((Retry::GaveUp, notify)) => {
+                log(format!("gave up on {} to {peer}: {reason}", short(&id)));
+                on_gave_up_receipt(store, id, now);
+                if let Some(prior) = notify {
+                    enqueue_custody_fail(store, cfg.me, &cfg.key.identity, id, prior, &reason, now);
                 }
             }
+            Ok((Retry::Inactive, _)) => {}
+            Err(e) => log(format!("store: {e}")),
         }
         notify.send("message");
     };
@@ -428,6 +577,7 @@ pub(crate) async fn coordinator(
                 RadioEvt::BeaconInterval(secs) => {
                     live_window = live_window_secs(secs);
                     graph.set_live_contact_secs(live_window);
+                    beacon_interval = secs;
                 }
                 RadioEvt::Down(why) => {
                     radio_up = false;
@@ -445,13 +595,17 @@ pub(crate) async fn coordinator(
                     radio_ids.clear();
                     for key in lost {
                         let flight = in_flight.remove(&key).expect("listed");
+                        // Our radio, not the link: nothing learned about the peer.
                         finish(
                             key.0,
                             flight,
-                            Err(("radio went down".into(), false)),
-                            &mut chooser,
+                            Outcome::Local {
+                                reason: "radio went down".into(),
+                                permanent: false,
+                            },
+                            &mut beliefs,
                             &mut graph,
-                            &mut failed_contacts,
+                            &mut handed,
                         );
                     }
                 }
@@ -526,18 +680,7 @@ pub(crate) async fn coordinator(
                         }
                         beacons_seen.insert(station.call, beacon.at);
                         wake_for(store, station.call, "heard", now);
-                        claim_live(
-                            cfg,
-                            &live.get().relay,
-                            &mut control,
-                            &mut advertised_live,
-                            station.call,
-                            RouteBearer::Radio,
-                            rate,
-                            capacity,
-                            now,
-                        );
-                        if let Err(error) = graph.observe_beacon(BeaconObservation {
+                        let observation = BeaconObservation {
                             origin: station.call,
                             receiver: cfg.me,
                             heard: &beacon.heard,
@@ -545,7 +688,32 @@ pub(crate) async fn coordinator(
                             capacity_bytes: capacity,
                             flags: beacon.flags,
                             observed_at: beacon.at,
-                        }) {
+                        };
+                        // The beacon came through from its origin to us; its
+                        // signed list says which links into its origin were
+                        // open, and when.
+                        let radio = |from, to| LinkKey {
+                            from,
+                            to,
+                            bearer: Bearer::Radio,
+                        };
+                        beliefs.observe_link(radio(station.call, cfg.me), beacon.at, LinkObservation::Beacon);
+                        for (heard, at) in observation.hearings() {
+                            beliefs.observe_link(radio(heard, station.call), at, LinkObservation::Reported);
+                        }
+                        claim_live(
+                            cfg,
+                            &live.get().relay,
+                            &mut control,
+                            &mut advertised_live,
+                            station.call,
+                            Bearer::Radio,
+                            beliefs.link_success(radio(cfg.me, station.call), now, now),
+                            rate,
+                            capacity,
+                            now,
+                        );
+                        if let Err(error) = graph.observe_beacon(observation) {
                             log(format!("ignored beacon contact from {}: {error}", station.call));
                         }
                         // Pull only from a station whose beacon says it holds something.
@@ -574,6 +742,19 @@ pub(crate) async fn coordinator(
                             }
                         }
                     }
+                    // Beacons due from stations heard before, and not heard:
+                    // closed links, or open ones that lost them.
+                    if beacon_interval > 0 {
+                        let now = unix_now();
+                        let listened: Vec<LinkKey> = beliefs
+                            .links()
+                            .map(|(key, _)| *key)
+                            .filter(|key| key.to == cfg.me && key.bearer == Bearer::Radio)
+                            .collect();
+                        for key in listened {
+                            beliefs.note_silence(key, now, beacon_interval);
+                        }
+                    }
                     status.lock().expect("lock").heard = list;
                     notify.send("status");
                 }
@@ -599,23 +780,13 @@ pub(crate) async fn coordinator(
                             let outcome = match receipt {
                                 Receipt::Verified => {
                                     control.clear_request(id, to);
-                                    Ok(())
+                                    Outcome::Delivered
                                 }
-                                Receipt::Unverified => Err((
-                                    format!(
-                                        "custody receipt from {to} is not verified; retaining custody"
-                                    ),
-                                    false,
+                                Receipt::Unverified => Outcome::Unverified(format!(
+                                    "custody receipt from {to} is not verified; retaining custody"
                                 )),
                             };
-                            finish(
-                                id,
-                                flight,
-                                outcome,
-                                &mut chooser,
-                                &mut graph,
-                                &mut failed_contacts,
-                            );
+                            finish(id, flight, outcome, &mut beliefs, &mut graph, &mut handed);
                         }
                     }
                 }
@@ -626,18 +797,24 @@ pub(crate) async fn coordinator(
                 } => {
                     if let Some(id) = radio_ids.remove(&(xfer_id, to)) {
                         if let Some(flight) = in_flight.remove(&(id, to)) {
-                            let permanent =
-                                matches!(reason, Failure::Empty | Failure::SelfAddressed);
                             finish(
                                 id,
                                 flight,
-                                Err((format!("{reason:?}"), permanent)),
-                                &mut chooser,
+                                Outcome::from_radio(reason),
+                                &mut beliefs,
                                 &mut graph,
-                                &mut failed_contacts,
+                                &mut handed,
                             );
                         }
                     }
+                }
+                RadioEvt::Over { to, sent, got } => {
+                    let link = LinkKey {
+                        from: cfg.me,
+                        to,
+                        bearer: Bearer::Radio,
+                    };
+                    beliefs.observe_link(link, unix_now(), LinkObservation::Over { sent, got });
                 }
             },
             Some((from, payload)) = net_control.recv() => {
@@ -673,10 +850,10 @@ pub(crate) async fn coordinator(
                             let _ = graph.release(hop.contact, flight.object_bytes);
                         }
                         let now = unix_now();
-                        match result {
-                            Ok(()) => {
-                                chooser.record(peer, flight.bearer, true, now);
-                                graph.record_delivery(cfg.me, peer, route_bearer(flight.bearer), true, now);
+                        let outcome = Outcome::from_net(result);
+                        learn(&mut beliefs, cfg.me, &flight, &outcome, now);
+                        match outcome {
+                            Outcome::Delivered => {
                                 match store.delivered(id, false, "internet", now) {
                                     Ok(()) => log(format!(
                                         "published bulletin {} to {peer} over the internet",
@@ -685,17 +862,11 @@ pub(crate) async fn coordinator(
                                     Err(e) => log(format!("store: {e}")),
                                 }
                             }
-                            Err(e) => {
-                                chooser.record(peer, flight.bearer, false, now);
-                                graph.record_delivery(cfg.me, peer, route_bearer(flight.bearer), false, now);
-                                let reason = match e {
-                                    NetError::Busy {
-                                        retry_after,
-                                        reason,
-                                    } => format!("busy for {retry_after} s: {reason}"),
-                                    NetError::Rejected(r) => format!("rejected: {r}"),
-                                    other => other.to_string(),
-                                };
+                            Outcome::LinkFailed(reason)
+                            | Outcome::Refused { reason, .. }
+                            | Outcome::Busy { reason, .. }
+                            | Outcome::Unverified(reason)
+                            | Outcome::Local { reason, .. } => {
                                 log(format!(
                                     "bulletin {} to {peer} failed: {reason}",
                                     short(&id)
@@ -726,49 +897,22 @@ pub(crate) async fn coordinator(
                         notify.send("status");
                     }
                 } else {
-                    let outcome = match result {
-                        Ok(()) => Ok(()),
-                        Err(NetError::Busy {
-                            retry_after,
-                            reason,
-                        }) => Err((format!("busy for {retry_after} s: {reason}"), false)),
-                        Err(NetError::Rejected(r)) => Err((format!("rejected: {r}"), false)),
-                        Err(e) => Err((e.to_string(), false)),
-                    };
+                    let outcome = Outcome::from_net(result);
                     if let Some(flight) = in_flight.remove(&(id, peer)) {
-                        if outcome.is_ok() {
+                        if matches!(outcome, Outcome::Delivered) {
                             control.clear_request(id, peer);
                         }
-                        finish(
-                            id,
-                            flight,
-                            outcome,
-                            &mut chooser,
-                            &mut graph,
-                            &mut failed_contacts,
-                        );
+                        finish(id, flight, outcome, &mut beliefs, &mut graph, &mut handed);
                     }
                 }
             }
             Some((id, peer, result)) = modem_rx.recv() => {
-                let outcome = match result {
-                    Ok(()) => Ok(()),
-                    Err(e) if e.starts_with("refused: busy for ") => Err((e, false)),
-                    Err(e) if e.starts_with("refused: ") => Err((e, true)),
-                    Err(e) => Err((e, false)),
-                };
+                let outcome = Outcome::from_modem(result);
                 if let Some(flight) = in_flight.remove(&(id, peer)) {
-                    if outcome.is_ok() {
+                    if matches!(outcome, Outcome::Delivered) {
                         control.clear_request(id, peer);
                     }
-                    finish(
-                        id,
-                        flight,
-                        outcome,
-                        &mut chooser,
-                        &mut graph,
-                        &mut failed_contacts,
-                    );
+                    finish(id, flight, outcome, &mut beliefs, &mut graph, &mut handed);
                 }
             }
             _ = tick.tick() => {
@@ -777,19 +921,32 @@ pub(crate) async fn coordinator(
                     Some(Err(e)) => log(format!("settings file not applied, keeping the settings in use: {e}")),
                     None => {}
                 }
-                // Link evidence changed since the last tick, in one transaction.
-                let changed = graph.take_changed_evidence();
-                if !changed.is_empty() {
-                    if let Err(error) = store.save_contact_evidence_batch(&changed) {
-                        log(format!("store: {error}"));
+                // Beliefs changed since the last tick, in one transaction.
+                beliefs.prune(unix_now());
+                if let Err(error) = store.save_beliefs(&beliefs.take_changed()) {
+                    log(format!("store: {error}"));
+                }
+                // End-to-end receipts for messages a custodian took: how long
+                // it took, and that it did its part.
+                match store.take_custody_outcomes() {
+                    Ok(outcomes) => {
+                        for outcome in outcomes {
+                            handed.remove(&outcome.id);
+                            beliefs.observe_custodian(
+                                outcome.custodian,
+                                outcome.delivered_at,
+                                CustodianObservation::Delivered {
+                                    delay_secs: outcome.delivered_at.saturating_sub(outcome.handed_at),
+                                },
+                            );
+                        }
                     }
+                    Err(error) => log(format!("store: {error}")),
                 }
                 if live.version() != live_version {
                     live_version = live.version();
                     notify.send("settings");
                     let snapshot = live.get();
-                    chooser.set_costs(snapshot.costs);
-                    chooser.set_half_life(snapshot.evidence_half_life_secs);
                     ensure_internet(
                         cfg,
                         store,
@@ -820,15 +977,24 @@ pub(crate) async fn coordinator(
                 let now = unix_now();
                 let links = net.as_ref().map(|n| n.connected()).unwrap_or_default();
                 let current_links: BTreeSet<Callsign> = links.iter().copied().collect();
+                let internet = |from, to| LinkKey {
+                    from,
+                    to,
+                    bearer: Bearer::Internet,
+                };
+                // Links that went down since the last tick are closed.
+                for peer in known_internet_links.difference(&current_links) {
+                    beliefs.observe_link(internet(cfg.me, *peer), now, LinkObservation::Down);
+                    beliefs.observe_link(internet(*peer, cfg.me), now, LinkObservation::Down);
+                }
                 for peer in &current_links {
                     for (from, to) in [(cfg.me, *peer), (*peer, cfg.me)] {
                         if let Err(error) = graph.observe_live_link(LiveContact {
                             from,
                             to,
-                            bearer: RouteBearer::Internet,
+                            bearer: Bearer::Internet,
                             rate_bps: 10_000_000,
                             capacity_bytes: 64 * 1024 * 1024,
-                            success_permyriad: Some(9_900),
                             flags: FLAG_INTERNET,
                             observed_at: now,
                         }) {
@@ -841,13 +1007,15 @@ pub(crate) async fn coordinator(
                         &mut control,
                         &mut advertised_live,
                         *peer,
-                        RouteBearer::Internet,
+                        Bearer::Internet,
+                        beliefs.link_success(internet(cfg.me, *peer), now, now),
                         10_000_000,
                         64 * 1024 * 1024,
                         now,
                     );
                     if !known_internet_links.contains(peer) {
-                        graph.record_delivery(cfg.me, *peer, RouteBearer::Internet, true, now);
+                        beliefs.observe_link(internet(cfg.me, *peer), now, LinkObservation::Up);
+                        beliefs.observe_link(internet(*peer, cfg.me), now, LinkObservation::Up);
                         wake_for(store, *peer, "linked", now);
                         match control.contact_messages() {
                             Ok(messages) => {
@@ -944,15 +1112,20 @@ pub(crate) async fn coordinator(
                                 continue;
                             }
                             // Our own message went to a custodian and no receipt
-                            // came back in all that time, by any path: count it
-                            // against that hop, so a station that takes custody
-                            // and drops it stops attracting traffic.
+                            // came back in all that time, by any path: the
+                            // custodian takes its share of the blame, weighed
+                            // against the rest of the route's chance, so a
+                            // station that takes custody and drops it stops
+                            // attracting traffic. The link that carried the
+                            // handoff did its part and is not blamed.
                             if record.direction == Direction::Out {
-                                if let (Some(custodian), Some(bearer)) = (
-                                    record.custody_by,
-                                    record.by.as_deref().and_then(bearer_named),
-                                ) {
-                                    graph.record_delivery(cfg.me, custodian, bearer, false, now);
+                                if let Some(custodian) = record.custody_by {
+                                    let downstream = handed.remove(&record.id).unwrap_or(0.5);
+                                    beliefs.observe_custodian(
+                                        custodian,
+                                        now,
+                                        CustodianObservation::Lost { downstream },
+                                    );
                                 }
                             }
                             match store.reclaim_custody(
@@ -1001,11 +1174,6 @@ pub(crate) async fn coordinator(
                     }
                     Err(error) => log(format!("store: {error}")),
                 }
-                // Cooldowns that ran out: a message sent or given up on leaves none.
-                failed_contacts.retain(|_, contacts| {
-                    contacts.retain(|_, until| *until > now);
-                    !contacts.is_empty()
-                });
                 let due = match store.due(now) {
                     Ok(d) => d,
                     Err(e) => {
@@ -1053,13 +1221,6 @@ pub(crate) async fn coordinator(
                     }
                     if bundle.kind == Kind::Bulletin {
                         let bulletin_peer = hm_xfer::broadcast_peer();
-                        let empty_route = || Route {
-                            hops: Vec::new(),
-                            arrival: now,
-                            airtime_millis: 0,
-                            success_probability: 1.0,
-                            risk_cost: 0.0,
-                        };
                         // A peer asked for this bulletin over SYNC: send it on the internet.
                         if let Some(peer) = control.target_for(r.id, now) {
                             if net.as_ref().is_some_and(|network| network.is_connected(peer))
@@ -1067,12 +1228,7 @@ pub(crate) async fn coordinator(
                             {
                                 in_flight.insert(
                                     (r.id, peer),
-                                    InFlight {
-                                        bearer: Bearer::Internet,
-                                        peer,
-                                        route: empty_route(),
-                                        object_bytes: object.len() as u64,
-                                    },
+                                    InFlight::direct(Bearer::Internet, peer, object.len() as u64, now),
                                 );
                                 let (network, tx, id) = (
                                     net.clone().expect("checked connected"),
@@ -1099,16 +1255,15 @@ pub(crate) async fn coordinator(
                             radio_ids.insert((hm_xfer::object_id(&object), bulletin_peer), r.id);
                             in_flight.insert(
                                 (r.id, bulletin_peer),
-                                InFlight {
-                                    bearer: Bearer::Radio,
-                                    peer: bulletin_peer,
-                                    route: empty_route(),
-                                    object_bytes: object.len() as u64,
-                                },
+                                InFlight::direct(Bearer::Radio, bulletin_peer, object.len() as u64, now),
                             );
+                            // Listeners' links are like the radio links this
+                            // station knows, as a population.
+                            let prior = beliefs.link_prior(Bearer::Radio);
                             let _ = radio_cmd.send(RadioCmd::Broadcast {
                                 object,
                                 precedence: r.precedence,
+                                erasure: hm_model::Erasure::from_prior(prior.erasure, prior.dispersion),
                             });
                             log(format!(
                                 "publishing bulletin {} on radio (attempt {})",
@@ -1129,12 +1284,7 @@ pub(crate) async fn coordinator(
                                 }
                                 in_flight.insert(
                                     (r.id, *peer),
-                                    InFlight {
-                                        bearer: Bearer::Internet,
-                                        peer: *peer,
-                                        route: empty_route(),
-                                        object_bytes: object.len() as u64,
-                                    },
+                                    InFlight::direct(Bearer::Internet, *peer, object.len() as u64, now),
                                 );
                                 let (network, tx, id, peer) = (
                                     net.clone().expect("checked"),
@@ -1195,44 +1345,98 @@ pub(crate) async fn coordinator(
                         max_hops = max_hops.min((visited.len() + 1) as u8);
                     }
                     let modem_up = modem.as_ref().is_some_and(|handle| handle.status().up);
-                    if modem_up {
+                    let routed_len = object.len()
+                        + usize::from(r.direction == Direction::Relay)
+                            * (10 + 6 * (usize::from(r.hop_count.unwrap_or(0)) + 1));
+                    // Links that could be tried now, never seen open: how
+                    // likely each is comes from the beliefs about it, which
+                    // start from its bearer's population. An ARQ modem can
+                    // call any station; the destination may be in radio
+                    // range, unheard; a relaying internet gateway may reach
+                    // it through the internet core (a default route).
+                    let potential = |from, to, bearer, rate_bps, capacity_bytes| LiveContact {
+                        from,
+                        to,
+                        bearer,
+                        rate_bps,
+                        capacity_bytes,
+                        flags: 0,
+                        observed_at: now,
+                    };
+                    // An internet link may be to the destination under its
+                    // base callsign: then the link to it is up, seen.
+                    if net
+                        .as_ref()
+                        .is_some_and(|network| network.is_connected(route_destination))
+                    {
+                        let link = LinkKey {
+                            from: cfg.me,
+                            to: route_destination,
+                            bearer: Bearer::Internet,
+                        };
+                        if beliefs.link(link).is_none_or(|l| l.last_open().is_none_or(|t| t + 60 < now)) {
+                            beliefs.observe_link(link, now, LinkObservation::Up);
+                        }
+                        let _ = graph.observe_live_link(LiveContact {
+                            flags: FLAG_INTERNET,
+                            ..potential(cfg.me, route_destination, Bearer::Internet, 10_000_000, 64 * 1024 * 1024)
+                        });
+                    }
+                    if modem_up && rf_ok {
                         let rate_bps = cfg
                             .modem
                             .as_ref()
                             .map_or(1_200, arq::ArqConfig::estimated_rate_bps);
-                        let _ = graph.observe_live_link(LiveContact {
-                            from: cfg.me,
-                            to: route_destination,
-                            bearer: RouteBearer::Modem,
+                        let _ = graph.add_potential(potential(
+                            cfg.me,
+                            route_destination,
+                            Bearer::Modem,
                             rate_bps,
-                            capacity_bytes: arq::MAX_OBJECT as u64,
-                            success_permyriad: Some(7_000),
-                            flags: 0,
-                            observed_at: now,
-                        });
+                            arq::MAX_OBJECT as u64,
+                        ));
                     }
-                    let mut excluded: Vec<ContactKey> = failed_contacts
-                        .get(&r.id)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|(contact, until)| (*until > now).then_some(*contact))
+                    if radio_up && rf_ok {
+                        let rate = live.get().radio.bitrate;
+                        let _ = graph.add_potential(potential(
+                            cfg.me,
+                            route_destination,
+                            Bearer::Radio,
+                            rate,
+                            (u64::from(rate) * 600 / 8).max(routed_len as u64),
+                        ));
+                    }
+                    let gateways: Vec<Callsign> = graph
+                        .stations_flagged(FLAG_INTERNET, now)
+                        .filter(|gateway| {
+                            *gateway != cfg.me
+                                && *gateway != route_destination
+                                && !visited.contains(gateway)
+                                && graph
+                                    .flags(*gateway, now)
+                                    .is_some_and(|flags| flags & (FLAG_RELAY | FLAG_MAILBOX) != 0)
+                        })
                         .collect();
-                    excluded.extend(
-                        graph
-                            .outgoing(cfg.me, now)
-                            .filter(|contact| match contact.key.bearer {
-                                RouteBearer::Radio => !radio_up || !rf_ok,
-                                RouteBearer::Internet => net
-                                    .as_ref()
-                                    .is_none_or(|network| !network.is_connected(contact.key.to)),
-                                RouteBearer::Modem => !modem_up || !rf_ok,
-                            })
-                            .map(|contact| contact.key),
-                    );
-                    let routed_len = object.len()
-                        + usize::from(r.direction == Direction::Relay)
-                            * (10 + 6 * (usize::from(r.hop_count.unwrap_or(0)) + 1));
-                    let make_request = || RouteRequest {
+                    for gateway in gateways {
+                        let _ = graph.add_potential(potential(
+                            gateway,
+                            route_destination,
+                            Bearer::Internet,
+                            10_000_000,
+                            64 * 1024 * 1024,
+                        ));
+                    }
+                    let excluded: Vec<ContactKey> = graph
+                        .outgoing(cfg.me, now)
+                        .filter(|contact| match contact.key.bearer {
+                            Bearer::Radio => !radio_up || !rf_ok,
+                            Bearer::Internet => net
+                                .as_ref()
+                                .is_none_or(|network| !network.is_connected(contact.key.to)),
+                            Bearer::Modem => !modem_up || !rf_ok,
+                        })
+                        .map(|contact| contact.key)
+                        .collect();
+                    let request = RouteRequest {
                         source: cfg.me,
                         destination: route_destination,
                         now,
@@ -1245,77 +1449,22 @@ pub(crate) async fn coordinator(
                         urgent: r.precedence >= 2,
                     };
                     let policy = RoutingPolicy {
-                        urgent_min_gain: live.get().relay.urgent_min_gain,
+                        attempt_cost: live.get().costs.attempt_cost(),
                         ..RoutingPolicy::default()
                     };
-                    let mut plan = plan_routes(&graph, &make_request(), policy);
-                    // No path to the destination is known. A station without
-                    // internet links hands it to a relaying internet gateway it
-                    // can reach (a default route): the gateway sees the
-                    // internet core and the radio areas behind other gateways.
-                    if plan.is_err() && known_internet_links.is_empty() {
-                        let mut best: Option<(f64, hm_route::RoutePlan)> = None;
-                        let gateways: Vec<Callsign> = graph
-                            .stations_flagged(FLAG_INTERNET, now)
-                            .filter(|gateway| {
-                                *gateway != cfg.me
-                                    && *gateway != destination
-                                    && !visited.contains(gateway)
-                                    && graph
-                                        .flags(*gateway, now)
-                                        .is_some_and(|flags| flags & (FLAG_RELAY | FLAG_MAILBOX) != 0)
-                            })
-                            .collect();
-                        for gateway in gateways {
-                            let request = RouteRequest {
-                                destination: gateway,
-                                ..make_request()
-                            };
-                            if let Ok(found) = plan_routes(&graph, &request, policy) {
-                                let score = found.combined_success_probability;
-                                if best.as_ref().is_none_or(|(b, _)| score > *b) {
-                                    best = Some((score, found));
-                                }
-                            }
-                        }
-                        if let Some((_, found)) = best {
-                            plan = Ok(found);
-                        }
-                    }
-                    // The destination may be in radio range, unheard: try it there
-                    // before the internet, which costs more.
-                    if plan.is_err() && radio_up && rf_ok {
-                        let rate = live.get().radio.bitrate;
-                        let _ = graph.observe_live_link(LiveContact {
-                            from: cfg.me,
-                            to: route_destination,
-                            bearer: RouteBearer::Radio,
-                            rate_bps: rate,
-                            capacity_bytes: (u64::from(rate) * 600 / 8).max(routed_len as u64),
-                            success_permyriad: Some(3_000),
-                            flags: 0,
-                            observed_at: now,
-                        });
-                        plan = plan_routes(&graph, &make_request(), policy);
-                    }
-                    if plan.is_err()
-                        && net
-                            .as_ref()
-                            .is_some_and(|network| network.is_connected(route_destination))
-                    {
-                        let _ = graph.observe_live_link(LiveContact {
-                            from: cfg.me,
-                            to: route_destination,
-                            bearer: RouteBearer::Internet,
-                            rate_bps: 10_000_000,
-                            capacity_bytes: 64 * 1024 * 1024,
-                            success_permyriad: Some(9_900),
-                            flags: FLAG_INTERNET,
-                            observed_at: now,
-                        });
-                        plan = plan_routes(&graph, &make_request(), policy);
-                    }
-                    let Ok(plan) = plan else { continue };
+                    // Plan with one draw from the beliefs: links little is
+                    // known about get tried in proportion to the chance that
+                    // they are the best.
+                    plans += 1;
+                    let mut draw = beliefs.thompson(rng.fork(plans), now);
+                    let Ok(plan) = plan_routes(&graph, &mut draw, &request, policy) else {
+                        continue;
+                    };
+                    let alternative = plan
+                        .alternatives
+                        .iter()
+                        .map(|route| route.success_probability)
+                        .fold(0.0_f64, f64::max);
                     for route in plan.active {
                         let Some(first) = route.hops.first() else {
                             continue;
@@ -1323,13 +1472,13 @@ pub(crate) async fn coordinator(
                         if first.depart > now {
                             continue;
                         }
-                        let (bearer, available) = match first.contact.bearer {
-                            RouteBearer::Radio => (Bearer::Radio, radio_up && rf_ok),
-                            RouteBearer::Internet => (
-                                Bearer::Internet,
-                                net.as_ref().is_some_and(|network| network.is_connected(first.contact.to)),
-                            ),
-                            RouteBearer::Modem => (Bearer::Modem, modem_up && rf_ok),
+                        let bearer = first.contact.bearer;
+                        let available = match bearer {
+                            Bearer::Radio => radio_up && rf_ok,
+                            Bearer::Internet => {
+                                net.as_ref().is_some_and(|network| network.is_connected(first.contact.to))
+                            }
+                            Bearer::Modem => modem_up && rf_ok,
                         };
                         if !available || in_flight.contains_key(&(r.id, first.contact.to)) {
                             continue;
@@ -1366,6 +1515,13 @@ pub(crate) async fn coordinator(
                             bearer.name(),
                             r.attempts + 1
                         ));
+                        // The route's chance beyond its first hop.
+                        let downstream = route
+                            .hops
+                            .iter()
+                            .skip(1)
+                            .map(|hop| f64::from(hop.probability_permillion) / 1_000_000.0)
+                            .product::<f64>();
                         in_flight.insert(
                             (r.id, peer),
                             InFlight {
@@ -1373,15 +1529,24 @@ pub(crate) async fn coordinator(
                                 peer,
                                 route,
                                 object_bytes: routed_len as u64,
+                                downstream,
+                                alternative,
+                                expires_at: bundle.expires_at(),
                             },
                         );
                         match bearer {
                             Bearer::Radio => {
                                 radio_ids.insert((hm_xfer::object_id(&wire_object), peer), r.id);
+                                let link = LinkKey {
+                                    from: cfg.me,
+                                    to: peer,
+                                    bearer: Bearer::Radio,
+                                };
                                 let _ = radio_cmd.send(RadioCmd::Send {
                                     object: wire_object,
                                     to: peer,
                                     precedence: r.precedence,
+                                    erasure: beliefs.erasure(link, now),
                                 });
                             }
                             Bearer::Internet => {
@@ -1429,12 +1594,10 @@ pub(crate) async fn coordinator(
                 st.radio = radio;
                 st.radio_via = radio_via.clone();
                 st.internet_peers = links;
-                st.estimates = chooser
-                    .peers()
-                    .into_iter()
-                    .flat_map(|p| {
-                        [Bearer::Radio, Bearer::Internet, Bearer::Modem].map(|b| (p, b.name(), chooser.estimate(p, b, now)))
-                    })
+                st.estimates = beliefs
+                    .links()
+                    .filter(|(key, _)| key.from == cfg.me)
+                    .map(|(key, _)| (key.to, key.bearer.name(), beliefs.link_success(*key, now, now)))
                     .collect();
             }
         }

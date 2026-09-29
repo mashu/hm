@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use hm_cli::config::RadioSettings;
 use hm_cli::driver::Link;
 use hm_cli::files::{KeyFile, Trust};
-use hm_cli::node::choose::Costs;
+use hm_cli::node::live::Costs;
 use hm_cli::node::live::Live;
 use hm_cli::node::{self, NodeConfig, RadioConfig, RadioLink};
 use hm_cli::sound_link::{AudioFactory, Csma, Framing, PttFactory, SoundLink};
@@ -190,7 +190,6 @@ fn start(ether: &Ether, key: &KeyFile, me: &str, peer: &KeyFile, db: &Tmp) -> no
             },
             custody_grace_secs: 6 * 3600,
             custody_suspect_secs: 24 * 3600,
-            evidence_half_life_secs: 3600,
             relay: Default::default(),
             beacon_secs: 0,
             peers: vec![],

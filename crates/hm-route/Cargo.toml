@@ -1,13 +1,15 @@
 [package]
 name = "hm-route"
-description = "Bayesian contact graph and capacity-aware delay-tolerant routing"
+description = "Contact plan and expected-utility delay-tolerant routing"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+hm-model = { path = "../hm-model" }
 hm-wire = { path = "../hm-wire" }
 
 [dev-dependencies]
+hm-core = { path = "../hm-core" }
 proptest.workspace = true

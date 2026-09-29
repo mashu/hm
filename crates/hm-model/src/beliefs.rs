@@ -120,9 +120,10 @@ impl Beliefs {
         self.refit_link_prior(key.bearer, at);
     }
 
-    /// Account for frames due over `key` every `interval` seconds (beacons)
-    /// that have not arrived by `now`, while the link was last open within
-    /// [`MISS_HORIZON`]. Returns how many were missed.
+    /// Account for beacons due over `key` that have not arrived by `now`,
+    /// while the link was last open within [`MISS_HORIZON`]: every
+    /// `interval` seconds until the link's own interval is learned. Returns
+    /// how many were missed.
     pub fn note_silence(&mut self, key: LinkKey, now: u64, interval: u64) -> usize {
         let Some(link) = self.links.get(&key) else {
             return 0;
@@ -148,11 +149,16 @@ impl Beliefs {
         self.refit_custodian_prior(at);
     }
 
+    /// The model of a link never observed: its bearer's population prior.
+    fn unseen(&self, bearer: Bearer, now: u64) -> LinkModel {
+        LinkModel::new(self.link_prior(bearer), now)
+    }
+
     /// Chance the link is open at `t`.
     pub fn p_open(&self, key: LinkKey, t: u64, now: u64) -> f64 {
         match self.links.get(&key) {
             Some(link) => link.p_open(t, now),
-            None => self.link_prior(key.bearer).p_open,
+            None => self.unseen(key.bearer, now).p_open(t, now),
         }
     }
 
@@ -161,7 +167,7 @@ impl Beliefs {
         let prior = self.link_prior(key.bearer);
         match self.links.get(&key) {
             Some(link) => link.success(prior, t, now),
-            None => prior.p_open * prior.handoff.mean,
+            None => self.unseen(key.bearer, now).success(prior, t, now),
         }
     }
 
@@ -486,7 +492,7 @@ pub struct Thompson<'a> {
     beliefs: &'a Beliefs,
     now: u64,
     rng: DetRng,
-    links: BTreeMap<LinkKey, Option<SampledLink>>,
+    links: BTreeMap<LinkKey, SampledLink>,
     accepts: BTreeMap<Callsign, f64>,
     delivers: BTreeMap<Callsign, f64>,
 }
@@ -496,20 +502,13 @@ impl Estimate for Thompson<'_> {
         let (beliefs, now) = (self.beliefs, self.now);
         let rng = &mut self.rng;
         let sampled = *self.links.entry(link).or_insert_with(|| {
-            beliefs
-                .links
-                .get(&link)
-                .map(|model| model.sample(beliefs.link_prior(link.bearer), rng, now))
-        });
-        let own = match sampled {
-            Some(s) => s.success(t),
-            None => {
-                let prior = beliefs.link_prior(link.bearer);
-                let open = prior.p_open;
-                open * prior.handoff.beta().sample(rng)
+            let prior = beliefs.link_prior(link.bearer);
+            match beliefs.links.get(&link) {
+                Some(model) => model.sample(prior, rng, now),
+                None => beliefs.unseen(link.bearer, now).sample(prior, rng, now),
             }
-        };
-        with_stated(own, beliefs.handoff_weight(link, now), stated)
+        });
+        with_stated(sampled.success(t), beliefs.handoff_weight(link, now), stated)
     }
 
     fn accepts(&mut self, station: Callsign, t: u64) -> f64 {
@@ -611,14 +610,16 @@ mod tests {
     fn silence_counts_against_a_link_until_the_horizon() {
         let mut beliefs = Beliefs::new();
         let k = key("M0AAA", "M0ME", Bearer::Radio);
-        beliefs.observe_link(k, 0, LinkObservation::Heard);
+        beliefs.observe_link(k, 0, LinkObservation::Beacon);
         let open_then = beliefs.p_open(k, 0, 0);
-        assert_eq!(beliefs.note_silence(k, 3_600, 600), 6);
+        assert_eq!(beliefs.note_silence(k, 3_600, 600), 5);
         assert!(beliefs.p_open(k, 3_600, 3_600) < open_then);
         assert_eq!(beliefs.note_silence(k, 3_600, 600), 0);
         let far = MISS_HORIZON + 10 * DAY;
         let missed = beliefs.note_silence(k, far, 3_600);
-        assert_eq!(missed as u64, (MISS_HORIZON - 3_600) / 3_600);
+        // Hourly misses from the last one counted to the horizon, the last
+        // half hour of it still in grace.
+        assert_eq!(missed as u64, (MISS_HORIZON - 3_600 - 1_800) / 3_600);
     }
 
     /// Thompson draws scatter around the posterior mean, and stay the same for

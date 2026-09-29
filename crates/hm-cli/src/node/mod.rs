@@ -19,7 +19,6 @@
 
 mod api;
 pub mod arq;
-pub mod choose;
 pub mod control;
 pub mod heard;
 pub mod live;

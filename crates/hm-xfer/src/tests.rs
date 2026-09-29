@@ -30,10 +30,23 @@ fn frames(out: &[Output<Event>]) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// What happened to transfers, without the loss observations reported along
+/// the way (see [`overs`]).
 fn events(out: &[Output<Event>]) -> Vec<Event> {
     out.iter()
         .filter_map(|o| match o {
+            Output::Event(Event::Over { .. }) => None,
             Output::Event(e) => Some(e.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The loss observations reported: (to, sent, got).
+fn overs(out: &[Output<Event>]) -> Vec<(Callsign, u32, u32)> {
+    out.iter()
+        .filter_map(|o| match o {
+            Output::Event(Event::Over { to, sent, got }) => Some((*to, *sent, *got)),
             _ => None,
         })
         .collect()
@@ -80,8 +93,10 @@ fn one_clean_over_delivers() {
         &mut out,
     );
     let burst = frames(&out);
-    // OFFER + K=5 symbols: at 2% assumed loss, 5 of 5 arrive with probability 0.904.
-    assert_eq!(burst.len(), 1 + 5);
+    // OFFER + K=5 symbols and one to spare: nothing is known of the link, so
+    // the radio population's loss (about 15 %) is expected, and one more frame
+    // costs less airtime than the turnaround it is likely to save.
+    assert_eq!(burst.len(), 1 + 6);
     let b_out = deliver(&mut b, Millis(20_000), &burst);
     assert_eq!(
         events(&b_out),
@@ -463,25 +478,27 @@ fn hostile_frames_never_panic() {
     }
 }
 
+/// Bursts come from the station's loss belief: a lossy link gets more
+/// frames than need, a clean one about as many as needed.
 #[test]
-fn burst_sizing_meets_the_target_and_no_more() {
-    assert_eq!(burst_size(1, 20, 16), 1);
-    assert_eq!(burst_size(5, 20, 16), 5);
-    assert_eq!(burst_size(9, 20, 16), 10); // 0.98^9 = 0.83 < 0.9
-    assert_eq!(burst_size(10, 0, 16), 10);
-    assert_eq!(burst_size(40, 100, 16), 16, "capped at max_burst");
-    for (need, loss) in [(1, 100), (5, 100), (12, 300), (3, 500)] {
-        let n = burst_size(need, loss, 255);
-        let q = 1.0 - loss as f64 / 1000.0;
-        assert!(prob_at_least(n, need, q) >= BURST_SUCCESS_TARGET, "{need} {loss}");
-        assert!(
-            prob_at_least(n - 1, need, q) < BURST_SUCCESS_TARGET || n == need,
-            "{need} {loss} not minimal"
+fn bursts_follow_the_loss_belief() {
+    let over = |loss: f64| {
+        let mut a = engine("SA0KAM");
+        let peer = call("SO5KM-1");
+        a.handle(
+            Millis(0),
+            Input::Command(Command::Belief {
+                peer,
+                erasure: Erasure::from_prior(Prior::new(loss, 200.0), 0.0),
+            }),
+            &mut Vec::new(),
         );
-    }
-    // Exact values: P[Bin(2, 0.5) >= 1] = 0.75, P[Bin(3, 0.9) >= 3] = 0.729.
-    assert!((prob_at_least(2, 1, 0.5) - 0.75).abs() < 1e-12);
-    assert!((prob_at_least(3, 3, 0.9) - 0.729).abs() < 1e-12);
+        // Five 200-byte symbols to go.
+        frames(&send(&mut a, Millis(0), "SO5KM-1", vec![3; 1000])).len() - 1
+    };
+    let (clean, lossy) = (over(0.01), over(0.3));
+    assert!((5..=6).contains(&clean), "{clean}");
+    assert!(lossy > clean + 1, "{lossy} vs {clean}");
 }
 
 /// Run A -> B through one clean over; returns B's final ACK frame and A.
@@ -1329,9 +1346,10 @@ fn a_missed_ack_shrinks_the_window_not_the_loss_estimate() {
     let first = frames(&send(&mut a, Millis(0), "SO5KM-1", vec![5; 4000]));
     assert_eq!(first.len(), 1 + 16, "OFFER and a full window of the 20 symbols");
     assert_eq!(a.window(peer), 16);
+    let before = a.loss_estimate(peer);
     // Nobody answers: time out, back off, probe.
     let (at, probe) = next_over(&mut a);
-    assert_eq!(a.loss_estimate(peer), 0, "silence is not loss");
+    assert_eq!(a.loss_estimate(peer), before, "silence is not loss");
     assert_eq!(a.window(peer), 8);
     assert_eq!(probe.len(), 1 + 2, "the probe is an OFFER and two symbols");
     // The answer asks for 18 more: one ACK, one more symbol per over.
@@ -1347,7 +1365,8 @@ fn a_missed_ack_shrinks_the_window_not_the_loss_estimate() {
     );
     assert_eq!(a.window(peer), 9);
     assert_eq!(frames(&out).len(), 9, "the next over fills the window");
-    assert_eq!(a.loss_estimate(peer), 0, "both probe symbols arrived");
+    assert_eq!(overs(&out), vec![(peer, 2, 2)], "both probe symbols arrived");
+    assert!(a.loss_estimate(peer) < before);
 }
 
 /// A link that holds our over back for a busy channel says when it finally

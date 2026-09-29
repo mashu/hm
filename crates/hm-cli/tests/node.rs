@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use hm_cli::config::{Config, RadioSettings, RelaySettings};
 use hm_cli::files::{KeyFile, Trust};
 use hm_cli::kiss_link::{KissTarget, TncParams};
-use hm_cli::node::choose::Costs;
+use hm_cli::node::live::Costs;
 use hm_cli::node::live::Live;
 use hm_cli::node::{self, NodeConfig, NodeHandle, RadioConfig, RadioLink};
 use hm_cli::station::LinkTiming;
@@ -170,7 +170,6 @@ fn start_routed(s: Setup, relay: RelaySettings, schedules: Vec<ScheduledContact>
             },
             custody_grace_secs: 6 * 3600,
             custody_suspect_secs: 24 * 3600,
-            evidence_half_life_secs: 3600,
             relay,
             beacon_secs: s.beacon_every.map_or(0, |d| d.as_secs()),
             peers,
@@ -813,8 +812,10 @@ fn a_radio_only_station_reaches_an_internet_station_through_a_gateway() {
     b.stop().unwrap();
 }
 
-/// Both stations have radio and internet. Mail goes by radio; when the band
-/// dies it moves to the internet by itself.
+/// Both stations have radio and internet, and hear each other's beacons.
+/// Mail goes by radio, which costs less; when the band dies, the failures and
+/// the silence teach the node that the radio link is closed, and mail moves
+/// to the internet by itself.
 #[test]
 fn radio_first_and_the_internet_when_radio_fails() {
     let tnc = fake_tnc(0);
@@ -832,7 +833,7 @@ fn radio_first_and_the_internet_when_radio_fails() {
         }),
         store: &a_db,
         retry: QUICK,
-        beacon_every: None,
+        beacon_every: Some(Duration::from_secs(2)),
         trust_file: None,
     });
     let b = start(Setup {
@@ -847,12 +848,22 @@ fn radio_first_and_the_internet_when_radio_fails() {
         }),
         store: &b_db,
         retry: QUICK,
-        beacon_every: None,
+        beacon_every: Some(Duration::from_secs(2)),
         trust_file: None,
     });
     wait_for(Duration::from_secs(20), "the internet link and the radio", || {
         let st = get(a.http_addr, "/api/status");
         (st["internet_peers"] == json!(["SO5KM"]) && st["radio"] == json!(true)).then_some(())
+    });
+    // Radio goes first once it is known to work: B's beacon says it hears A.
+    wait_for(Duration::from_secs(30), "B's beacon, hearing A", || {
+        let st = get(a.http_addr, "/api/status");
+        st["heard"].as_array().unwrap().iter().find_map(|h| {
+            let hears_a = h["hears"]
+                .as_array()
+                .is_some_and(|l| l.iter().any(|c| c == "SA0KAM"));
+            (h["station"] == "SO5KM-1" && hears_a).then_some(())
+        })
     });
 
     send(a.http_addr, json!({"to": "SO5KM-1", "text": "one"}));
@@ -1067,7 +1078,6 @@ fn trusted_stations_change_while_the_node_runs() {
             "custody_grace_secs": 3600,
             "custody_suspect_secs": 7200,
             "receipt_retry_attempts": 9,
-            "evidence_half_life_secs": 1800,
             "relay": { "enabled": true, "mailbox": true, "max_hops": 4 },
             "radio": { "max_rounds": 5 },
         })),
@@ -1084,7 +1094,6 @@ fn trusted_stations_change_while_the_node_runs() {
             now["live"]["custody_grace_secs"].as_u64(),
             now["live"]["custody_suspect_secs"].as_u64(),
             now["live"]["receipt_retry_attempts"].as_u64(),
-            now["live"]["evidence_half_life_secs"].as_u64(),
             now["live"]["relay"]["enabled"].as_bool(),
             now["live"]["relay"]["mailbox"].as_bool(),
             now["live"]["relay"]["max_hops"].as_u64(),
@@ -1096,7 +1105,6 @@ fn trusted_stations_change_while_the_node_runs() {
             Some(3600),
             Some(7200),
             Some(9),
-            Some(1800),
             Some(true),
             Some(true),
             Some(4),
@@ -1110,13 +1118,12 @@ fn trusted_stations_change_while_the_node_runs() {
             c.delivery.custody_grace_secs,
             c.delivery.custody_suspect_secs,
             c.delivery.receipt_retry_attempts,
-            c.delivery.evidence_half_life_secs,
             c.relay.enabled,
             c.relay.mailbox,
             c.relay.max_hops,
             c.radio.max_rounds,
         ),
-        (3600, 7200, 9, 1800, true, true, 4, 5)
+        (3600, 7200, 9, true, true, 4, 5)
     );
     assert_eq!(c.station.locator.as_deref(), Some("KO02md"));
     let (status, body) = http(

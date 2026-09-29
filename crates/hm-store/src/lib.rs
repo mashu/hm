@@ -15,7 +15,6 @@
 
 use std::path::Path;
 
-use hm_route::{Bearer, EdgeKey, Evidence};
 use hm_wire::{Callsign, ObjectId};
 use minicbor::{Decode, Encode};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -27,7 +26,12 @@ const BY_TIME: TableDefinition<(u8, u64, u64, [u8; 32]), ()> = TableDefinition::
 /// (255 - precedence, sequence, id): outbound messages not yet delivered or abandoned.
 const QUEUE: TableDefinition<(u8, u64, [u8; 32]), ()> = TableDefinition::new("queue");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
-const CONTACT_EVIDENCE: TableDefinition<[u8; 16], &[u8]> = TableDefinition::new("contact_evidence");
+/// The station's beliefs about links and custodians (`hm_model::Beliefs`
+/// records), opaque to the store.
+const BELIEFS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("beliefs");
+/// End-to-end deliveries of messages handed to a custodian, not yet taken by
+/// the node: message id -> custodian (6 bytes), handoff and receipt times.
+const CUSTODY_OUTCOMES: TableDefinition<[u8; 32], [u8; 22]> = TableDefinition::new("custody_outcomes");
 /// Per-peer outbound chat sequence (callsign bytes → last assigned seq).
 const PEER_SEQ: TableDefinition<[u8; 6], u64> = TableDefinition::new("peer_seq");
 /// A bulletin stored without its expiry (by older versions) is offered for
@@ -191,6 +195,19 @@ pub struct Record {
     /// Sender-assigned conversation sequence from the wire bundle (chat).
     #[n(24)]
     pub wire_seq: Option<u64>,
+    /// When `custody_by` took custody, Unix seconds.
+    #[n(25)]
+    pub custody_at: Option<u64>,
+}
+
+/// A message handed to `custodian` at `handed_at` was confirmed delivered end
+/// to end at `delivered_at`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CustodyOutcome {
+    pub id: ObjectId,
+    pub custodian: Callsign,
+    pub handed_at: u64,
+    pub delivered_at: u64,
 }
 
 impl Record {
@@ -373,88 +390,6 @@ fn decode(bytes: &[u8]) -> Result<Record> {
     minicbor::decode(bytes).map_err(|e| Error::Corrupt(e.to_string()))
 }
 
-fn evidence_key(key: EdgeKey) -> [u8; 16] {
-    let mut out = [0_u8; 16];
-    out[..6].copy_from_slice(&key.from.to_bytes());
-    out[6..12].copy_from_slice(&key.to.to_bytes());
-    out[12] = match key.bearer {
-        Bearer::Radio => 0,
-        Bearer::Internet => 1,
-        Bearer::Modem => 2,
-    };
-    out[13] = key.utc_hour.unwrap_or(u8::MAX);
-    out
-}
-
-fn decode_evidence_key(bytes: [u8; 16]) -> Result<EdgeKey> {
-    let from = Callsign::from_bytes(
-        bytes[..6]
-            .try_into()
-            .map_err(|_| Error::Corrupt("contact evidence key".into()))?,
-    )
-    .map_err(|error| Error::Corrupt(error.to_string()))?;
-    let to = Callsign::from_bytes(
-        bytes[6..12]
-            .try_into()
-            .map_err(|_| Error::Corrupt("contact evidence key".into()))?,
-    )
-    .map_err(|error| Error::Corrupt(error.to_string()))?;
-    let bearer = match bytes[12] {
-        0 => Bearer::Radio,
-        1 => Bearer::Internet,
-        2 => Bearer::Modem,
-        _ => return Err(Error::Corrupt("contact evidence bearer".into())),
-    };
-    let utc_hour = match bytes[13] {
-        u8::MAX => None,
-        hour @ 0..=23 => Some(hour),
-        _ => return Err(Error::Corrupt("contact evidence hour".into())),
-    };
-    Ok(EdgeKey {
-        from,
-        to,
-        bearer,
-        utc_hour,
-    })
-}
-
-fn evidence_value(evidence: Evidence) -> [u8; 24] {
-    let mut out = [0_u8; 24];
-    out[..8].copy_from_slice(&evidence.successes.to_be_bytes());
-    out[8..16].copy_from_slice(&evidence.failures.to_be_bytes());
-    out[16..].copy_from_slice(&evidence.at.to_be_bytes());
-    out
-}
-
-fn decode_evidence_value(bytes: &[u8]) -> Result<Evidence> {
-    if bytes.len() != 24 {
-        return Err(Error::Corrupt("contact evidence length".into()));
-    }
-    let successes = f64::from_be_bytes(
-        bytes[..8]
-            .try_into()
-            .map_err(|_| Error::Corrupt("contact evidence value".into()))?,
-    );
-    let failures = f64::from_be_bytes(
-        bytes[8..16]
-            .try_into()
-            .map_err(|_| Error::Corrupt("contact evidence value".into()))?,
-    );
-    let at = u64::from_be_bytes(
-        bytes[16..]
-            .try_into()
-            .map_err(|_| Error::Corrupt("contact evidence value".into()))?,
-    );
-    if !successes.is_finite() || !failures.is_finite() || successes < 0.0 || failures < 0.0 {
-        return Err(Error::Corrupt("invalid contact evidence".into()));
-    }
-    Ok(Evidence {
-        successes,
-        failures,
-        at,
-    })
-}
-
 impl Store {
     /// Builder shared by the node (writer) and CLI readers so they can share one file.
     fn builder() -> redb::Builder {
@@ -474,7 +409,8 @@ impl Store {
             tx.open_table(BY_TIME)?;
             tx.open_table(QUEUE)?;
             tx.open_table(META)?;
-            tx.open_table(CONTACT_EVIDENCE)?;
+            tx.open_table(BELIEFS)?;
+            tx.open_table(CUSTODY_OUTCOMES)?;
             tx.open_table(PEER_SEQ)?;
         }
         tx.commit()?;
@@ -539,6 +475,7 @@ impl Store {
             next_hops: None,
             shadow_until: None,
             wire_seq: None,
+            custody_at: None,
         }
     }
 
@@ -992,6 +929,7 @@ impl Store {
             r.state = State::InTransit;
             r.verified |= receipt_verified;
             r.custody_by = Some(next_hop);
+            r.custody_at = Some(now);
             r.next_hop = r.next_hops.as_ref().and_then(|hops| hops.first().copied());
             r.attempts += 1;
             let mut suspect_at = now.saturating_add(suspect_secs.max(1));
@@ -1125,21 +1063,64 @@ impl Store {
         destination: Callsign,
         now: u64,
     ) -> Result<bool> {
-        self.update(id, |r| {
+        let outcome = self.update(id, |r| {
             if r.direction != Direction::Out
                 || r.state == State::Cancelled
                 || r.final_destination() != destination
             {
-                return false;
+                return None;
             }
+            let handed = (r.state == State::InTransit)
+                .then_some(())
+                .and(r.custody_by.zip(r.custody_at));
             r.state = State::Delivered;
             r.verified = true;
             r.e2e_receipt = Some(receipt);
             r.next_attempt = now;
             r.note = None;
             r.shadow_until = None;
-            true
-        })
+            Some(handed)
+        })?;
+        let Some(handed) = outcome else {
+            return Ok(false);
+        };
+        if let Some((custodian, handed_at)) = handed {
+            let mut value = [0_u8; 22];
+            value[..6].copy_from_slice(&custodian.to_bytes());
+            value[6..14].copy_from_slice(&handed_at.to_be_bytes());
+            value[14..].copy_from_slice(&now.to_be_bytes());
+            let tx = self.write_tx()?;
+            tx.open_table(CUSTODY_OUTCOMES)?.insert(id.0, value)?;
+            tx.commit()?;
+        }
+        Ok(true)
+    }
+
+    /// End-to-end deliveries of messages that went through a custodian since
+    /// the last call, removed as they are returned.
+    pub fn take_custody_outcomes(&self) -> Result<Vec<CustodyOutcome>> {
+        let tx = self.write_tx()?;
+        let mut out = Vec::new();
+        {
+            let mut table = tx.open_table(CUSTODY_OUTCOMES)?;
+            for entry in table.iter()? {
+                let (id, value) = entry?;
+                let value = value.value();
+                let custodian = Callsign::from_bytes(value[..6].try_into().expect("6 bytes"))
+                    .map_err(|e| Error::Corrupt(e.to_string()))?;
+                out.push(CustodyOutcome {
+                    id: ObjectId(id.value()),
+                    custodian,
+                    handed_at: u64::from_be_bytes(value[6..14].try_into().expect("8 bytes")),
+                    delivered_at: u64::from_be_bytes(value[14..].try_into().expect("8 bytes")),
+                });
+            }
+            for outcome in &out {
+                table.remove(outcome.id.0)?;
+            }
+        }
+        tx.commit()?;
+        Ok(out)
     }
 
     /// A receipt signed by `destination` for relay holding `id` passed through
@@ -1403,43 +1384,38 @@ impl Store {
         Ok(found)
     }
 
-    pub fn save_contact_evidence(&self, key: EdgeKey, evidence: Evidence) -> Result<()> {
-        self.save_contact_evidence_batch(&[(key, evidence)])
-    }
-
-    /// Save several links' evidence in one transaction.
-    pub fn save_contact_evidence_batch(&self, entries: &[(EdgeKey, Evidence)]) -> Result<()> {
-        for (key, evidence) in entries {
-            if !evidence.successes.is_finite()
-                || !evidence.failures.is_finite()
-                || evidence.successes < 0.0
-                || evidence.failures < 0.0
-                || key.utc_hour.is_some_and(|hour| hour > 23)
-            {
-                return Err(Error::Corrupt("invalid contact evidence".into()));
-            }
+    /// Save belief records in one transaction: `(key, Some(value))` writes,
+    /// `(key, None)` deletes.
+    pub fn save_beliefs(&self, records: &[(Vec<u8>, Option<Vec<u8>>)]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
         }
         let tx = self.write_tx()?;
         {
-            let mut table = tx.open_table(CONTACT_EVIDENCE)?;
-            for (key, evidence) in entries {
-                table.insert(evidence_key(*key), evidence_value(*evidence).as_slice())?;
+            let mut table = tx.open_table(BELIEFS)?;
+            for (key, value) in records {
+                match value {
+                    Some(value) => {
+                        table.insert(key.as_slice(), value.as_slice())?;
+                    }
+                    None => {
+                        table.remove(key.as_slice())?;
+                    }
+                }
             }
         }
         tx.commit()?;
         Ok(())
     }
 
-    pub fn contact_evidence(&self) -> Result<Vec<(EdgeKey, Evidence)>> {
+    /// Every saved belief record.
+    pub fn beliefs(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let tx = self.read_tx()?;
-        let table = tx.open_table(CONTACT_EVIDENCE)?;
+        let table = tx.open_table(BELIEFS)?;
         let mut out = Vec::new();
         for entry in table.iter()? {
             let (key, value) = entry?;
-            out.push((
-                decode_evidence_key(key.value())?,
-                decode_evidence_value(value.value())?,
-            ));
+            out.push((key.value().to_vec(), value.value().to_vec()));
         }
         Ok(out)
     }

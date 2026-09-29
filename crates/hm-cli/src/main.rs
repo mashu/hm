@@ -224,9 +224,6 @@ struct NodeArgs {
     /// Retry budget for end-to-end receipts [delivery.receipt_retry_attempts].
     #[arg(long)]
     receipt_retry_attempts: Option<u32>,
-    /// Bearer evidence half-life for path choice, seconds [delivery.evidence_half_life_secs].
-    #[arg(long)]
-    evidence_half_life_secs: Option<u64>,
     /// Accept multi-hop relay custody [relay.enabled].
     #[arg(long)]
     relay: Option<bool>,
@@ -245,9 +242,6 @@ struct NodeArgs {
     /// Per-bundle radio airtime budget, seconds [relay.airtime_budget_secs].
     #[arg(long)]
     relay_airtime_budget_secs: Option<u64>,
-    /// Min probability gain before urgent dual-copy [relay.urgent_min_gain].
-    #[arg(long)]
-    relay_urgent_min_gain: Option<f64>,
     /// Fraction of radio airtime for control [relay.control_airtime_fraction].
     #[arg(long)]
     relay_control_airtime_fraction: Option<f64>,
@@ -397,12 +391,6 @@ impl NodeArgs {
             "delivery.receipt_retry_attempts",
             o,
         );
-        set(
-            &mut c.delivery.evidence_half_life_secs,
-            self.evidence_half_life_secs,
-            "delivery.evidence_half_life_secs",
-            o,
-        );
         set(&mut c.relay.enabled, self.relay, "relay.enabled", o);
         set(&mut c.relay.mailbox, self.mailbox, "relay.mailbox", o);
         set(
@@ -417,12 +405,6 @@ impl NodeArgs {
             &mut c.relay.airtime_budget_secs,
             self.relay_airtime_budget_secs,
             "relay.airtime_budget_secs",
-            o,
-        );
-        set(
-            &mut c.relay.urgent_min_gain,
-            self.relay_urgent_min_gain,
-            "relay.urgent_min_gain",
             o,
         );
         set(

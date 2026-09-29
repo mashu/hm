@@ -7,12 +7,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hm_core::{DetRng, Input, Machine, Millis, Output};
+use hm_model::{ChannelModel, Erasure};
 use hm_wire::{
     Callsign, Dest, FrameHeader, FrameType, ObjectId, FEATURE_MAILBOX, FEATURE_RELAY, FLAG_HOLDING,
     FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY,
 };
 use hm_xfer::beacon::{beacon_frame, read_beacon};
-use hm_xfer::{Command, Event, Failure, Receipt};
+use hm_xfer::{broadcast_peer, Command, Event, Failure, Receipt};
 
 use super::control::{
     beacon_interval_ms, control_share_permyriad, live_window_secs, ControlBudget, SyncQueue,
@@ -29,15 +30,20 @@ use crate::sound_link::SoundLink;
 use crate::station::{unix_now, Station};
 
 pub(crate) enum RadioCmd {
+    /// Transfer `object` to `to`, with overs sized from the station's belief
+    /// about frame loss on the link (`erasure`).
     Send {
         object: Vec<u8>,
         to: Callsign,
         precedence: u8,
+        erasure: Erasure,
     },
-    /// RF bulletin: `Dest::Broadcast`, no ACK wait.
+    /// RF bulletin: `Dest::Broadcast`, no ACK wait; `erasure`: the station's
+    /// belief about frame loss on its radio links in general.
     Broadcast {
         object: Vec<u8>,
         precedence: u8,
+        erasure: Erasure,
     },
     Accept {
         from: Callsign,
@@ -73,6 +79,12 @@ pub(crate) enum RadioEvt {
         to: Callsign,
         reason: Failure,
     },
+    /// An ACK from `to` said `got` of our last `sent` frames arrived.
+    Over {
+        to: Callsign,
+        sent: u32,
+        got: u32,
+    },
     Sync {
         from: Callsign,
         payload: Vec<u8>,
@@ -91,6 +103,8 @@ const FIRST_BEACON_MS: (u64, u64) = (5_000, 30_000);
 const HEARD_REPORT: Duration = Duration::from_secs(30);
 /// Stations heard within this long share the channel with us, at least.
 const SHARING_WINDOW_SECS: u64 = 3600;
+/// How often the stations heard are taken into the channel belief.
+const CHANNEL_LOOK_SECS: u64 = 60;
 const MAX_WAIT: Duration = Duration::from_millis(200);
 
 /// How a radio session ended.
@@ -257,8 +271,11 @@ pub(crate) fn radio_session(
     let mut sync_queue = SyncQueue::new(SYNC_QUEUE_FRAMES);
     let mut holding = false;
     // The stations sharing the channel (ourselves included) share its
-    // control and beacon budgets.
-    let mut sharing = 1usize;
+    // control and beacon budgets: how many, the channel belief says, from the
+    // stations heard lately.
+    let mut channel = ChannelModel::default();
+    let mut channel_seen = unix_now();
+    let mut sharing = channel.sharing(channel_seen);
     let mut beacon_interval_secs = beacon_secs;
     let _ = events.send(RadioEvt::BeaconInterval(beacon_interval_secs));
     loop {
@@ -302,7 +319,14 @@ pub(crate) fn radio_session(
             }
         }
         let window = live_window_secs(beacon_interval_secs).max(SHARING_WINDOW_SECS);
-        let now_sharing = heard.active(unix_now(), window) + 1;
+        let t = unix_now();
+        if t >= channel_seen + CHANNEL_LOOK_SECS {
+            let exposure = (t - channel_seen) as f64 / window as f64;
+            channel.observe_active(t, heard.active(t, window) as u32, exposure);
+            channel_seen = t;
+            x.set_listeners(channel.contenders(t).ceil() as u32);
+        }
+        let now_sharing = channel.sharing(t);
         if now_sharing != sharing {
             sharing = now_sharing;
             control_budget.set_permyriad(control_share_permyriad(control_permyriad, sharing));
@@ -349,20 +373,42 @@ pub(crate) fn radio_session(
                     object,
                     to,
                     precedence,
-                } => x.handle(
-                    now(),
-                    Input::Command(Command::Send {
-                        to,
-                        object,
-                        precedence,
-                    }),
-                    &mut out,
-                ),
-                RadioCmd::Broadcast { object, precedence } => x.handle(
-                    now(),
-                    Input::Command(Command::Broadcast { object, precedence }),
-                    &mut out,
-                ),
+                    erasure,
+                } => {
+                    x.handle(
+                        now(),
+                        Input::Command(Command::Belief { peer: to, erasure }),
+                        &mut out,
+                    );
+                    x.handle(
+                        now(),
+                        Input::Command(Command::Send {
+                            to,
+                            object,
+                            precedence,
+                        }),
+                        &mut out,
+                    )
+                }
+                RadioCmd::Broadcast {
+                    object,
+                    precedence,
+                    erasure,
+                } => {
+                    x.handle(
+                        now(),
+                        Input::Command(Command::Belief {
+                            peer: broadcast_peer(),
+                            erasure,
+                        }),
+                        &mut out,
+                    );
+                    x.handle(
+                        now(),
+                        Input::Command(Command::Broadcast { object, precedence }),
+                        &mut out,
+                    )
+                }
                 RadioCmd::Accept {
                     from,
                     xfer_id,
@@ -439,6 +485,9 @@ pub(crate) fn radio_session(
                         to,
                         reason,
                     });
+                }
+                Output::Event(Event::Over { to, sent, got }) => {
+                    let _ = events.send(RadioEvt::Over { to, sent, got });
                 }
             }
         }

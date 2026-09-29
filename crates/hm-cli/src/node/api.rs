@@ -888,7 +888,6 @@ struct RelayView {
     max_bytes: Option<u64>,
     max_hops: Option<u8>,
     airtime_budget_secs: Option<u64>,
-    urgent_min_gain: Option<f64>,
     control_airtime_fraction: Option<f64>,
 }
 
@@ -901,7 +900,6 @@ impl RelayView {
             max_bytes: Some(r.max_bytes),
             max_hops: Some(r.max_hops),
             airtime_budget_secs: Some(r.airtime_budget_secs),
-            urgent_min_gain: Some(r.urgent_min_gain),
             control_airtime_fraction: Some(r.control_airtime_fraction),
         }
     }
@@ -918,7 +916,6 @@ impl RelayView {
             max_bytes,
             max_hops,
             airtime_budget_secs,
-            urgent_min_gain,
             control_airtime_fraction
         );
         r
@@ -972,7 +969,6 @@ struct LiveView {
     custody_grace_secs: Option<u64>,
     custody_suspect_secs: Option<u64>,
     receipt_retry_attempts: Option<u32>,
-    evidence_half_life_secs: Option<u64>,
     relay: Option<RelayView>,
     peers: Option<Vec<PeerView>>,
     /// A grid locator; "" removes it.
@@ -1063,7 +1059,6 @@ fn settings_view(s: &AppState) -> SettingsView {
             custody_grace_secs: Some(l.custody_grace_secs),
             custody_suspect_secs: Some(l.custody_suspect_secs),
             receipt_retry_attempts: Some(l.receipt_retry.max_attempts),
-            evidence_half_life_secs: Some(l.evidence_half_life_secs),
             relay: Some(RelayView::of(&l.relay)),
             peers: Some(
                 l.peers
@@ -1130,8 +1125,7 @@ async fn change_settings(
         || req.retry_attempts.is_some()
         || req.custody_grace_secs.is_some()
         || req.custody_suspect_secs.is_some()
-        || req.receipt_retry_attempts.is_some()
-        || req.evidence_half_life_secs.is_some();
+        || req.receipt_retry_attempts.is_some();
     if has_live {
         s.live
             .change(Change {
@@ -1147,7 +1141,6 @@ async fn change_settings(
                 custody_grace_secs: req.custody_grace_secs,
                 custody_suspect_secs: req.custody_suspect_secs,
                 receipt_retry_attempts: req.receipt_retry_attempts,
-                evidence_half_life_secs: req.evidence_half_life_secs,
                 relay,
                 peers,
             })

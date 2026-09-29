@@ -8,24 +8,15 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use hm_route::{Bearer as RouteBearer, ScheduledContact};
+use hm_route::ScheduledContact;
 use hm_wire::{Callsign, ObjectId};
 
-use super::choose::Bearer;
 use super::live::{Live, Overrides};
 use crate::config::RadioSettings;
 use crate::files::KeyFile;
 use crate::kiss_link::{KissTarget, TncParams};
 use crate::sound_link::{AudioFactory, Csma, Framing, PttFactory};
 use crate::station::{unix_now, LinkTiming};
-
-pub(crate) fn route_bearer(bearer: Bearer) -> RouteBearer {
-    match bearer {
-        Bearer::Radio => RouteBearer::Radio,
-        Bearer::Internet => RouteBearer::Internet,
-        Bearer::Modem => RouteBearer::Modem,
-    }
-}
 
 /// How the node reaches its radio.
 pub enum RadioLink {

@@ -164,6 +164,67 @@ pub fn burst_size(need: u32, cap: u32, erasure: &Erasure, cost: OverCost) -> u32
     plan_overs(need, cap, erasure, cost).1.max(1)
 }
 
+/// Frames for a broadcast over to `listeners` stations that each need `need`
+/// symbols. Each listener's arrivals follow the Beta-binomial predictive,
+/// independently; after an over the listener worst off asks for its shortfall
+/// and a repair over for that many follows, sized the same way. With `J(r)`
+/// the expected airtime to finish when the worst listener lacks `r`, and `W`
+/// the worst shortfall after an over of `n`,
+///
+/// ```text
+/// P(W ≤ d) = P(X_n ≥ r − d)^listeners
+/// J(r) = min_n [ n·frame + turnaround + Σ_{1≤d≤r} P(W = d) · J(d) ]
+/// ```
+///
+/// where `d = r` (nobody got anything) leaves the same state, solved as a
+/// geometric wait. Every frame of a bigger over shrinks every listener's
+/// shortfall, which a broadcast sized for one listener would miss.
+pub fn broadcast_burst(need: u32, cap: u32, erasure: &Erasure, cost: OverCost, listeners: u32) -> u32 {
+    let cap = cap.max(1);
+    if need >= cap {
+        return cap;
+    }
+    let need = need.max(1) as usize;
+    let listeners = f64::from(listeners.max(1));
+    let arrivals: Vec<Vec<f64>> = (0..=cap).map(|n| erasure.arrivals(n)).collect();
+    // at_least[n][k] = P(X_n >= k).
+    let at_least: Vec<Vec<f64>> = arrivals
+        .iter()
+        .map(|p| {
+            let mut tail = alloc::vec![0.0; p.len() + 1];
+            for k in (0..p.len()).rev() {
+                tail[k] = tail[k + 1] + p[k];
+            }
+            tail
+        })
+        .collect();
+    let mut expected = alloc::vec![0.0_f64; need + 1];
+    let mut first = cap;
+    for r in 1..=need {
+        let mut best = (f64::INFINITY, cap);
+        for n in r as u32..=cap {
+            let tail = &at_least[n as usize];
+            // P(W <= d) for d = 0..=r.
+            let worst = |d: usize| libm::pow(tail[r - d].min(1.0), listeners);
+            let stay = worst(r) - worst(r - 1);
+            if stay >= 1.0 - 1.0e-12 {
+                continue;
+            }
+            let mut total = f64::from(n) * cost.frame_ms + cost.turnaround_ms;
+            for (d, cost_to_go) in expected.iter().enumerate().take(r).skip(1) {
+                total += (worst(d) - worst(d - 1)) * cost_to_go;
+            }
+            let total = total / (1.0 - stay);
+            if total < best.0 {
+                best = (total, n);
+            }
+        }
+        expected[r] = best.0;
+        first = best.1;
+    }
+    first
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +294,20 @@ mod tests {
         };
         assert_eq!(burst_size(40, 16, &e, cost), 16);
         assert_eq!(burst_size(0, 16, &e, cost), 1);
+    }
+
+    /// More listeners, more frames: every one of them must get enough.
+    #[test]
+    fn broadcasts_are_sized_for_all_their_listeners() {
+        let e = erasure(0.25, 1.0e6, 0.0);
+        let cost = OverCost {
+            frame_ms: 1_500.0,
+            turnaround_ms: 8_000.0,
+        };
+        let one = broadcast_burst(10, 32, &e, cost, 1);
+        let ten = broadcast_burst(10, 32, &e, cost, 10);
+        assert!(ten > one, "{ten} vs {one}");
+        assert!(e.p_at_least(ten, 10).powi(10) > 0.5);
     }
 
     #[test]

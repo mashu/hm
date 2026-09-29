@@ -16,7 +16,7 @@
 //!
 //! | observation         | open/closed            | erasure                | handoff              |
 //! |---------------------|------------------------|------------------------|----------------------|
-//! | `Heard`             | open                   | one frame arrived      |                      |
+//! | `Beacon`, `Heard`   | open                   | one frame arrived      |                      |
 //! | `Reported`          | open (hearsay)         |                        |                      |
 //! | `Missed`            | closed, or open & lost | lost if it was open    |                      |
 //! | `Up` / `Down`       | open / closed          |                        |                      |
@@ -115,6 +115,10 @@ impl LinkPrior {
 /// Something seen that bears on a link.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum LinkObservation {
+    /// One of the periodic frames sent over the link (a beacon) arrived: it
+    /// was open. The gaps between them teach how often they come, so that
+    /// one that does not come can be noticed ([`LinkModel::due_misses`]).
+    Beacon,
     /// A frame sent over the link arrived: it was open.
     Heard,
     /// Another station's signed report that it heard over this link.
@@ -214,14 +218,27 @@ pub struct LinkModel {
     /// Up to when frames due on the link have been accounted for.
     #[n(10)]
     expected_until: u64,
+    /// When the last beacon came, and about how often they come: the
+    /// shortest gap between two, let grow slowly so that a station that
+    /// beacons less often is followed.
+    #[n(11)]
+    last_beacon: Option<u64>,
+    #[n(12)]
+    beacon_gap: Option<f64>,
 }
+
+/// A beacon gap estimate grows by this share of itself with each beacon, so a
+/// peer that lengthens its interval is followed while jitter and misses (which
+/// only lengthen gaps) do not inflate it.
+const GAP_GROWTH: f64 = 0.05;
 
 impl LinkModel {
     pub fn new(prior: &LinkPrior, now: u64) -> LinkModel {
         LinkModel {
             availability: Diurnal::new(prior.p_open, prior.daily, now),
+            // Nothing seen yet: the state is the daily pattern, relaxed long ago.
             state: prior.p_open,
-            state_at: now,
+            state_at: 0,
             log_persistence: log(prior
                 .persistence_secs
                 .clamp(PERSISTENCE_RANGE.0, PERSISTENCE_RANGE.1)),
@@ -232,6 +249,8 @@ impl LinkModel {
             diurnal_at: None,
             observed_at: now,
             expected_until: now,
+            last_beacon: None,
+            beacon_gap: None,
         }
     }
 
@@ -243,6 +262,12 @@ impl LinkModel {
     /// Last time the link was seen open (a frame, a report, a session, an over).
     pub fn last_open(&self) -> Option<u64> {
         self.last_open
+    }
+
+    /// About how often the link's periodic frames (beacons) come, once two
+    /// have been seen.
+    pub fn beacon_interval(&self) -> Option<u64> {
+        self.beacon_gap.map(|g| libm::round(g) as u64)
     }
 
     /// Last time anything was observed on the link.
@@ -305,7 +330,8 @@ impl LinkModel {
         let handoff_mean = self.handoff(prior, now).mean();
         let detect = 1.0 - self.erasure(prior, now).mean();
         let likelihood = match observation {
-            LinkObservation::Heard
+            LinkObservation::Beacon
+            | LinkObservation::Heard
             | LinkObservation::Reported
             | LinkObservation::Up
             | LinkObservation::Over { .. }
@@ -321,6 +347,15 @@ impl LinkModel {
         self.availability.update(at, likelihood, weight);
         self.diurnal_at = Some(self.diurnal_at.map_or(at, |last| last.max(at)));
         match observation {
+            LinkObservation::Beacon => {
+                self.erasure.add(0.0, 1.0, at, ERASURE_HALF_LIFE);
+                if let Some(previous) = self.last_beacon.filter(|p| at > *p) {
+                    let gap = (at - previous) as f64;
+                    self.beacon_gap =
+                        Some(self.beacon_gap.map_or(gap, |g| (g * (1.0 + GAP_GROWTH)).min(gap)));
+                }
+                self.last_beacon = Some(self.last_beacon.map_or(at, |p| p.max(at)));
+            }
             LinkObservation::Heard => self.erasure.add(0.0, 1.0, at, ERASURE_HALF_LIFE),
             LinkObservation::Missed => self.erasure.add(open_after, 0.0, at, ERASURE_HALF_LIFE),
             LinkObservation::Over { sent, got } if sent > 0 => {
@@ -339,20 +374,23 @@ impl LinkModel {
             self.last_open = Some(self.last_open.map_or(at, |t| t.max(at)));
         }
         self.observed_at = now;
-        if matches!(observation, LinkObservation::Heard | LinkObservation::Missed) {
+        if matches!(observation, LinkObservation::Beacon | LinkObservation::Missed) {
             self.expected_until = self.expected_until.max(at);
         }
     }
 
-    /// Frames due over the link every `interval` seconds that have not been
-    /// accounted for by `now`: the times they were due. Heard frames and
-    /// earlier misses account for their time.
+    /// Beacons due over the link that have not come by `now`: the times they
+    /// were due, one interval apart from the last beacon or miss. The
+    /// interval is the link's own, once learned, else `interval`. A beacon
+    /// counts as missed only half an interval after it was due: beacons come
+    /// a little early or late.
     pub fn due_misses(&self, now: u64, interval: u64) -> impl Iterator<Item = u64> {
-        let interval = interval.max(1);
+        let interval = self.beacon_interval().unwrap_or(interval).max(1);
         let from = self.expected_until;
+        let by = now.saturating_sub(interval / 2);
         (1..)
             .map(move |k| from.saturating_add(k * interval))
-            .take_while(move |t| *t <= now)
+            .take_while(move |t| *t <= by)
     }
 
     /// Bayes' rule on the open/closed state for an observation at `at`, and
@@ -466,7 +504,7 @@ mod tests {
                 let t = day * DAY + step * 600;
                 let hour = (t % DAY) / HOUR;
                 let observation = if (12..18).contains(&hour) {
-                    LinkObservation::Heard
+                    LinkObservation::Beacon
                 } else {
                     LinkObservation::Missed
                 };
@@ -556,16 +594,36 @@ mod tests {
     }
 
     #[test]
-    fn misses_are_due_once_per_interval_after_the_last_frame() {
+    fn misses_are_due_once_per_interval_after_the_last_beacon() {
         let prior = radio();
         let mut link = LinkModel::new(&prior, 0);
-        link.observe(&prior, 100, LinkObservation::Heard);
-        let due: Vec<u64> = link.due_misses(700, 200).collect();
+        link.observe(&prior, 100, LinkObservation::Beacon);
+        let due: Vec<u64> = link.due_misses(800, 200).collect();
         assert_eq!(due, vec![300, 500, 700]);
         for t in due {
             link.observe(&prior, t, LinkObservation::Missed);
         }
-        assert_eq!(link.due_misses(800, 200).count(), 0);
+        assert_eq!(link.due_misses(850, 200).count(), 0);
+        // Other frames heard are no beacons: they neither teach the interval
+        // nor stand for a beacon that was due.
+        link.observe(&prior, 710, LinkObservation::Heard);
+        assert_eq!(link.due_misses(1_000, 200).collect::<Vec<_>>(), vec![900]);
+    }
+
+    /// A station that beacons every ten minutes, a little early or late, is
+    /// not missed by one that beacons every five.
+    #[test]
+    fn the_beacon_interval_is_the_peers_own() {
+        let prior = radio();
+        let mut link = LinkModel::new(&prior, 0);
+        for (n, jitter) in [0, 40, 0, 55, 10, 0, 30].into_iter().enumerate() {
+            link.observe(&prior, 600 * n as u64 + jitter, LinkObservation::Beacon);
+        }
+        let interval = link.beacon_interval().unwrap();
+        assert!((540..=640).contains(&interval), "{interval}");
+        // Just after a beacon was due, it is not yet missed.
+        assert_eq!(link.due_misses(3_600 + 650, 300).count(), 0);
+        assert_eq!(link.due_misses(3_600 + 1_300, 300).count(), 1);
     }
 
     #[test]
