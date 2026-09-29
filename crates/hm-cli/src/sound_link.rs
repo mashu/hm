@@ -27,7 +27,7 @@ use hm_core::DetRng;
 use hm_modem_afsk::{Demodulator, DemodulatorConfig, Modulator};
 use hm_rig::ptt::Ptt;
 use hm_rig::AudioPort;
-use hm_wire::{Callsign, Dest, FrameHeader, FEATURE_IL2P};
+use hm_wire::{Callsign, Dest, FrameHeader, FEATURE_COMPACT, FEATURE_IL2P};
 
 use crate::driver::Link;
 
@@ -100,6 +100,8 @@ pub struct SoundLink {
     framing: Framing,
     /// Stations that told us they decode IL2P.
     il2p_peers: BTreeSet<Callsign>,
+    /// Stations that told us they read compact frames.
+    compact_peers: BTreeSet<Callsign>,
     to_air: Option<Sender<Outgoing>>,
     from_air: Receiver<Vec<u8>>,
     /// Frames given to the modem thread so far, and what it has sent of them.
@@ -161,6 +163,7 @@ impl SoundLink {
             me,
             framing: csma.framing,
             il2p_peers: BTreeSet::new(),
+            compact_peers: BTreeSet::new(),
             to_air: Some(to_air),
             from_air,
             handed: 0,
@@ -195,15 +198,23 @@ impl Drop for SoundLink {
 
 impl Link for SoundLink {
     fn send(&mut self, frame: &[u8]) -> io::Result<()> {
-        let ui = ax25::wrap(self.me, frame)
+        let to = match FrameHeader::decode(frame) {
+            Ok((
+                FrameHeader {
+                    dst: Dest::Station(c),
+                    ..
+                },
+                _,
+            )) => Some(c),
+            _ => None,
+        };
+        let compact = to.is_some_and(|c| self.compact_peers.contains(&c));
+        let ui = ax25::wrap_frame(self.me, frame, compact)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:?}")))?;
         let il2p = match self.framing {
             Framing::Ax25 => false,
             Framing::Il2p => true,
-            Framing::Auto => match FrameHeader::decode(frame) {
-                Ok((h, _)) => matches!(h.dst, Dest::Station(c) if self.il2p_peers.contains(&c)),
-                Err(_) => false,
-            },
+            Framing::Auto => to.is_some_and(|c| self.il2p_peers.contains(&c)),
         };
         let tx = self.to_air.as_ref().expect("open until dropped");
         tx.send((ui, il2p)).map_err(|_| self.failed())?;
@@ -221,16 +232,21 @@ impl Link for SoundLink {
     }
 
     fn peer_features(&mut self, peer: Callsign, features: u32) {
-        if features & FEATURE_IL2P != 0 {
-            self.il2p_peers.insert(peer);
-        } else {
-            self.il2p_peers.remove(&peer);
+        for (feature, peers) in [
+            (FEATURE_IL2P, &mut self.il2p_peers),
+            (FEATURE_COMPACT, &mut self.compact_peers),
+        ] {
+            if features & feature != 0 {
+                peers.insert(peer);
+            } else {
+                peers.remove(&peer);
+            }
         }
     }
 
-    /// The modem decodes IL2P whatever it sends.
+    /// The modem decodes IL2P whatever it sends, and reads compact frames.
     fn features(&self) -> u32 {
-        FEATURE_IL2P
+        FEATURE_IL2P | FEATURE_COMPACT
     }
 
     fn recv_timeout(&mut self, wait: Duration) -> io::Result<Option<Vec<u8>>> {
@@ -272,8 +288,8 @@ fn run(
         port.capture(&mut audio, CAPTURE_WAIT)?;
         demod.process(&audio, &mut frames);
         for f in frames.drain(..) {
-            if let Some(hm) = ax25::unwrap(&f) {
-                if air_out.send(hm.to_vec()).is_err() {
+            if let Some(hm) = ax25::unwrap_frame(&f) {
+                if air_out.send(hm).is_err() {
                     return Ok(());
                 }
             }

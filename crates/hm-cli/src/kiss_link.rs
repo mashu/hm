@@ -11,6 +11,7 @@
 //! the link sends those as KISS parameters when it opens. Direwolf takes them
 //! from its own configuration, so on TCP they are left alone.
 
+use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +22,7 @@ use std::time::Duration;
 
 use hm_bearer::ax25;
 use hm_bearer::kiss::{self, Command};
-use hm_wire::Callsign;
+use hm_wire::{Callsign, Dest, FrameHeader, FEATURE_COMPACT};
 
 use crate::driver::Link;
 
@@ -122,6 +123,8 @@ pub struct KissLink {
     frames: Receiver<Vec<u8>>,
     me: Callsign,
     tnc_port: u8,
+    /// Stations that told us they read compact frames.
+    compact_peers: BTreeSet<Callsign>,
     stop: Arc<AtomicBool>,
     /// Unblocks the reader thread when the link is dropped.
     close: Option<Box<dyn FnOnce() + Send>>,
@@ -212,8 +215,8 @@ impl KissLink {
                 decoder.push(&buf[..n], &mut decoded);
                 for f in decoded.drain(..) {
                     if f.is_data() && f.port == tnc_port {
-                        if let Some(hm) = ax25::unwrap(&f.data) {
-                            if tx.send(hm.to_vec()).is_err() {
+                        if let Some(hm) = ax25::unwrap_frame(&f.data) {
+                            if tx.send(hm).is_err() {
                                 return;
                             }
                         }
@@ -226,6 +229,7 @@ impl KissLink {
             frames,
             me,
             tnc_port,
+            compact_peers: BTreeSet::new(),
             stop,
             close,
         })
@@ -257,10 +261,27 @@ impl Drop for KissLink {
 
 impl Link for KissLink {
     fn send(&mut self, frame: &[u8]) -> io::Result<()> {
-        let ui = ax25::wrap(self.me, frame)
+        let compact = matches!(
+            FrameHeader::decode(frame),
+            Ok((FrameHeader { dst: Dest::Station(c), .. }, _)) if self.compact_peers.contains(&c)
+        );
+        let ui = ax25::wrap_frame(self.me, frame, compact)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:?}")))?;
         self.writer.write_all(&kiss::data_frame(self.tnc_port, &ui))?;
         self.writer.flush()
+    }
+
+    fn peer_features(&mut self, peer: Callsign, features: u32) {
+        if features & FEATURE_COMPACT != 0 {
+            self.compact_peers.insert(peer);
+        } else {
+            self.compact_peers.remove(&peer);
+        }
+    }
+
+    /// Any TNC passes UI frames to any address, so compact frames too.
+    fn features(&self) -> u32 {
+        FEATURE_COMPACT
     }
 
     fn recv_timeout(&mut self, wait: Duration) -> io::Result<Option<Vec<u8>>> {
@@ -278,6 +299,67 @@ impl Link for KissLink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// What the link writes to the TNC.
+    #[derive(Clone, Default)]
+    struct Wire(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Wire {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn frames_go_compact_to_stations_that_read_it() {
+        let call = |s: &str| Callsign::parse(s).unwrap();
+        let wire = Wire::default();
+        let mut link = KissLink::start(
+            call("SA0KAM"),
+            0,
+            Box::new(wire.clone()),
+            io::empty(),
+            false,
+            None,
+        )
+        .unwrap();
+        let frame = |to: &str| {
+            FrameHeader {
+                ftype: hm_wire::FrameType::Data,
+                src: call("SA0KAM"),
+                dst: Dest::Station(call(to)),
+                session: 7,
+                index: 1,
+            }
+            .frame(b"symbol")
+            .unwrap()
+        };
+        let sent = |link: &mut KissLink, to: &str| {
+            wire.0.lock().unwrap().clear();
+            link.send(&frame(to)).unwrap();
+            let mut decoder = kiss::Decoder::new(MAX_KISS_FRAME);
+            let mut out = Vec::new();
+            decoder.push(&wire.0.lock().unwrap(), &mut out);
+            out.remove(0).data
+        };
+        assert_eq!(link.features() & FEATURE_COMPACT, FEATURE_COMPACT);
+        let whole = sent(&mut link, "SO5KM");
+        assert_eq!(ax25::parse_ui(&whole).unwrap().dest.call, ax25::HM_DEST);
+        link.peer_features(call("SO5KM"), FEATURE_COMPACT);
+        let compact = sent(&mut link, "SO5KM");
+        assert_eq!(&ax25::parse_ui(&compact).unwrap().dest.call, b"SO5KM ");
+        assert_eq!(whole.len() - compact.len(), 12);
+        assert_eq!(ax25::unwrap_frame(&compact), Some(frame("SO5KM")));
+        // Another station, which did not say it reads the compact form.
+        assert_eq!(sent(&mut link, "SP5AAA").len(), whole.len());
+        link.peer_features(call("SO5KM"), 0);
+        assert_eq!(sent(&mut link, "SO5KM").len(), whole.len());
+    }
 
     #[test]
     fn targets_parse() {

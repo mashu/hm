@@ -11,10 +11,25 @@
 //! The AX.25 source address is the legal station identification on this
 //! path, so callsigns AX.25 cannot express (more than 6 characters before the
 //! SSID, or a `/` suffix) cannot use a KISS TNC.
+//!
+//! **Compact form**, to a station that said it reads it (OPEN feature
+//! [`hm_wire::FEATURE_COMPACT`]): the UI frame goes to the destination
+//! station's own address, and the info field starts with a 6-byte compact
+//! header instead of the 18-byte one, whose two callsigns the AX.25 addresses
+//! already carry:
+//!
+//! ```text
+//! byte 0     version 1 (high nibble) | frame type (low nibble)
+//! bytes 1-2  session
+//! bytes 3-5  index
+//! ```
+//!
+//! The receiver rebuilds the full header from the AX.25 source and
+//! destination. Broadcast frames always go whole to `HMNET`.
 
 use alloc::vec::Vec;
 
-use hm_wire::{Callsign, CALLSIGN_MAX_LEN};
+use hm_wire::{Callsign, Dest, FrameHeader, CALLSIGN_MAX_LEN, HEADER_LEN};
 
 /// Destination address used by every hm frame on the KISS path.
 pub const HM_DEST: [u8; 6] = *b"HMNET ";
@@ -22,6 +37,10 @@ pub const CONTROL_UI: u8 = 0x03;
 pub const PID_NO_L3: u8 = 0xF0;
 /// Bytes the UI wrapper adds to each frame (two addresses, control, PID).
 pub const UI_OVERHEAD: usize = 16;
+/// Version nibble of a compact hm header (a full header's is 0).
+pub const COMPACT_VERSION: u8 = 1;
+/// A compact header: version and type, session, index.
+pub const COMPACT_HEADER_LEN: usize = 6;
 const MAX_DIGIPEATERS: usize = 8;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -56,6 +75,23 @@ impl Address {
         let mut call = [b' '; 6];
         call[..base.len()].copy_from_slice(base);
         Ok(Address { call, ssid })
+    }
+
+    /// The callsign this address spells (SSID 0 is the bare callsign).
+    pub fn to_callsign(&self) -> Option<Callsign> {
+        let len = self.call.iter().position(|&c| c == b' ').unwrap_or(6);
+        let base = core::str::from_utf8(&self.call[..len]).ok()?;
+        if self.ssid == 0 {
+            Callsign::parse(base).ok()
+        } else {
+            Callsign::parse(&alloc::format!("{base}-{}", self.ssid)).ok()
+        }
+    }
+
+    /// The address of `c`, if the address spells `c` again exactly.
+    fn exactly(c: Callsign) -> Option<Address> {
+        let address = Address::from_callsign(c).ok()?;
+        (address.to_callsign() == Some(c)).then_some(address)
     }
 
     fn encode(&self, command_bit: bool, last: bool, out: &mut Vec<u8>) {
@@ -118,6 +154,59 @@ pub fn wrap(src: Callsign, info: &[u8]) -> Result<Vec<u8>, Ax25Error> {
     out.push(PID_NO_L3);
     out.extend_from_slice(info);
     Ok(out)
+}
+
+/// Wrap an hm frame from `src` in a UI frame. With `compact`, a frame for
+/// one station goes to that station's own address with a compact header
+/// (see the module notes); otherwise, or when either callsign has no exact
+/// AX.25 form, it goes whole to `HMNET` as [`wrap`] sends it.
+pub fn wrap_frame(src: Callsign, frame: &[u8], compact: bool) -> Result<Vec<u8>, Ax25Error> {
+    if compact {
+        if let Ok((h, payload)) = FrameHeader::decode(frame) {
+            let addresses = match h.dst {
+                Dest::Station(to) if h.src == src => Address::exactly(to).zip(Address::exactly(src)),
+                _ => None,
+            };
+            if let Some((dest, from)) = addresses {
+                let mut out = Vec::with_capacity(UI_OVERHEAD + COMPACT_HEADER_LEN + payload.len());
+                dest.encode(true, false, &mut out);
+                from.encode(false, true, &mut out);
+                out.push(CONTROL_UI);
+                out.push(PID_NO_L3);
+                out.push((COMPACT_VERSION << 4) | (frame[0] & 0x0F));
+                out.extend_from_slice(&frame[13..HEADER_LEN]); // session and index
+                out.extend_from_slice(payload);
+                return Ok(out);
+            }
+        }
+    }
+    wrap(src, frame)
+}
+
+/// The hm frame inside a UI frame, whole: sent to `HMNET` with its full
+/// header, or to a station in the compact form, whose full header is rebuilt
+/// from the AX.25 addresses (so its source is always the AX.25 source).
+pub fn unwrap_frame(frame: &[u8]) -> Option<Vec<u8>> {
+    let ui = parse_ui(frame).ok()?;
+    if ui.pid != PID_NO_L3 {
+        return None;
+    }
+    let first = *ui.info.first()?;
+    if first >> 4 != COMPACT_VERSION {
+        return (ui.dest.call == HM_DEST).then(|| ui.info.to_vec());
+    }
+    if ui.info.len() < COMPACT_HEADER_LEN || ui.dest.call == HM_DEST {
+        return None;
+    }
+    let (src, dst) = (ui.src.to_callsign()?, ui.dest.to_callsign()?);
+    let mut out = Vec::with_capacity(HEADER_LEN + ui.info.len() - COMPACT_HEADER_LEN);
+    out.push(first & 0x0F);
+    out.extend_from_slice(&src.to_bytes());
+    out.extend_from_slice(&dst.to_bytes());
+    out.extend_from_slice(&ui.info[1..]);
+    // The frame type must be one the full header knows.
+    FrameHeader::decode(&out).ok()?;
+    Some(out)
 }
 
 /// A parsed UI frame.
@@ -246,10 +335,93 @@ mod tests {
         assert_eq!(parse_ui(&iframe), Err(Ax25Error::NotUi));
     }
 
+    fn hm(src: &str, dst: Dest, payload: &[u8]) -> Vec<u8> {
+        FrameHeader {
+            ftype: hm_wire::FrameType::Data,
+            src: call(src),
+            dst,
+            session: 0xBEEF,
+            index: 0x012345,
+        }
+        .frame(payload)
+        .unwrap()
+    }
+
+    #[test]
+    fn compact_frames_carry_the_callsigns_once() {
+        let full = hm("SA0KAM", Dest::Station(call("SO5KM-1")), b"symbol");
+        let compact = wrap_frame(call("SA0KAM"), &full, true).unwrap();
+        let whole = wrap(call("SA0KAM"), &full).unwrap();
+        assert_eq!(whole.len() - compact.len(), HEADER_LEN - COMPACT_HEADER_LEN);
+        let ui = parse_ui(&compact).unwrap();
+        assert_eq!(
+            ui.dest,
+            Address {
+                call: *b"SO5KM ",
+                ssid: 1
+            }
+        );
+        assert_eq!(
+            ui.info[..COMPACT_HEADER_LEN],
+            [0x10, 0xBE, 0xEF, 0x01, 0x23, 0x45]
+        );
+        assert_eq!(unwrap_frame(&compact), Some(full.clone()));
+        assert_eq!(
+            unwrap(&compact),
+            None,
+            "a station that reads only the full form ignores it"
+        );
+        assert_eq!(unwrap_frame(&whole), Some(full));
+    }
+
+    #[test]
+    fn what_cannot_be_compact_goes_whole() {
+        let me = call("SA0KAM");
+        for frame in [
+            hm("SA0KAM", Dest::Broadcast, b"to everyone"),
+            hm("SA0KAM", Dest::Station(call("DL1ABCDE")), b"no AX.25 form"),
+            hm(
+                "SA0KAM",
+                Dest::Station(call("SO5KM-0")),
+                b"-0 would come back without it",
+            ),
+            hm("SP5AAA", Dest::Station(call("SO5KM")), b"not from us"),
+            b"not an hm frame".to_vec(),
+        ] {
+            assert_eq!(wrap_frame(me, &frame, true).unwrap(), wrap(me, &frame).unwrap());
+        }
+    }
+
+    #[test]
+    fn a_compact_frame_is_from_its_ax25_source() {
+        let full = hm("SA0KAM", Dest::Station(call("SO5KM")), b"x");
+        let mut compact = wrap_frame(call("SA0KAM"), &full, true).unwrap();
+        let other: Vec<u8> = b"SP5AAA".iter().map(|c| c << 1).collect();
+        compact[7..13].copy_from_slice(&other);
+        let (h, _) = FrameHeader::decode(&unwrap_frame(&compact).unwrap()).unwrap();
+        assert_eq!(h.src, call("SP5AAA"));
+        let mut unknown_type = wrap_frame(call("SA0KAM"), &full, true).unwrap();
+        unknown_type[UI_OVERHEAD] = 0x1F;
+        assert_eq!(unwrap_frame(&unknown_type), None);
+        assert_eq!(unwrap_frame(&compact[..UI_OVERHEAD + 3]), None, "a cut header");
+    }
+
     proptest! {
         #[test]
         fn parse_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..120)) {
             let _ = parse_ui(&bytes);
+            let _ = unwrap_frame(&bytes);
+        }
+
+        #[test]
+        fn compact_roundtrip(
+            to in "[A-Z0-9]{1,6}",
+            ssid in 1u8..16,
+            payload in proptest::collection::vec(any::<u8>(), 0..300),
+        ) {
+            let full = hm("SA0KAM", Dest::Station(call(&alloc::format!("{to}-{ssid}"))), &payload);
+            let compact = wrap_frame(call("SA0KAM"), &full, true).unwrap();
+            prop_assert_eq!(unwrap_frame(&compact), Some(full));
         }
 
         #[test]

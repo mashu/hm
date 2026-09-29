@@ -276,6 +276,29 @@ nothing about who received it.
 - Keep a long-run airtime budget (duty cycle with a burst allowance), and never
   send an over larger than the allowance.
 
+**Broadcast transfers** (bulletins): OFFER and DATA go to the broadcast
+destination and listeners never send completion ACKs. Repair works like
+reliable multicast with request suppression, using the fountain code: any
+fresh symbol helps every listener that is short, whatever it missed.
+
+- A listener still short of symbols when an over ends asks the sender for more:
+  an ACK addressed to the sender, same session, `need` = K minus the symbols
+  held (1 if it holds K but lacks the OFFER). It asks at a random moment in
+  [guard, guard + 3 ACK airtimes] after the over.
+- A listener that hears two other listeners ask for at least as much before its
+  moment stays quiet (one alone may have been lost on its way to the sender). A
+  listener whose request brings no repair asks once more, one repair window later.
+- After its first over (or two) the sender listens for requests for one repair
+  window (guard + 3 ACK airtimes + one ACK airtime + guard). If any came, it
+  sends the OFFER again and fresh symbols for the largest `need`, sized for 30%
+  loss, then listens again. It finishes after two quiet windows in a row (two
+  requests sent at once collide unheard) or after 3 repair overs.
+- Simulated with 10 listeners each losing 25% of frames, a 2 kB bulletin
+  reached 72% of listeners with one publish and 99% with repair, for 37% more
+  airtime and about six requests in all (`cargo test -p hm-xfer --release --test sim bulletin_repair -- --nocapture`).
+
+Stations that do not implement repair ignore these ACKs, and publish once.
+
 **Receiver resources** (recommended): cap concurrent incoming transfers overall
 and per sender (8 and 2 by default). When full, evict the least valuable
 transfer: not finished before finished, no OFFER before OFFER seen, then fewest
@@ -294,7 +317,7 @@ OPEN (CTRL payload, 12 bytes):
 | --- | --- | --- |
 | 0 | 1 | 0x02 |
 | 1 | 1 | flags: 0x01 reply (answers the peer's OPEN); other bits 0 |
-| 2 | 4 | feature bits: 0x01 mailbox (holds mail for others), 0x02 relay (passes bundles on, Phase 2), 0x04 IL2P (decodes IL2P framing on this link); unknown bits are ignored |
+| 2 | 4 | feature bits: 0x01 mailbox (holds mail for others), 0x02 relay (passes bundles on, Phase 2), 0x04 IL2P (decodes IL2P framing on this link), 0x08 compact (reads compact frames on this link, section 9); unknown bits are ignored |
 | 6 | 3 | largest object accepted |
 | 9 | 2 | largest symbol size accepted (a multiple of 8) |
 | 11 | 1 | transfers accepted at once from this peer |
@@ -382,6 +405,28 @@ AX.25 cannot express cannot use a KISS TNC. Receivers accept frames with a
 digipeater path and with the poll bit set, and ignore frames with another
 destination or PID.
 
+**Compact form.** The full hm header repeats what the AX.25 addresses say.
+To a station whose OPEN carries the compact feature (0x08), a frame for that
+station alone may go in compact form instead: the AX.25 destination is that
+station's own address (SSID 0–15), and the information field starts with a
+6-byte header in place of the 18-byte one:
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 1 | version 1 (high nibble) and frame type (low nibble) |
+| 1 | 2 | session |
+| 3 | 3 | index |
+| 6 | … | the payload |
+
+The receiver rebuilds the full header: source from the AX.25 source,
+destination from the AX.25 destination. A frame's source is therefore always
+its AX.25 source. The compact form is used only when both callsigns come back
+exactly from their AX.25 addresses (so not for `-0` or longer callsigns).
+Broadcast frames always go whole to `HMNET`. A station that does not read the
+compact form ignores such frames (another destination). It saves 12 bytes a
+frame: about 11% of a DATA frame's airtime with 64-byte HF symbols, 5% with
+200-byte VHF symbols.
+
 KISS framing is standard: FEND 0xC0, FESC 0xDB, TFEND 0xDC, TFESC 0xDD. The type
 byte holds the TNC port in its high nibble and command 0 (data).
 
@@ -427,7 +472,13 @@ One bundle travels on one bidirectional stream:
 | Direction | Content |
 | --- | --- |
 | sender to receiver | `"HMD0"`, object length (u32, ≤ 1 MiB), object |
-| receiver to sender | `0x00` and a 64-byte receipt if the object is stored or already held; or `0x01`, reason length (u16), UTF-8 reason |
+| receiver to sender | `0x00` and a 64-byte receipt if the object is stored or already held; `0x01`, reason length (u16), UTF-8 reason if refused; or `0x02`, seconds to wait (u16), reason length (u16), reason if busy |
+
+A control message (SYNC between two linked stations) travels the same way as
+`"HMC0"`, length (u32, ≤ 4096), payload, and is answered with `0x00` alone or
+a refusal. Reasons are cut to 512 bytes. A reader checks the announced length
+against its limit before taking the body, and buffers the body only as it
+arrives (`hm_wire::stream`).
 
 The receipt is the transfer receipt of section 7 with base callsigns and
 session 0: the receiver's signature over
@@ -729,6 +780,7 @@ wire 82585ea90000014600004f8af6fb028282004600000207586b82036f71736c406578616d706
 ## AX.25 UI and KISS (the frame header vector above, from SA0KAM)
 ax25 909a9c8aa840e0a6826096829a6103f00000004f8af6fb001b97cbd86bbeef01234568656c6c6f
 kiss c000909a9c8aa840e0a6826096829a6103f00000004f8af6fb001b97cbd86bbeef01234568656c6c6fc0
+compact a69e6a969a40e2a6826096829a6103f010beef01234568656c6c6f
 
 ## Transfer of the chat bundle (SA0KAM -> SO5KM-1, symbols of up to 200 bytes: one of 120, first over, opening the session)
 object_id 26a90b587084a213a812a105b23553637c1afd5c125fc66381203f4583e09807

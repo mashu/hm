@@ -95,7 +95,20 @@ def check(text: str) -> None:
     assert ax == expect_ax, "ax25 wrapper"
     esc = ax.replace(b"\xdb", b"\xdb\xdd").replace(b"\xc0", b"\xdb\xdc")
     assert kiss == b"\xc0\x00" + esc + b"\xc0", "kiss framing"
-    print("ok  AX.25 UI wrapper and KISS framing")
+    # Compact form: to the destination's own address (SO5KM-1), with a
+    # 6-byte header (version 1 | type, session, index) instead of 18 bytes.
+    compact = bytes.fromhex(re.search(r"compact ([0-9a-f]+)", s_ax).group(1))
+    expect_compact = (
+        ax25_addr("SO5KM", 1, 1, 0)
+        + ax25_addr("SA0KAM", 0, 0, 1)
+        + b"\x03\xf0"
+        + bytes([0x10 | (frame[0] & 0x0F)])
+        + frame[13:18]
+        + frame[18:]
+    )
+    assert compact == expect_compact, "compact AX.25 form"
+    assert len(ax) - len(compact) == 12
+    print("ok  AX.25 UI wrapper, compact form and KISS framing")
 
     sender = nacl.signing.SigningKey(bytes([7] * 32)).verify_key
     for title in ["## Chat bundle", "## Mail bundle"]:

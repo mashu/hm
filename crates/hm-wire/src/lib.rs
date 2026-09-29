@@ -8,6 +8,7 @@
 //! - [`Beacon`]: signed presence and identification, broadcast.
 //! - [`Locator`]: Maidenhead grid locators, as beacons carry them.
 //! - [`ObjectId`]: 32-byte content hash naming bundles, records and attachments.
+//! - [`stream`]: messages on reliable byte streams (internet links, ARQ modems).
 //!
 //! Layouts are specified in `SPEC.md` at the repository root.
 
@@ -24,6 +25,7 @@ mod id;
 mod locator;
 mod route;
 mod session;
+pub mod stream;
 mod sync;
 
 pub use ack::{Ack, MAX_ACK_COMPLETED, NEED_OFFER, RECEIPT_LEN};
@@ -37,8 +39,8 @@ pub use id::ObjectId;
 pub use locator::Locator;
 pub use route::{unwrap_routed, wrap_routed, RoutedBundle, MAX_ROUTE_HOPS, ROUTE_MAGIC};
 pub use session::{
-    Close, CloseReason, Open, CLOSE_LEN, CTRL_CLOSE, CTRL_OPEN, FEATURE_IL2P, FEATURE_MAILBOX, FEATURE_RELAY,
-    OPEN_LEN, OPEN_REPLY,
+    Close, CloseReason, Open, CLOSE_LEN, CTRL_CLOSE, CTRL_OPEN, FEATURE_COMPACT, FEATURE_IL2P,
+    FEATURE_MAILBOX, FEATURE_RELAY, OPEN_LEN, OPEN_REPLY,
 };
 pub use sync::{
     ContactAdvert, ContactBearer, SyncFilter, SyncMessage, SyncOffer, SyncWant, CONTACT_LEN,
