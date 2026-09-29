@@ -29,23 +29,28 @@ use std::sync::Arc;
 use hm_core::DetRng;
 use hm_ident::{Identity, PublicKey};
 use hm_model::{Bearer, Beliefs};
-use hm_net::NetError;
 use hm_route::{ContactGraph, GraphConfig, ScheduledContact};
 use hm_store::Store;
 use hm_wire::{Callsign, ObjectId};
 
-use super::control::{live_window_secs, ControlPlane};
-use super::heard;
-use super::live::Live;
-use super::radio::{RadioCmd, RadioEvt};
-use super::sync::advertised_flags;
-use super::types::{log, Notify};
+use crate::adverts::advertised_flags;
+use crate::control::{live_window_secs, ControlPlane};
+use crate::{heard, log, Notify, RadioCmd, RadioEvt, Settings, Transfer};
 
-pub(crate) use handoff::InFlight;
+use handoff::InFlight;
 use links::LiveClaim;
 
+/// What an ARQ modem carries.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ModemSpec {
+    /// Its rate, in bits per second.
+    pub rate_bps: u32,
+    /// The largest object it takes, in bytes.
+    pub max_object: u64,
+}
+
 /// Who the node is and what it has, fixed for its run.
-pub(crate) struct NodeIdentity {
+pub struct NodeIdentity {
     pub me: Callsign,
     /// The callsign the node's key is bound to.
     pub key_call: Callsign,
@@ -53,8 +58,8 @@ pub(crate) struct NodeIdentity {
     pub schedules: Vec<ScheduledContact>,
     /// Whether the node has an internet endpoint (its adverts say so).
     pub has_internet: bool,
-    /// Rate of the ARQ modem, if the node has one.
-    pub modem_rate_bps: Option<u32>,
+    /// The ARQ modem, if the node has one.
+    pub modem: Option<ModemSpec>,
     /// How the radio is reached, if the node has one.
     pub radio_via: Option<String>,
     /// Seed of the node's random choices (route planning draws).
@@ -62,7 +67,7 @@ pub(crate) struct NodeIdentity {
 }
 
 /// What happened, for the node to act on.
-pub(crate) enum Input {
+pub enum Input {
     /// A second has passed. `links`: internet peers linked now; `modem`: the
     /// ARQ modem's state (up, connected peer), if the node has one.
     Tick {
@@ -74,13 +79,13 @@ pub(crate) enum Input {
     NetDone {
         id: ObjectId,
         peer: Callsign,
-        result: Result<(), NetError>,
+        result: Transfer,
     },
     /// A transfer through the ARQ modem ended.
     ModemDone {
         id: ObjectId,
         peer: Callsign,
-        result: Result<(), String>,
+        result: Transfer,
     },
     /// SYNC from an internet peer, with the key its link proved.
     NetSync {
@@ -88,13 +93,13 @@ pub(crate) enum Input {
         payload: Vec<u8>,
         peer_key: Option<PublicKey>,
     },
-    /// The live settings changed.
-    Settings(Box<Live>),
+    /// The settings changed.
+    Settings(Box<Settings>),
 }
 
 /// What the node wants done.
 #[derive(Debug)]
-pub(crate) enum Command {
+pub enum Command {
     Radio(RadioCmd),
     /// Transfer `object` to `peer` over the internet; the result comes back
     /// as [`Input::NetDone`].
@@ -119,7 +124,7 @@ pub(crate) enum Command {
 
 /// What the node shows of itself.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct NodeStatus {
+pub struct NodeStatus {
     pub radio: Option<bool>,
     pub radio_via: Option<String>,
     pub internet_peers: Vec<Callsign>,
@@ -130,9 +135,9 @@ pub(crate) struct NodeStatus {
     pub heard: Vec<heard::Station>,
 }
 
-pub(crate) struct Node {
+pub struct Node {
     id: NodeIdentity,
-    live: Live,
+    settings: Settings,
     store: Arc<Store>,
     notify: Notify,
     /// Each route plan draws from the beliefs once, from its own stream.
@@ -172,7 +177,8 @@ pub(crate) struct Node {
 }
 
 impl Node {
-    pub fn new(id: NodeIdentity, live: Live, store: Arc<Store>, notify: Notify, now: u64) -> Node {
+    /// A node starting at `now`, with what it learned before from `store`.
+    pub fn new(id: NodeIdentity, settings: Settings, store: Arc<Store>, notify: Notify, now: u64) -> Node {
         let mut graph = ContactGraph::new(GraphConfig::default()).expect("default contact graph");
         for schedule in &id.schedules {
             if let Err(error) = graph.add_schedule(*schedule) {
@@ -190,20 +196,20 @@ impl Node {
             }
             Err(error) => log(format!("could not restore beliefs: {error}")),
         }
-        let live_window = live_window_secs(live.beacon_secs);
+        let live_window = live_window_secs(settings.beacon_secs);
         graph.set_live_contact_secs(live_window);
         let mut node = Node {
             rng: DetRng::from_seed(id.seed),
             plans: 0,
             control: ControlPlane::for_station(id.me),
-            advertised: advertised_flags(id.has_internet, &live.relay),
+            advertised: advertised_flags(id.has_internet, &settings.relay),
             schedule_base: now as u32,
             radio_up: false,
             last_down: None,
             radio_via: id.radio_via.clone(),
-            beacon_interval: live.beacon_secs,
+            beacon_interval: settings.beacon_secs,
             id,
-            live,
+            settings,
             store,
             notify,
             graph,
@@ -238,7 +244,7 @@ impl Node {
                 payload,
                 peer_key,
             } => self.receive_sync(now, Bearer::Internet, from, &payload, peer_key, out),
-            Input::Settings(live) => self.settings(now, *live),
+            Input::Settings(settings) => self.apply_settings(now, *settings),
         }
     }
 
@@ -275,9 +281,9 @@ impl Node {
         self.modem.is_some_and(|(up, _)| up)
     }
 
-    fn settings(&mut self, now: u64, live: Live) {
-        self.live = live;
-        let flags = advertised_flags(self.id.has_internet, &self.live.relay);
+    fn apply_settings(&mut self, now: u64, settings: Settings) {
+        self.settings = settings;
+        let flags = advertised_flags(self.id.has_internet, &self.settings.relay);
         if flags != self.advertised {
             self.advertised = flags;
             // Above every sequence number used so far, even within one second.

@@ -15,12 +15,11 @@
 //! SA0KAM-2 can be two nodes. An entry with an SSID names exactly that station;
 //! one without covers all SSIDs of the callsign that have no entry of their own.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-use hm_ident::{Identity, PublicKey};
+use hm_ident::Identity;
 use hm_wire::Callsign;
 
 use crate::hex;
@@ -94,60 +93,7 @@ impl KeyFile {
     }
 }
 
-/// Public keys of stations whose messages we can verify.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Trust {
-    keys: BTreeMap<Callsign, PublicKey>,
-}
-
-impl Trust {
-    /// A station's key as one line, `CALL KEY`, the way `hm whoami` prints it:
-    /// `None` for a blank line or a comment.
-    pub fn parse_line(line: &str) -> Result<Option<(Callsign, PublicKey)>, String> {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            return Ok(None);
-        }
-        let (call, key) = line
-            .split_once(char::is_whitespace)
-            .ok_or("expected `CALL PUBLICKEY`")?;
-        let call = Callsign::parse(call).map_err(|e| e.to_string())?;
-        let key = hex::decode_32(key.trim())?;
-        Ok(Some((call, PublicKey(key))))
-    }
-
-    /// Stop trusting exactly `call`; true if it had an entry of its own.
-    pub fn remove(&mut self, call: Callsign) -> bool {
-        self.keys.remove(&call).is_some()
-    }
-
-    pub fn len(&self) -> usize {
-        self.keys.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
-    }
-
-    /// Trust `key` for `call`: that station only when `call` has an SSID,
-    /// every SSID without a line of its own when it has none.
-    pub fn insert(&mut self, call: Callsign, key: PublicKey) {
-        self.keys.insert(call, key);
-    }
-
-    /// Every trusted station and its key.
-    pub fn iter(&self) -> impl Iterator<Item = (Callsign, PublicKey)> + '_ {
-        self.keys.iter().map(|(c, k)| (*c, *k))
-    }
-
-    /// The key for a station: its own line, else the line for its base callsign.
-    pub fn key_for(&self, call: Callsign) -> Option<PublicKey> {
-        self.keys
-            .get(&call)
-            .or_else(|| self.keys.get(&call.base()))
-            .copied()
-    }
-}
+pub use hm_node::Trust;
 
 #[cfg(test)]
 mod tests {

@@ -8,12 +8,11 @@ use hm_model::{Bearer, LinkKey, LinkObservation};
 use hm_route::LiveContact;
 use hm_wire::{Callsign, Dest, FLAG_INTERNET};
 
-use super::super::control::{ControlAction, LIVE_ADVERT_REFRESH_SECS, LIVE_ADVERT_VALIDITY_SECS};
-use super::super::radio::RadioCmd;
-use super::super::sync::{live_advert, scheduled_advert};
-use super::super::types::{log, short};
 use super::custody::wake_for;
 use super::{Command, Node};
+use crate::adverts::{live_advert, scheduled_advert};
+use crate::control::{ControlAction, LIVE_ADVERT_REFRESH_SECS, LIVE_ADVERT_VALIDITY_SECS};
+use crate::{log, short, RadioCmd};
 
 /// Holdings are pulled from an internet peer at least this often.
 const INTERNET_PULL_SECS: u64 = 5 * 60;
@@ -52,7 +51,7 @@ impl Node {
                 self.id.me,
                 &self.id.identity,
                 self.id.has_internet,
-                &self.live.relay,
+                &self.settings.relay,
                 schedule,
                 sequence,
             ) {
@@ -97,7 +96,7 @@ impl Node {
             self.id.me,
             &self.id.identity,
             self.id.has_internet,
-            &self.live.relay,
+            &self.settings.relay,
             peer,
             bearer,
             success,
@@ -219,7 +218,7 @@ impl Node {
 
     /// Ask `peer` for what it holds for us (and for relaying, if we relay).
     pub(super) fn send_filters(&mut self, peer: Callsign, bearer: Bearer, now: u64, out: &mut Vec<Command>) {
-        let relaying = self.live.relay.enabled || self.live.relay.mailbox;
+        let relaying = self.settings.relay.enabled || self.settings.relay.mailbox;
         match self.control.filters(peer, &self.store, relaying, now) {
             Ok(filters) => {
                 for payload in filters {
@@ -253,11 +252,11 @@ impl Node {
         peer_key: Option<PublicKey>,
         out: &mut Vec<Command>,
     ) {
-        let relaying = self.live.relay.enabled || self.live.relay.mailbox;
+        let relaying = self.settings.relay.enabled || self.settings.relay.mailbox;
         let actions = match self.control.receive(
             from,
             payload,
-            &self.live.trust,
+            &self.settings.trust,
             peer_key,
             (self.id.me, self.id.identity.public()),
             &self.store,

@@ -6,14 +6,12 @@ use hm_route::BeaconObservation;
 use hm_wire::{Callsign, ObjectId};
 use hm_xfer::Receipt;
 
-use super::super::accept::{accept, Acceptance, AcceptanceGate};
-use super::super::control::{live_window_secs, radio_pull_due};
-use super::super::heard;
-use super::super::radio::{RadioCmd, RadioEvt};
-use super::super::types::log;
 use super::custody::wake_for;
 use super::handoff::Outcome;
 use super::{Command, Node};
+use crate::accept::{accept, Acceptance, AcceptanceGate};
+use crate::control::{live_window_secs, radio_pull_due};
+use crate::{heard, log, short, RadioCmd, RadioEvt};
 
 /// A busy node asks radio senders to come back after this many seconds.
 const BUSY_RETRY_SECS: u16 = 60;
@@ -54,11 +52,12 @@ impl Node {
                     AcceptanceGate {
                         store: &self.store,
                         notify: &self.notify,
-                        trust: &self.live.trust,
+                        trust: &self.settings.trust,
                         me: self.id.me,
                         key_call: self.id.key_call,
                         identity: &self.id.identity,
-                        relay: &self.live.relay,
+                        relay: &self.settings.relay,
+                        now,
                     },
                     from,
                     &object,
@@ -143,7 +142,7 @@ impl Node {
                 }
             }
             match self.store.delivered(id, false, "radio", now) {
-                Ok(()) => log(format!("published bulletin {}", super::super::types::short(&id))),
+                Ok(()) => log(format!("published bulletin {}", short(&id))),
                 Err(e) => log(format!("store: {e}")),
             }
             self.notify.send("message");
@@ -165,7 +164,7 @@ impl Node {
     /// beacon in once, as a contact and as news about links; count beacons
     /// due and not heard; pull holdings from stations that have some.
     fn heard(&mut self, now: u64, list: Vec<heard::Station>, out: &mut Vec<Command>) {
-        let rate = self.live.radio.bitrate;
+        let rate = self.settings.radio_bitrate;
         let capacity = (u64::from(rate) * 600 / 8).max(4_096);
         let me = self.id.me;
         let radio = |from, to| LinkKey {

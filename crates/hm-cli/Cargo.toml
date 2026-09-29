@@ -21,6 +21,7 @@ hm-store = { path = "../hm-store" }
 hm-route = { path = "../hm-route" }
 hm-model = { path = "../hm-model" }
 hm-net = { path = "../hm-net" }
+hm-node = { path = "../hm-node" }
 hm-rig = { path = "../hm-rig" }
 hm-modem-afsk = { path = "../hm-modem-afsk" }
 axum = "0.8"

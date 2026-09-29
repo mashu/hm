@@ -7,20 +7,16 @@ use hm_route::{plan_routes, ContactKey, LiveContact, Route, RouteRequest, Routin
 use hm_store::{Direction, Record};
 use hm_wire::{wrap_routed, Callsign, ObjectId, FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY};
 
-use super::super::radio::RadioCmd;
-use super::super::rf_policy;
-use super::super::types::{log, short};
 use super::custody::enqueue_custody_fail;
 use super::handoff::InFlight;
 use super::{Command, Node};
+use crate::{log, rf_policy, short, RadioCmd};
 
 /// What an internet link is taken to carry.
 const INTERNET_RATE_BPS: u32 = 10_000_000;
 const INTERNET_CAPACITY: u64 = 64 * 1024 * 1024;
 /// A radio contact is taken to last this long, for its capacity.
 const RADIO_CONTACT_SECS: u64 = 600;
-/// Rate assumed for an ARQ modem that does not say.
-const DEFAULT_MODEM_RATE_BPS: u32 = 1_200;
 
 impl Node {
     pub(super) fn deliver_due(&mut self, now: u64, out: &mut Vec<Command>) {
@@ -187,18 +183,17 @@ impl Node {
                 )
             });
         }
-        if self.modem_up() && rf_ok {
-            let rate = self.id.modem_rate_bps.unwrap_or(DEFAULT_MODEM_RATE_BPS);
+        if let Some(modem) = self.id.modem.filter(|_| self.modem_up() && rf_ok) {
             let _ = self.graph.add_potential(potential(
                 me,
                 destination,
                 Bearer::Modem,
-                rate,
-                super::super::arq::MAX_OBJECT as u64,
+                modem.rate_bps,
+                modem.max_object,
             ));
         }
         if self.radio_up && rf_ok {
-            let rate = self.live.radio.bitrate;
+            let rate = self.settings.radio_bitrate;
             let _ = self.graph.add_potential(potential(
                 me,
                 destination,
@@ -244,19 +239,19 @@ impl Node {
         let me = self.id.me;
         let destination = r.final_destination();
         let origin = bundle.from;
-        if r.direction == Direction::Relay && self.live.trust.key_for(origin).is_none() {
+        if r.direction == Direction::Relay && self.settings.trust.key_for(origin).is_none() {
             let reason = format!("relay origin {origin} is no longer trusted");
             self.give_up(r.id, &reason, now);
             log(format!("stopped relaying {}: {reason}", short(&r.id)));
             return;
         }
-        let rf_ok = rf_policy::may_transmit_rf(origin, me, self.id.key_call, &self.live.trust);
+        let rf_ok = rf_policy::may_transmit_rf(origin, me, self.id.key_call, &self.settings.trust);
         let requested_peer = self.control.target_for(r.id, now);
         let route_destination = requested_peer.unwrap_or(destination);
         let visited = r.visited.clone().unwrap_or_default();
         let mut max_hops = r.max_hops.unwrap_or_else(|| bundle.max_hops());
-        max_hops = max_hops.min(bundle.max_hops()).min(self.live.relay.max_hops);
-        if r.direction == Direction::Relay && !self.live.relay.enabled {
+        max_hops = max_hops.min(bundle.max_hops()).min(self.settings.relay.max_hops);
+        if r.direction == Direction::Relay && !self.settings.relay.enabled {
             max_hops = max_hops.min((visited.len() + 1) as u8);
         }
         let routed_len = (object.len()
@@ -281,13 +276,13 @@ impl Node {
             expires_at: bundle.expires_at(),
             object_bytes: routed_len,
             max_hops: if requested_peer.is_some() { 1 } else { max_hops },
-            airtime_budget_millis: self.live.relay.airtime_budget_secs.saturating_mul(1_000),
+            airtime_budget_millis: self.settings.relay.airtime_budget_secs.saturating_mul(1_000),
             visited: &visited,
             excluded_contacts: &excluded,
             urgent: r.precedence >= 2,
         };
         let policy = RoutingPolicy {
-            attempt_cost: self.live.costs.attempt_cost(),
+            attempt_cost: self.settings.costs.attempt_cost(),
             ..RoutingPolicy::default()
         };
         // Plan with one draw from the beliefs: links little is known about

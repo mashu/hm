@@ -15,37 +15,7 @@ use hm_wire::{Callsign, Locator};
 use crate::config::{self, Config, RadioSettings, RelaySettings};
 use crate::files::Trust;
 
-/// Cost of a delivery attempt on each bearer, in hundredths of a delivered
-/// message's value (`[delivery] *_cost`).
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub struct Costs {
-    pub radio: f64,
-    pub internet: f64,
-    pub modem: f64,
-}
-
-impl Default for Costs {
-    fn default() -> Self {
-        let delivery = crate::config::DeliverySettings::default();
-        Costs {
-            radio: delivery.radio_cost,
-            internet: delivery.internet_cost,
-            modem: delivery.modem_cost,
-        }
-    }
-}
-
-impl Costs {
-    /// The costs in a delivered message's value, by [`hm_model::Bearer::index`],
-    /// for route choice.
-    pub fn attempt_cost(&self) -> [f64; 3] {
-        [self.radio, self.internet, self.modem].map(|c| c / 100.0)
-    }
-
-    pub fn of(&self, bearer: hm_model::Bearer) -> f64 {
-        self.attempt_cost()[bearer.index()]
-    }
-}
+pub use hm_node::Costs;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Live {
@@ -68,6 +38,21 @@ pub struct Live {
 }
 
 impl Live {
+    /// What the node decides with.
+    pub fn node_settings(&self) -> hm_node::Settings {
+        hm_node::Settings {
+            trust: self.trust.clone(),
+            costs: self.costs,
+            retry: self.retry,
+            receipt_retry: self.receipt_retry,
+            custody_grace_secs: self.custody_grace_secs,
+            custody_suspect_secs: self.custody_suspect_secs,
+            relay: self.relay.clone(),
+            beacon_secs: self.beacon_secs,
+            radio_bitrate: self.radio.bitrate,
+        }
+    }
+
     pub fn from_config(c: &Config) -> Result<Live, String> {
         let notes = c
             .trust

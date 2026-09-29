@@ -6,8 +6,9 @@
 //! authenticate the end-to-end origin before accepting custody, and this gate
 //! re-checks before every RF or ARQ-modem transmission.
 
-use crate::files::Trust;
 use hm_wire::Callsign;
+
+use crate::Trust;
 
 /// Whether a bundle whose end-to-end origin is `origin` may leave this station
 /// over RF (packet radio or an ARQ modem).
@@ -25,7 +26,7 @@ pub fn may_transmit_rf(origin: Callsign, me: Callsign, key_call: Callsign, trust
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::files::KeyFile;
+    use hm_ident::Identity;
 
     fn call(s: &str) -> Callsign {
         Callsign::parse(s).unwrap()
@@ -44,9 +45,9 @@ mod tests {
     #[test]
     fn trusted_origin_may_use_rf() {
         let me = call("SM0R1");
-        let peer = KeyFile::generate(call("SA0KAM")).unwrap();
+        let peer = call("SA0KAM");
         let mut trust = Trust::default();
-        trust.insert(peer.call, peer.identity.public());
-        assert!(may_transmit_rf(peer.call, me, me, &trust));
+        trust.insert(peer, Identity::from_secret([7; 32]).public());
+        assert!(may_transmit_rf(peer, me, me, &trust));
     }
 }

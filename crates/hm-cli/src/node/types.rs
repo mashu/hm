@@ -8,15 +8,17 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use hm_net::Verdict;
+use hm_node::Acceptance;
 use hm_route::ScheduledContact;
-use hm_wire::{Callsign, ObjectId};
+use hm_wire::Callsign;
 
 use super::live::{Live, Overrides};
 use crate::config::RadioSettings;
 use crate::files::KeyFile;
 use crate::kiss_link::{KissTarget, TncParams};
 use crate::sound_link::{AudioFactory, Csma, Framing, PttFactory};
-use crate::station::{unix_now, LinkTiming};
+use crate::station::LinkTiming;
 
 /// How the node reaches its radio.
 pub enum RadioLink {
@@ -178,12 +180,19 @@ impl NodeHandle {
     }
 }
 
-pub fn log(msg: impl AsRef<str>) {
-    eprintln!("{} {}", crate::station::utc_clock(unix_now()), msg.as_ref());
-}
+pub use hm_node::{addressed_to_us, log};
 
-pub(crate) fn short(id: &ObjectId) -> String {
-    id.to_string()[..12].to_string()
+/// What an internet or modem peer is told about an object it sent.
+pub(crate) fn verdict(acceptance: Acceptance) -> Verdict {
+    match acceptance {
+        Acceptance::Stored => Verdict::Stored,
+        Acceptance::Duplicate => Verdict::Duplicate,
+        Acceptance::Busy(reason) => Verdict::Busy {
+            retry_after: 60,
+            reason,
+        },
+        Acceptance::Rejected(reason) => Verdict::Rejected(reason),
+    }
 }
 
 /// Tells open web pages what changed, so they fetch it again at once:
@@ -205,18 +214,18 @@ impl Notify {
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<&'static str> {
         self.0.subscribe()
     }
+
+    /// The same notifications, for [`hm_node`], which knows no channels.
+    pub fn observer(&self) -> hm_node::Notify {
+        let sender = self.0.clone();
+        hm_node::Notify::new(move |what| {
+            let _ = sender.send(what);
+        })
+    }
 }
 
 impl Default for Notify {
     fn default() -> Notify {
         Notify::new()
     }
-}
-
-/// Whether mail to station `to` is ours. Every SSID is a station of its own,
-/// so SA0KAM-1 does not take mail for SA0KAM-2. A node whose key file names
-/// the bare callsign (and picked its SSID with `--ssid`) also takes mail for
-/// the bare callsign.
-pub fn addressed_to_us(to: Callsign, me: Callsign, key_call: Callsign) -> bool {
-    to == me || (to == key_call && key_call == key_call.base())
 }

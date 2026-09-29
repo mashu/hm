@@ -13,19 +13,17 @@ use std::time::Duration;
 
 use hm_ident::Identity;
 use hm_net::{Net, NetError};
+use hm_node::{Command, Input, ModemSpec, Node, NodeIdentity, NodeStatus, RadioCmd, RadioEvt, Transfer};
 use hm_store::Store;
 use hm_wire::{Callsign, ObjectId};
 
 use super::arq;
 use super::internet::ensure_internet;
 use super::live::LiveConfig;
-use super::machine::{Command, Input, Node, NodeIdentity, NodeStatus};
-use super::radio::{RadioCmd, RadioEvt};
 use super::types::{log, NodeConfig, Notify, Status};
 use crate::station::unix_now;
 
-pub(crate) type NetResult = (ObjectId, Callsign, Result<(), NetError>);
-type ModemResult = (ObjectId, Callsign, Result<(), String>);
+type Done = (ObjectId, Callsign, Transfer);
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn coordinator(
@@ -51,14 +49,23 @@ pub(crate) async fn coordinator(
         identity: Identity::from_secret(cfg.key.identity.secret()),
         schedules: cfg.schedules.clone(),
         has_internet: cfg.internet.is_some(),
-        modem_rate_bps: cfg.modem.as_ref().map(arq::ArqConfig::estimated_rate_bps),
+        modem: cfg.modem.as_ref().map(|m| ModemSpec {
+            rate_bps: m.estimated_rate_bps(),
+            max_object: arq::MAX_OBJECT as u64,
+        }),
         radio_via: cfg.radio.as_ref().map(|r| r.describe()),
         seed,
     };
-    let mut node = Node::new(identity, live.get(), store.clone(), notify.clone(), unix_now());
+    let mut node = Node::new(
+        identity,
+        live.get().node_settings(),
+        store.clone(),
+        notify.observer(),
+        unix_now(),
+    );
     let mut live_version = live.version();
-    let (net_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<NetResult>();
-    let (modem_tx, mut modem_rx) = tokio::sync::mpsc::unbounded_channel::<ModemResult>();
+    let (net_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<Done>();
+    let (modem_tx, mut modem_rx) = tokio::sync::mpsc::unbounded_channel::<Done>();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut out = Vec::new();
     let mut shown = NodeStatus::default();
@@ -92,7 +99,7 @@ pub(crate) async fn coordinator(
                         n.set_trust(&snapshot.trust.iter().collect::<Vec<_>>());
                         n.set_dial(snapshot.peers.clone());
                     }
-                    node.handle(now, Input::Settings(Box::new(snapshot)), &mut out);
+                    node.handle(now, Input::Settings(Box::new(snapshot.node_settings())), &mut out);
                 }
                 let links = net.as_ref().map(|n| n.connected()).unwrap_or_default();
                 let modem_state = modem.as_ref().map(|m| {
@@ -124,8 +131,8 @@ fn execute(
     radio: &mpsc::Sender<RadioCmd>,
     net: Option<&Arc<Net>>,
     modem: Option<&Arc<arq::Arq>>,
-    net_done: &tokio::sync::mpsc::UnboundedSender<NetResult>,
-    modem_done: &tokio::sync::mpsc::UnboundedSender<ModemResult>,
+    net_done: &tokio::sync::mpsc::UnboundedSender<Done>,
+    modem_done: &tokio::sync::mpsc::UnboundedSender<Done>,
 ) {
     match command {
         Command::Radio(cmd) => {
@@ -136,11 +143,11 @@ fn execute(
                 let done = net_done.clone();
                 tokio::spawn(async move {
                     let result = network.deliver(peer, &object).await;
-                    let _ = done.send((id, peer, result));
+                    let _ = done.send((id, peer, net_transfer(result)));
                 });
             }
             None => {
-                let _ = net_done.send((id, peer, Err(NetError::NotConnected)));
+                let _ = net_done.send((id, peer, net_transfer(Err(NetError::NotConnected))));
             }
         },
         Command::ModemDeliver { id, peer, object } => match modem.cloned() {
@@ -152,7 +159,7 @@ fn execute(
                 });
             }
             None => {
-                let _ = modem_done.send((id, peer, Err("no modem".into())));
+                let _ = modem_done.send((id, peer, Transfer::Failed("no modem".into())));
             }
         },
         Command::NetSync { peer, payload } => {
@@ -162,6 +169,24 @@ fn execute(
                 });
             }
         }
+    }
+}
+
+/// How an internet transfer ended, as the node sees it. A peer's refusal
+/// may not hold for the next try (its limits, its trust list), so it is not
+/// taken as permanent.
+fn net_transfer(result: Result<(), NetError>) -> Transfer {
+    match result {
+        Ok(()) => Transfer::Delivered,
+        Err(NetError::Busy { retry_after, reason }) => Transfer::Busy {
+            retry_after: u64::from(retry_after),
+            reason,
+        },
+        Err(NetError::Rejected(reason)) => Transfer::Refused {
+            reason,
+            permanent: false,
+        },
+        Err(error) => Transfer::Failed(error.to_string()),
     }
 }
 

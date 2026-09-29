@@ -721,6 +721,7 @@ dependencies = [
  "hm-model",
  "hm-modem-afsk",
  "hm-net",
+ "hm-node",
  "hm-rig",
  "hm-route",
  "hm-sim",
@@ -780,6 +781,23 @@ dependencies = [
  "rcgen",
  "rustls",
  "tokio",
+]
+
+[[package]]
+name = "hm-node"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "hm-bundle",
+ "hm-core",
+ "hm-ident",
+ "hm-model",
+ "hm-route",
+ "hm-sim",
+ "hm-store",
+ "hm-wire",
+ "hm-xfer",
+ "serde",
 ]
 
 [[package]]

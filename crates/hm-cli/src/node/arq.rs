@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use hm_ident::Identity;
 use hm_net::{Accept, Verdict};
+use hm_node::Transfer;
 use hm_rig::ptt::Ptt;
 use hm_wire::stream::{next_message, StreamLimits, StreamMessage, OBJECT_MAGIC};
 use hm_wire::Callsign;
@@ -120,7 +121,7 @@ pub struct ArqStatus {
 struct Request {
     to: Callsign,
     object: Vec<u8>,
-    reply: oneshot::Sender<Result<(), String>>,
+    reply: oneshot::Sender<Transfer>,
 }
 
 /// Handle to the modem task.
@@ -165,14 +166,14 @@ impl Arq {
     }
 
     /// Send `object` to `to` and wait for its verified receipt.
-    pub async fn deliver(&self, to: Callsign, object: Vec<u8>) -> Result<(), String> {
+    pub async fn deliver(&self, to: Callsign, object: Vec<u8>) -> Transfer {
         let (reply, answer) = oneshot::channel();
-        self.tx
-            .send(Request { to, object, reply })
-            .map_err(|_| "the modem task has stopped".to_string())?;
+        if self.tx.send(Request { to, object, reply }).is_err() {
+            return Transfer::Failed("the modem task has stopped".into());
+        }
         answer
             .await
-            .unwrap_or_else(|_| Err("the modem task has stopped".into()))
+            .unwrap_or_else(|_| Transfer::Failed("the modem task has stopped".into()))
     }
 }
 
@@ -205,6 +206,7 @@ enum Message {
     Bundle(Vec<u8>),
     Receipt([u8; 64]),
     Rejected(String),
+    Busy { retry_after: u64, reason: String },
     Bad(String),
 }
 
@@ -219,13 +221,11 @@ impl Inbox {
                 let msg = match message {
                     StreamMessage::Object(object) => Message::Bundle(object.to_vec()),
                     StreamMessage::Stored(receipt) => Message::Receipt(receipt),
-                    StreamMessage::Rejected(reason) => {
-                        Message::Rejected(String::from_utf8_lossy(reason).into_owned())
-                    }
-                    StreamMessage::Busy { retry_after, reason } => Message::Rejected(format!(
-                        "busy for {retry_after} s: {}",
-                        String::from_utf8_lossy(reason)
-                    )),
+                    StreamMessage::Rejected(reason) => refusal(String::from_utf8_lossy(reason).into_owned()),
+                    StreamMessage::Busy { retry_after, reason } => Message::Busy {
+                        retry_after: u64::from(retry_after),
+                        reason: String::from_utf8_lossy(reason).into_owned(),
+                    },
                     StreamMessage::Control(_) => {
                         Message::Bad("no control messages on a modem connection".into())
                     }
@@ -260,6 +260,19 @@ fn bundle_message(object: &[u8]) -> Vec<u8> {
 /// versions know no busy answer.
 fn rejection(reason: &str) -> Vec<u8> {
     StreamMessage::Rejected(reason.as_bytes()).encode()
+}
+
+/// A refusal received: busy, when it says so the way [`rejection`] does.
+fn refusal(reason: String) -> Message {
+    let busy = reason.strip_prefix("busy for ").and_then(|rest| {
+        let (secs, rest) = rest.split_once(" s")?;
+        let retry_after = secs.parse().ok()?;
+        Some((retry_after, rest.trim_start_matches(':').trim_start().to_string()))
+    });
+    match busy {
+        Some((retry_after, reason)) => Message::Busy { retry_after, reason },
+        None => Message::Rejected(reason),
+    }
 }
 
 /// The modem program's two ports.
@@ -324,14 +337,18 @@ impl Task {
             loop {
                 match tokio::time::timeout_at(deadline, self.requests.recv()).await {
                     Ok(Some(r)) => {
-                        let _ = r.reply.send(Err("the modem is not reachable".into()));
+                        let _ = r
+                            .reply
+                            .send(Transfer::Failed("the modem is not reachable".into()));
                     }
                     Ok(None) => return,
                     Err(_) => break,
                 }
             }
             for r in self.waiting.drain(..) {
-                let _ = r.reply.send(Err("the modem is not reachable".into()));
+                let _ = r
+                    .reply
+                    .send(Transfer::Failed("the modem is not reachable".into()));
             }
         }
     }
@@ -603,12 +620,14 @@ impl Task {
                 self.set_status(true, None);
                 match state {
                     State::Calling { req, .. } => {
-                        let _ = req.reply.send(Err(format!("no connection: {text}")));
+                        let _ = req.reply.send(Transfer::Failed(format!("no connection: {text}")));
                     }
                     State::Connected {
                         sent: Some((req, _)), ..
                     } => {
-                        let _ = req.reply.send(Err("disconnected before the receipt came".into()));
+                        let _ = req
+                            .reply
+                            .send(Transfer::Failed("disconnected before the receipt came".into()));
                     }
                     _ => {}
                 }
@@ -654,26 +673,33 @@ impl Task {
                     };
                     self.send_data(p, &reply).await?;
                 }
-                Message::Receipt(_) | Message::Rejected(_) if sent.is_none() => {} // not ours
+                Message::Receipt(_) | Message::Rejected(_) | Message::Busy { .. } if sent.is_none() => {} // not ours
                 Message::Receipt(sig) => {
                     let (req, _) = sent.take().expect("checked above");
                     let key = self.live.get().trust.key_for(req.to);
                     let statement =
                         receipt_statement(req.to.base(), self.me.base(), 0, &object_id(&req.object));
                     let result = match key {
-                        Some(k) if k.verify(&statement, &sig).is_ok() => Ok(()),
-                        Some(_) => Err("the receipt does not verify".into()),
-                        None => Err(format!("no key for {} to check its receipt", req.to)),
+                        Some(k) if k.verify(&statement, &sig).is_ok() => Transfer::Delivered,
+                        Some(_) => Transfer::Failed("the receipt does not verify".into()),
+                        None => Transfer::Failed(format!("no key for {} to check its receipt", req.to)),
                     };
                     let _ = req.reply.send(result);
                 }
                 Message::Rejected(reason) => {
                     let (req, _) = sent.take().expect("checked above");
-                    let _ = req.reply.send(Err(format!("refused: {reason}")));
+                    let _ = req.reply.send(Transfer::Refused {
+                        reason,
+                        permanent: true,
+                    });
+                }
+                Message::Busy { retry_after, reason } => {
+                    let (req, _) = sent.take().expect("checked above");
+                    let _ = req.reply.send(Transfer::Busy { retry_after, reason });
                 }
                 Message::Bad(why) => {
                     if let Some((req, _)) = sent.take() {
-                        let _ = req.reply.send(Err(why.clone()));
+                        let _ = req.reply.send(Transfer::Failed(why.clone()));
                     } else {
                         self.send_data(p, &rejection(&why)).await?;
                     }
@@ -738,7 +764,7 @@ impl Task {
         };
         match state {
             State::Calling { req, since } if now - since > CALL_TIMEOUT => {
-                let _ = req.reply.send(Err("no answer to the call".into()));
+                let _ = req.reply.send(Transfer::Failed("no answer to the call".into()));
                 self.hang_up(p).await?;
                 Ok(State::Idle)
             }
@@ -746,7 +772,7 @@ impl Task {
                 sent: Some((req, at)),
                 ..
             } if now - at > RECEIPT_TIMEOUT => {
-                let _ = req.reply.send(Err("no receipt in time".into()));
+                let _ = req.reply.send(Transfer::Failed("no receipt in time".into()));
                 self.hang_up(p).await?;
                 Ok(State::Idle)
             }
@@ -801,6 +827,13 @@ mod tests {
         assert!(matches!(inbox.next(), Some(Message::Bundle(b)) if b == b"one"));
         assert!(matches!(inbox.next(), Some(Message::Receipt(r)) if r == [7; 64]));
         assert!(matches!(inbox.next(), Some(Message::Rejected(r)) if r == "busy"));
+        inbox
+            .buf
+            .extend_from_slice(&rejection("busy for 90 s: holdings full"));
+        assert!(matches!(
+            inbox.next(),
+            Some(Message::Busy { retry_after: 90, reason }) if reason == "holdings full"
+        ));
         assert!(inbox.next().is_none());
     }
 }

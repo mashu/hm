@@ -6,12 +6,13 @@ use std::sync::{Arc, Mutex, Weak};
 
 use hm_ident::Identity;
 use hm_net::{Net, NetConfig};
+use hm_node::{accept, AcceptanceGate};
 use hm_store::Store;
 use hm_wire::Callsign;
 
-use super::accept::{accept, AcceptanceGate};
 use super::live::LiveConfig;
-use super::types::{log, NodeConfig, Notify, Status};
+use super::types::{log, verdict, NodeConfig, Notify, Status};
+use crate::station::unix_now;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_net(
@@ -28,7 +29,7 @@ pub(crate) fn start_net(
         cfg.me,
         cfg.key.call,
         Identity::from_secret(cfg.key.identity.secret()),
-        notify.clone(),
+        notify.observer(),
     );
     // Weak so the accept gate does not keep Net (and the store) alive after stop.
     let net_slot: Arc<Mutex<Weak<Net>>> = Arc::new(Mutex::new(Weak::new()));
@@ -40,7 +41,7 @@ pub(crate) fn start_net(
             .expect("lock")
             .upgrade()
             .and_then(|n| n.public_key_of(via));
-        accept(
+        verdict(accept(
             AcceptanceGate {
                 store: &store,
                 notify: &gate_notify,
@@ -49,12 +50,12 @@ pub(crate) fn start_net(
                 key_call,
                 identity: &gate_identity,
                 relay: &current.relay,
+                now: unix_now(),
             },
             via,
             &obj,
             peer_key.as_ref(),
-        )
-        .verdict()
+        ))
     });
     let control: hm_net::Control = Arc::new(move |from, payload| {
         let _ = net_control_tx.send((from, payload));

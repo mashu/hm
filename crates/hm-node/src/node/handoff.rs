@@ -1,15 +1,14 @@
 //! Transfers under way, how they end, and what each ending teaches.
 
 use hm_model::{Bearer, Beliefs, CustodianObservation, LinkKey, LinkObservation};
-use hm_net::NetError;
 use hm_route::Route;
 use hm_store::Retry;
 use hm_wire::{Callsign, ObjectId};
 use hm_xfer::Failure;
 
-use super::super::types::{log, short};
 use super::custody::{enqueue_custody_fail, holds_until_expiry, on_gave_up_receipt, retry_policy_for};
 use super::Node;
+use crate::{log, short, Transfer};
 
 /// A transfer under way to `peer` over `bearer`.
 pub(crate) struct InFlight {
@@ -67,40 +66,19 @@ pub(crate) enum Outcome {
 }
 
 impl Outcome {
-    pub fn from_net(result: Result<(), NetError>) -> Outcome {
+    /// How an internet or modem transfer ended.
+    pub fn from_transfer(result: Transfer) -> Outcome {
         match result {
-            Ok(()) => Outcome::Delivered,
-            Err(NetError::Busy { retry_after, reason }) => Outcome::Busy {
+            Transfer::Delivered => Outcome::Delivered,
+            Transfer::Busy { retry_after, reason } => Outcome::Busy {
                 reason: format!("busy for {retry_after} s: {reason}"),
-                retry_after: u64::from(retry_after),
+                retry_after,
             },
-            Err(NetError::Rejected(r)) => Outcome::Refused {
-                reason: format!("rejected: {r}"),
-                permanent: false,
+            Transfer::Refused { reason, permanent } => Outcome::Refused {
+                reason: format!("refused: {reason}"),
+                permanent,
             },
-            Err(e) => Outcome::LinkFailed(e.to_string()),
-        }
-    }
-
-    pub fn from_modem(result: Result<(), String>) -> Outcome {
-        match result {
-            Ok(()) => Outcome::Delivered,
-            Err(e) if e.starts_with("refused: busy for ") => {
-                let retry_after = e["refused: busy for ".len()..]
-                    .split(' ')
-                    .next()
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(60);
-                Outcome::Busy {
-                    reason: e,
-                    retry_after,
-                }
-            }
-            Err(e) if e.starts_with("refused: ") => Outcome::Refused {
-                reason: e,
-                permanent: true,
-            },
-            Err(e) => Outcome::LinkFailed(e),
+            Transfer::Failed(reason) => Outcome::LinkFailed(reason),
         }
     }
 
@@ -193,11 +171,11 @@ impl Node {
         if let Err(error) = store.clear_next_hop(id, peer) {
             log(format!("store: {error}"));
         }
-        let policy = retry_policy_for(store, id, &self.live);
+        let policy = retry_policy_for(store, id, &self.settings);
         let r = if permanent {
             store.abandon(id, &reason).map(|notify| (Retry::GaveUp, notify))
         } else {
-            let hold = holds_until_expiry(store, id, &self.live);
+            let hold = holds_until_expiry(store, id, &self.settings);
             store.attempt_failed_or_hold(id, &format!("{reason} ({})", bearer.name()), policy, now, hold)
         };
         match r {
@@ -220,7 +198,7 @@ impl Node {
         self.notify.send("message");
     }
 
-    pub(super) fn net_done(&mut self, now: u64, id: ObjectId, peer: Callsign, result: Result<(), NetError>) {
+    pub(super) fn net_done(&mut self, now: u64, id: ObjectId, peer: Callsign, result: Transfer) {
         let bulletin = self
             .store
             .record(id)
@@ -230,7 +208,7 @@ impl Node {
         let Some(flight) = self.in_flight.remove(&(id, peer)) else {
             return;
         };
-        let outcome = Outcome::from_net(result);
+        let outcome = Outcome::from_transfer(result);
         if bulletin || matches!(outcome, Outcome::Delivered) {
             self.control.clear_request(id, peer);
         }
@@ -241,8 +219,8 @@ impl Node {
         }
     }
 
-    pub(super) fn modem_done(&mut self, now: u64, id: ObjectId, peer: Callsign, result: Result<(), String>) {
-        let outcome = Outcome::from_modem(result);
+    pub(super) fn modem_done(&mut self, now: u64, id: ObjectId, peer: Callsign, result: Transfer) {
+        let outcome = Outcome::from_transfer(result);
         if let Some(flight) = self.in_flight.remove(&(id, peer)) {
             if matches!(outcome, Outcome::Delivered) {
                 self.control.clear_request(id, peer);
@@ -270,10 +248,12 @@ impl Node {
                 log(format!("bulletin {} to {peer} failed: {reason}", short(&id)));
                 // Retry only when nothing else is still carrying this id.
                 if !self.in_flight.keys().any(|(flight_id, _)| *flight_id == id) {
-                    match self
-                        .store
-                        .attempt_failed(id, &format!("{reason} (internet)"), self.live.retry, now)
-                    {
+                    match self.store.attempt_failed(
+                        id,
+                        &format!("{reason} (internet)"),
+                        self.settings.retry,
+                        now,
+                    ) {
                         Ok((Retry::At(t), _)) => log(format!(
                             "bulletin {}; next try in {} s",
                             short(&id),

@@ -7,13 +7,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hm_core::{DetRng, Input, Machine, Millis, Output};
-use hm_model::{ChannelModel, Erasure};
+use hm_model::ChannelModel;
 use hm_wire::{
-    Callsign, Dest, FrameHeader, FrameType, ObjectId, FEATURE_MAILBOX, FEATURE_RELAY, FLAG_HOLDING,
-    FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY,
+    Callsign, Dest, FrameHeader, FrameType, FEATURE_MAILBOX, FEATURE_RELAY, FLAG_HOLDING, FLAG_INTERNET,
+    FLAG_MAILBOX, FLAG_RELAY,
 };
 use hm_xfer::beacon::{beacon_frame, read_beacon};
-use hm_xfer::{broadcast_peer, Command, Event, Failure, Receipt};
+use hm_xfer::{broadcast_peer, Command, Event};
 
 use super::control::{
     beacon_interval_ms, control_share_permyriad, live_window_secs, ControlBudget, SyncQueue,
@@ -28,73 +28,7 @@ use crate::files::Trust;
 use crate::kiss_link::KissLink;
 use crate::sound_link::SoundLink;
 use crate::station::{unix_now, Station};
-
-#[derive(Debug)]
-pub(crate) enum RadioCmd {
-    /// Transfer `object` to `to`, with overs sized from the station's belief
-    /// about frame loss on the link (`erasure`).
-    Send {
-        object: Vec<u8>,
-        to: Callsign,
-        precedence: u8,
-        erasure: Erasure,
-    },
-    /// RF bulletin: `Dest::Broadcast`, no ACK wait; `erasure`: the station's
-    /// belief about frame loss on its radio links in general.
-    Broadcast {
-        object: Vec<u8>,
-        precedence: u8,
-        erasure: Erasure,
-    },
-    Accept {
-        from: Callsign,
-        xfer_id: ObjectId,
-        accepted: bool,
-        retry_after: u16,
-    },
-    Sync {
-        to: Dest,
-        payload: Vec<u8>,
-    },
-    /// Whether we hold bundles others may pull: our beacons say so.
-    Holding(bool),
-}
-
-#[derive(Debug)]
-pub(crate) enum RadioEvt {
-    /// The radio link now in use (`None`: the radio is off).
-    Using(Option<String>),
-    Up,
-    Down(String),
-    Received {
-        from: Callsign,
-        xfer_id: ObjectId,
-        object: Vec<u8>,
-    },
-    Delivered {
-        xfer_id: ObjectId,
-        to: Callsign,
-        receipt: Receipt,
-    },
-    Failed {
-        xfer_id: ObjectId,
-        to: Callsign,
-        reason: Failure,
-    },
-    /// An ACK from `to` said `got` of our last `sent` frames arrived.
-    Over {
-        to: Callsign,
-        sent: u32,
-        got: u32,
-    },
-    Sync {
-        from: Callsign,
-        payload: Vec<u8>,
-    },
-    Heard(Vec<heard::Station>),
-    /// We now beacon every this many seconds (more stations, longer).
-    BeaconInterval(u64),
-}
+use hm_node::{RadioCmd, RadioEvt};
 
 const RECONNECT: Duration = Duration::from_secs(5);
 /// The first beacon goes out at a random moment in this window after the radio

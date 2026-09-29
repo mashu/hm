@@ -5,8 +5,8 @@ use hm_model::Bearer;
 use hm_route::ScheduledContact;
 use hm_wire::{Callsign, ContactAdvert, ContactBearer, FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY};
 
-use super::control::{sign_contact, LIVE_ADVERT_VALIDITY_SECS};
-use crate::config::RelaySettings;
+use crate::control::{sign_contact, LIVE_ADVERT_VALIDITY_SECS};
+use crate::RelaySettings;
 
 /// The flags our beacons and adverts carry: internet, relay, mailbox.
 pub(crate) fn advertised_flags(has_internet: bool, relay: &RelaySettings) -> u8 {

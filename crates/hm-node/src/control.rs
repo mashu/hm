@@ -32,7 +32,7 @@ use hm_wire::{
     FLAG_HOLDING, MAX_FILTER_BYTES, MAX_OFFER,
 };
 
-use crate::files::Trust;
+use crate::Trust;
 
 pub const TRICKLE_MIN_MS: u64 = 5_000;
 pub const TRICKLE_MAX_MS: u64 = 60 * 60 * 1_000;
@@ -864,10 +864,11 @@ mod tests {
 
     impl TempDb {
         fn new(name: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
                 "hm-control-{name}-{}-{}.db",
                 std::process::id(),
-                getrandom::u64().unwrap()
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             Self(path)
         }

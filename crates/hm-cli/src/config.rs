@@ -384,60 +384,7 @@ impl DeliverySettings {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RelaySettings {
-    /// Accept custody for traffic whose final recipient is another station.
-    pub enabled: bool,
-    /// Hold traffic until its final recipient contacts this node.
-    pub mailbox: bool,
-    pub max_holdings: usize,
-    pub max_bytes: u64,
-    pub max_hops: u8,
-    /// Per-bundle radio airtime ceiling.
-    pub airtime_budget_secs: u64,
-    /// Retired: whether urgent traffic goes two ways at once is decided by
-    /// expected utility. Accepted and ignored, so that older station files
-    /// still load.
-    #[serde(skip_serializing)]
-    pub urgent_min_gain: Option<f64>,
-    /// Fraction of rolling radio airtime reserved for control.
-    pub control_airtime_fraction: f64,
-}
-
-impl Default for RelaySettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            mailbox: false,
-            max_holdings: 256,
-            max_bytes: 16 * 1024 * 1024,
-            max_hops: 8,
-            airtime_budget_secs: 300,
-            urgent_min_gain: None,
-            control_airtime_fraction: 0.02,
-        }
-    }
-}
-
-impl RelaySettings {
-    pub fn check(&self) -> Result<(), String> {
-        if self.max_holdings == 0 || self.max_bytes == 0 {
-            return Err("relay max_holdings and max_bytes must be positive".into());
-        }
-        if !(1..=16).contains(&self.max_hops) {
-            return Err("relay.max_hops must be between 1 and 16".into());
-        }
-        if self.airtime_budget_secs == 0 {
-            return Err("relay.airtime_budget_secs must be positive".into());
-        }
-        if !self.control_airtime_fraction.is_finite() || !(0.0..=1.0).contains(&self.control_airtime_fraction)
-        {
-            return Err("relay.control_airtime_fraction must be between 0 and 1".into());
-        }
-        Ok(())
-    }
-}
+pub use hm_node::RelaySettings;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

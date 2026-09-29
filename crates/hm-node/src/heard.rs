@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use hm_wire::{Callsign, Heard, Locator, FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY, MAX_HEARD};
 use hm_xfer::beacon::HeardBeacon;
 
-use crate::files::Trust;
+use crate::Trust;
 
 /// How a beacon's key compares with the trusted key.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

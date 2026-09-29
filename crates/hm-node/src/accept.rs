@@ -2,16 +2,15 @@
 
 use hm_bundle::{Address, Bundle, Kind, Opened};
 use hm_ident::{Identity, PublicKey};
-use hm_net::Verdict;
 use hm_store::{AdmissionLimits, Direction, QueuedMessage, ReceivedMessage, RelayMetadata, State, Store};
 use hm_wire::{unwrap_routed, Callsign};
 
-use super::types::{addressed_to_us, log, short, Notify};
-use crate::config::RelaySettings;
-use crate::files::Trust;
-use crate::station::{open_message, unix_now, Verification};
+use crate::message::{open_message, Verification, MAX_BULLETIN_BYTES, MAX_INBOUND_BULLETINS_PER_ORIGIN_HOUR};
+use crate::{addressed_to_us, log, short, Notify, RelaySettings, Trust};
 
-pub(crate) enum Acceptance {
+/// What the gate did with an object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Acceptance {
     Stored,
     Duplicate,
     Busy(String),
@@ -19,35 +18,26 @@ pub(crate) enum Acceptance {
 }
 
 impl Acceptance {
-    pub(crate) fn verdict(self) -> Verdict {
-        match self {
-            Self::Stored => Verdict::Stored,
-            Self::Duplicate => Verdict::Duplicate,
-            Self::Busy(reason) => Verdict::Busy {
-                retry_after: 60,
-                reason,
-            },
-            Self::Rejected(reason) => Verdict::Rejected(reason),
-        }
-    }
-
-    pub(crate) fn custody_accepted(&self) -> bool {
+    pub fn custody_accepted(&self) -> bool {
         matches!(self, Self::Stored | Self::Duplicate)
     }
 }
 
-pub(crate) struct AcceptanceGate<'a> {
-    pub(crate) store: &'a Store,
-    pub(crate) notify: &'a Notify,
-    pub(crate) trust: &'a Trust,
-    pub(crate) me: Callsign,
-    pub(crate) key_call: Callsign,
-    pub(crate) identity: &'a Identity,
-    pub(crate) relay: &'a RelaySettings,
+/// What the gate decides with: the station, its store and settings, and the time.
+pub struct AcceptanceGate<'a> {
+    pub store: &'a Store,
+    pub notify: &'a Notify,
+    pub trust: &'a Trust,
+    pub me: Callsign,
+    pub key_call: Callsign,
+    pub identity: &'a Identity,
+    pub relay: &'a RelaySettings,
+    /// Unix seconds.
+    pub now: u64,
 }
 
 /// True when this origin already has too many inbound bulletins in the last hour.
-pub(crate) fn inbound_bulletin_flood(store: &Store, origin: Callsign, now: u64) -> bool {
+pub fn inbound_bulletin_flood(store: &Store, origin: Callsign, now: u64) -> bool {
     let Ok(list) = store.list(Direction::In, 200) else {
         return false;
     };
@@ -65,7 +55,7 @@ pub(crate) fn inbound_bulletin_flood(store: &Store, origin: Callsign, now: u64) 
         };
         if opened.bundle.kind == Kind::Bulletin && opened.bundle.from == origin {
             n += 1;
-            if n >= crate::station::MAX_INBOUND_BULLETINS_PER_ORIGIN_HOUR {
+            if n >= MAX_INBOUND_BULLETINS_PER_ORIGIN_HOUR {
                 return true;
             }
         }
@@ -74,7 +64,7 @@ pub(crate) fn inbound_bulletin_flood(store: &Store, origin: Callsign, now: u64) 
 }
 
 /// The one gate for final delivery and relay custody.
-pub(crate) fn accept(
+pub fn accept(
     gate: AcceptanceGate<'_>,
     via: Callsign,
     object: &[u8],
@@ -88,6 +78,7 @@ pub(crate) fn accept(
         key_call,
         identity,
         relay,
+        now,
     } = gate;
     let routed = match unwrap_routed(object) {
         Ok(route) => route,
@@ -113,7 +104,6 @@ pub(crate) fn accept(
         return Acceptance::Rejected("signature does not verify".into());
     }
     let verified = m.verification == Verification::Verified;
-    let now = unix_now();
     if bundle.is_expired(now) {
         return Acceptance::Rejected("bundle expired".into());
     }
@@ -136,7 +126,7 @@ pub(crate) fn accept(
         if bulletin_group.is_none() {
             return Acceptance::Rejected("bulletin requires a group address".into());
         }
-        if inner.len() > crate::station::MAX_BULLETIN_BYTES {
+        if inner.len() > MAX_BULLETIN_BYTES {
             return Acceptance::Rejected("bulletin too large".into());
         }
         if inbound_bulletin_flood(store, bundle.from, now) {

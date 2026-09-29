@@ -7,11 +7,9 @@ use hm_model::CustodianObservation;
 use hm_store::{Direction, ReclaimOutcome, RetryPolicy, Store};
 use hm_wire::{Callsign, ObjectId};
 
-use super::super::live::Live;
-use super::super::radio::RadioCmd;
-use super::super::types::{log, short};
 use super::handoff::InFlight;
 use super::{Command, Node};
+use crate::{log, short, RadioCmd, Settings};
 
 /// Check this often whether we hold anything others may pull (our beacons say so).
 const HOLDING_CHECK_SECS: u64 = 30;
@@ -36,9 +34,9 @@ impl Node {
             peer,
             flight.downstream,
             if at_destination { 0.0 } else { flight.alternative },
-            1.0 / self.live.costs.of(flight.bearer).max(1.0e-6),
+            1.0 / self.settings.costs.of(flight.bearer).max(1.0e-6),
             flight.expires_at.saturating_sub(now),
-            (MIN_SUSPECT_SECS, self.live.custody_suspect_secs),
+            (MIN_SUSPECT_SECS, self.settings.custody_suspect_secs),
             now,
         );
         match self.store.custody_transferred(
@@ -48,7 +46,7 @@ impl Node {
                 receipt_verified: true,
                 by: flight.bearer.name(),
                 now,
-                grace_secs: self.live.custody_grace_secs,
+                grace_secs: self.settings.custody_grace_secs,
                 suspect_secs,
             },
         ) {
@@ -237,17 +235,17 @@ pub(super) fn on_gave_up_receipt(store: &Store, receipt_id: ObjectId, now: u64) 
     }
 }
 
-pub(super) fn retry_policy_for(store: &Store, id: ObjectId, live: &Live) -> RetryPolicy {
+pub(super) fn retry_policy_for(store: &Store, id: ObjectId, settings: &Settings) -> RetryPolicy {
     let Ok(Some(object)) = store.object(id) else {
-        return live.retry;
+        return settings.retry;
     };
     let Ok(opened) = Opened::decode(&object) else {
-        return live.retry;
+        return settings.retry;
     };
     if opened.bundle.kind == Kind::Receipt {
-        live.receipt_retry
+        settings.receipt_retry
     } else {
-        live.retry
+        settings.retry
     }
 }
 
@@ -255,11 +253,11 @@ pub(super) fn retry_policy_for(store: &Store, id: ObjectId, live: &Live) -> Retr
 /// expires rather than given up: our own messages, and holdings of a mailbox
 /// relay, whose job is to wait for a destination that is rarely in reach.
 /// A plain relay gives up so the custodian before it can try another path.
-pub(super) fn holds_until_expiry(store: &Store, id: ObjectId, live: &Live) -> bool {
+pub(super) fn holds_until_expiry(store: &Store, id: ObjectId, settings: &Settings) -> bool {
     match store.record(id) {
         Ok(Some(record)) => match record.direction {
             Direction::Out => true,
-            Direction::Relay => live.relay.mailbox,
+            Direction::Relay => settings.relay.mailbox,
             _ => false,
         },
         _ => false,
