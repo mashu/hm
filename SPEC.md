@@ -509,32 +509,47 @@ A contact is a directed opportunity to transfer bytes:
 parts per 10,000, `rate` is effective bits/s, and `capacity` is residual bytes.
 Only `origin` may sign an outgoing contact claim. Claims expire at `end`.
 
-Every node keeps Beta evidence `(alpha, beta)` for each directed
-`(origin, peer, bearer, UTC-hour)` edge. A successful custody handoff increments
-`alpha`, a failed handoff increments `beta`, and old evidence decays. Routing
-uses a conservative posterior quantile `q`, not an RSSI value or a random draw.
+Each node keeps its beliefs about links in one model per path (`hm-model`):
+both directions of a radio, modem or internet path share whether it is open,
+since propagation is reciprocal and a handoff needs both (the object one way,
+the receipt back). The model is a two-state open/closed filter that relaxes
+toward a learned time-of-day pattern, with a Beta belief in handoff success
+while open and one in frame loss. Its evidence is typed: a beacon heard, a
+peer's report that it heard us, an ACK's frame counts, a handoff that
+completed or failed, beacons due and not heard, and, for a station never heard
+here, each of its transmissions a neighbour reports hearing. A beacon shows the
+paths it attests (its origin to the receiver, each station it lists to its
+origin) open at their times, and each becomes a contact in both directions.
+Custodians have a model of their own (acceptance, busy periods, delivery
+onward), and a link never seen starts from its bearer's population prior.
 
-For a time-respecting route `r`, under the independent-edge approximation:
-
-`P_success(r) = product(q_e)` and `C_risk(r) = sum(-ln(q_e))`.
+A route delivers with probability `P = product(p_e)`, each hop's link
+completing and its custodian accepting (and, before the destination, doing its
+part), estimated from one Thompson draw from the beliefs per plan. It arrives
+at `a` and costs `C = sum(P(reach hop) * cost(bearer))`. Its expected utility
+is `U = P * u(a) - C`, where `u` falls linearly to nothing at the bundle's
+expiry (halves every 10 minutes for urgent traffic). Routes are ranked by `U`
+with the best fallback counted: `U(r) + (1 - p_1) * U(best other way once r's
+first hop has failed)`.
 
 A route is feasible only when every contact has residual volume for the object,
 projected arrival is before bundle expiry, no station repeats, and `max_hops`
-is not exceeded. Among feasible routes within the local airtime budget, choose
-the greatest `P_success`; break ties by earliest projected arrival, least
-airtime, then fewest hops. Keep up to three alternatives for sequential
-failover, but activate only one.
+is not exceeded, within the local airtime budget. Keep up to three
+alternatives for sequential failover, but activate only one.
 
 Routine and priority bundles have one active custodian. Immediate and flash
-bundles may have two copies only on edge-disjoint feasible routes and only when
-both fit the airtime budget. There is no neighbourhood payload flood.
+bundles may have a second copy on an edge-disjoint feasible route when the
+time it saves outweighs its cost in expected utility. There is no
+neighbourhood payload flood.
 
-When no route to the destination is known, a station without internet links
-routes to a station whose beacon or advert carries both the internet flag and
-the relay or mailbox flag (a gateway), if one is reachable: the default route.
-The gateway plans again with what it knows of the internet core and of radio
-areas behind other gateways. Only when there is no gateway does a station try
-the destination directly on the radio, where it may be in range unheard.
+Contacts the station could try besides those it knows are open: the
+destination directly on the radio (it may be in range unheard) or through
+the ARQ modem, and, for a station without internet links, a station whose
+beacon or advert carries both the internet flag and the relay or mailbox flag
+(a gateway), which plans again with what it knows of the internet core: the
+default route. Their chance is the beliefs' about those paths, so a
+destination the station's neighbours hear and it does not is soon believed
+out of reach directly.
 
 ### 11.2 Custody and end-to-end delivery
 

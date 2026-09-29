@@ -459,3 +459,72 @@ the default route hides this. On a pure-RF HF network it does not.
 Order: P1, P2 and P6 are small and independent. P3 and P4 next. P9 before
 P5, so the forecasting model is built against a whole-node simulator that
 can show it working over weeks.
+
+---
+
+## 11. Progress
+
+Done: P1, P2, P3, P4, P6 (`hm-model`, and the planner, transfer engine and
+node rebuilt on it) and P9.
+
+**P9.** The station's decisions are `hm_node::Node`, a state machine without
+I/O: time and events in (radio events, transfer results, SYNC, ticks,
+settings), commands out. Its radio side is `hm_node::Radio`, an
+`hm_core::Machine` (transfer engine, beacons, stations heard, SYNC under the
+control budget, the channel belief), frames in and out. The daemon's
+coordinator and radio thread are shells around the two. `hm_node::Station`
+joins them into one machine, which hm-sim runs on its channel physics with an
+in-memory store per station. `crates/hm-node/tests/support/world.rs` builds
+HF networks whose paths open and close through the day (a persistent
+hour-by-hour chance) and fade while open (Watterson), queues traffic, and
+finds each message's earliest possible arrival over the openings (an oracle
+that knows the future and has no airtime limit). A week of five stations runs
+in about 20 s with the nodes ticking every 10 s rather than every second
+(`cargo run --release -p hm-node --example hf_days`); two small scenarios run
+in CI.
+
+**What the whole-station simulation found**, and what was fixed:
+
+- *Beliefs and contacts were directional.* A beacon heard from B updated
+  B→A only; a handoff A→B learned nothing from it, and B's beacon listing C
+  made the contact C→B but not B→C. A station could not route through a
+  neighbour to a station only the neighbour hears. HF propagation is
+  reciprocal and a handoff needs both directions, so beliefs are now per path
+  (`LinkKey::path`) and a beacon makes contacts both ways. Week-long Baltic
+  run (4 seeds): 172 → 216 of 240 delivered (all 240 deliverable).
+- *A station never heard gave no evidence.* Beacons due and not heard were
+  counted only for stations heard before. Now each transmission of a station
+  that a neighbour reports hearing, and that did not reach us, is a `Missed`
+  observation on the path.
+- The diurnal routing benchmark (hm-sim, Bayesian CGR) with these changes:
+  staggered windows 97.9 → 100 % delivered, p50 36.0 → 34.0 h, p95 60.2 →
+  54.5 h, airtime +0.9 %; overlapping windows 100 % both, p50 12.5 → 12.0 h,
+  airtime +2.4 %. The Brier score got worse (0.784 → 0.865, 0.669 → 0.711):
+  it scores the per-attempt forecast against eventual delivery, which is
+  §3.3's problem, for P5.
+
+**What it shows is still wrong.** Over the week the channel is busy 51 % of
+the time to move a dozen messages of a few hundred bytes a day: data frames
+take 27 % of it and session opens 19 % (beacons 3.2 %, SYNC 0.5 %), and over
+four seeds 14,268 ACKs came back for 265,568 data frames. Stations transmit
+into closed paths; the log shows attempt after attempt ending in `NoAnswer`,
+and why:
+
+1. The planner acts on the best route *now* whenever its expected utility is
+   positive. With a flat attempt cost of 1 % of a message's value, a direct
+   attempt at p = 0.02 qualifies, every retry, all night, while the relay
+   route that opens in the morning with p ≈ 0.85 is not in the graph yet.
+   Only a forecast of openings can say "wait" (P5).
+2. An attempt's cost is flat per bearer, not the airtime it takes. A failed
+   HF attempt is 12 silent rounds, about a minute of a 300 bd channel over
+   25 minutes; on a shared HF channel that is the airtime of a message or
+   two, not 1 % of one.
+3. The transfer engine runs all its rounds whatever the silence says. After
+   two or three rounds with nothing heard, the posterior that the path is
+   open is a small fraction of the prior.
+
+Next, in order: P5 (forecast contacts from the link models, so the planner
+compares acting now with the best later opening); attempt cost as expected
+airtime priced by the channel's occupancy; stopping silent rounds on the
+posterior (P7's neighbour). `hm-cli/tests/control_load.rs` still copies the
+daemon's control policy by hand; it can now run `Radio` machines instead.

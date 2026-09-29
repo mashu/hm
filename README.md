@@ -28,36 +28,44 @@ decide *whether*, *when* and *over which medium* to spend airtime.
 | Strength | What it means in practice |
 | --- | --- |
 | **Signed custody, not blind relay** | Each hop moves durable custody only after a verified next-hop receipt; the prior hop retains a shadow copy for reclaim. The origin marks **Delivered** only on a destination-signed end-to-end receipt (else eventually **DeliveredUnconfirmed** or **Failed**). |
-| **Bayesian contacts** | Link success is a decaying Beta posterior from schedules, beacons, live links and handoff outcomes—not a single SNR snapshot. |
-| **Thompson-sampled bearers** | Radio, Internet and ARQ modems compete by discounted cost ÷ sampled success rate, so a failing radio yields to Internet and is retried as evidence fades. |
+| **Generative link models** | Whether each path is open is a filtered two-state belief with a learned time-of-day pattern, fed by typed evidence (beacons heard and missed, peers' reports, ACK frame counts, handoff outcomes), not a single SNR snapshot. |
+| **Routes by expected utility** | Radio, Internet and ARQ modems compete in one plan: each route's chance (one Thompson draw from the beliefs) times the value of arriving when it would, less the cost of the attempts, with the best fallback counted. |
 | **Fountain-coded RF transfers** | RaptorQ symbol bursts with adaptive sizing absorb loss without stop-and-wait ACKs on every fragment. |
 | **Airtime as a budget** | Relays and control traffic (Trickle contacts, holdings SYNC) are capped; urgent traffic may use at most one extra edge-disjoint copy. |
 | **Federated trust** | Station keys authenticate Internet (QUIC/TLS 1.3) and verify bundles; optional public core hubs accept dial-ins without a directory of every home station. |
-| **Research-shaped codebase** | Protocol layers live in small, dependency-ordered crates (`hm-wire` → `hm-bundle` → `hm-xfer` / `hm-route` → `hm-cli`), so policies can be swapped or simulated in isolation. |
+| **Research-shaped codebase** | Protocol layers live in small, dependency-ordered crates (`hm-wire` → `hm-bundle` → `hm-xfer` / `hm-model` → `hm-route` → `hm-node` → `hm-cli`). The station's decisions and its radio side are state machines without I/O, so whole stations run in the simulator for weeks of HF in seconds. |
 
 ## Bayesian pieces
 
-Two places use Bayesian reasoning explicitly:
+What a station believes lives in one place, `hm-model`, and every decision
+reads it:
 
-1. **Contact graph (`hm-route`)** — each directed edge
-   `(origin, peer, bearer, UTC hour)` keeps Beta evidence `(α, β)`. Successful
-   custody increments `α`, failures increment `β`, and evidence decays with
-   time. Route scoring uses a **conservative posterior quantile** (not a mean
-   and not a random draw), so plans prefer contacts that are both likely and
-   well-supported. Feasible routes must meet deadline, residual capacity,
-   airtime and hop limits; the node keeps a short failover list and activates
-   one custodian at a time for routine traffic.
+1. **Links** — one model per path and bearer: both directions share whether
+   the path is open (propagation is reciprocal, and a handoff needs the
+   receipt back). A two-state open/closed filter relaxes toward a time-of-day
+   pattern learned online; Beta beliefs hold handoff success while open and
+   frame loss. Each kind of evidence has its own likelihood: a beacon heard,
+   a peer's report that it heard us, beacons due and not heard (for a station
+   never heard here, each of its transmissions a neighbour reports), an ACK's
+   frame counts, a handoff that completed or failed. A link never seen starts
+   from its bearer's population prior (empirical Bayes).
+2. **Custodians** — whether a station accepts custody, when it is busy, and
+   how often what it takes arrives; how long to wait for an end-to-end
+   receipt before reclaiming custody is an optimal stopping time on it.
+3. **Channel** — how many stations share it and how busy it is, which sets
+   the beacon interval, the control budget and how many listeners a
+   broadcast is sized for.
 
-2. **Bearer choice (`hm-cli` chooser)** — for a neighbour that can be reached
-   on more than one medium, each `(station, bearer)` arm is a Beta belief
-   (optimistic prior). The node draws a success rate from each available arm
-   and picks the lowest expected cost `cost / rate` (**discounted Thompson
-   sampling**). Failures push traffic toward Internet or modem; as they fade,
-   radio is tried again.
+**Route choice (`hm-route`)** plans with one Thompson draw from the beliefs
+per message: each route's chance of delivering times the value of arriving
+when it would (falling to nothing at expiry), less the expected cost of its
+attempts, with the best fallback counted. Radio, internet and ARQ modems are
+contacts in the same plan, so no separate bearer chooser is needed.
+**Burst sizing (`hm-xfer`)** picks the over that minimises expected airtime
+under the Beta-binomial predictive of frame loss.
 
-Payload routing itself stays deterministic given the graph; randomness is
-confined to bearer exploration so simulation and replay remain reproducible
-when the RNG seed is fixed.
+Beliefs are saved in the store and restored at start. With a fixed seed,
+planning and simulation are reproducible.
 
 ## Protocol layers
 
@@ -66,12 +74,14 @@ when the RNG seed is fixed.
 | **Identity & trust** | Callsigns, Ed25519 keys, signed envelopes, local trust lists | `hm-ident`, `hm-cli` config | Trust is explicit and local; keys are never learned from beacons. |
 | **Application objects** | Chat / mail / bulletin / receipt bundles, compression | `hm-bundle` | Content-addressed, sealed objects; cleartext by design for amateur service. |
 | **Custody & persistence** | Inbox, outbox, relay holdings, retries, shadow retain, suspect reclaim | `hm-store` | Crash-safe `redb` store; at-most-once local store by content id; hop at-least-once while queued |
-| **Contact & routing** | Bayesian graph, CGR-style plans, failover, urgent dual-path | `hm-route` | Policy lives here: change scoring or admission without touching RF framing. |
+| **Beliefs** | Link, custodian and channel models; evidence in, probabilities and posterior draws out | `hm-model` | `no_std`; one model per thing believed in, shared by every decision. |
+| **Contact & routing** | Contact graph, expected-utility plans, failover, urgent dual-path | `hm-route` | Policy lives here: change scoring or admission without touching RF framing. |
 | **Transfer** | Sessions, OFFER, RaptorQ bursts, ACKs, transfer receipts | `hm-xfer` | Sans-IO engine driven by `hm-core::Machine`; same logic on radio and in sim. |
 | **Wire framing** | 18-byte headers, ACK/OFFER/OPEN/CLOSE, beacons, SYNC | `hm-wire` | Compact, versioned; independent Python vectors in CI. |
 | **Bearers** | KISS/AX.25, built-in AFSK, QUIC Internet, ARQ modem hosts | `hm-bearer`, `hm-modem-afsk`, `hm-net`, `hm-rig`, modem glue in `hm-cli` | Bearers are interchangeable ports into the transfer engine. |
-| **Station orchestration** | Daemon, setup, web UI/API, live settings | `hm-cli` | Thin coordination over the libraries above—not a second protocol stack. |
-| **Validation** | Discrete-event RF/Internet simulation, baseline routing compare | `hm-sim` | Deterministic experiments before on-air trials. |
+| **Station decisions** | Acceptance gate, control plane, routing and custody (`Node`); transfer engine, beacons, stations heard and SYNC budget (`Radio`) | `hm-node` | State machines without I/O: time and events in, commands and frames out. |
+| **Station orchestration** | Daemon, setup, web UI/API, live settings | `hm-cli` | Shells that feed `hm-node`'s machines real events and carry out their commands. |
+| **Validation** | Discrete-event RF simulation, whole stations over days of HF, baseline routing compare | `hm-sim`, `hm-node` tests | Deterministic experiments before on-air trials. |
 
 Wire details and test vectors: [`SPEC.md`](SPEC.md). Bulletin channels:
 [`docs/bulletin-channels.md`](docs/bulletin-channels.md).
@@ -84,7 +94,8 @@ Wire details and test vectors: [`SPEC.md`](SPEC.md). Bulletin channels:
 | `hm-wire` | Base-40 callsigns, 18-byte frame header, ACK payload, object ids, signed contact deltas and pairwise holdings-reconciliation messages |
 | `hm-ident` | Ed25519 identities, signed envelopes, callsign binding records, attestations |
 | `hm-bundle` | Messages: build, seal, open, verify; end-to-end receipts; attachment references; bounded zstd body compression with a versioned shared dictionary |
-| `hm-route` | Bayesian contact graph from schedules, beacons, live links and delivery evidence; capacity-, deadline-, airtime- and storage-aware route selection with sequential failover and bounded urgent replication |
+| `hm-model` | What a station believes, `no_std`: link paths (two-state availability with a learned daily pattern, handoff and frame-loss Beta beliefs), custodians, the channel; typed evidence, population priors, Thompson draws; burst sizing by expected airtime; saved and restored as records |
+| `hm-route` | Contact graph from schedules, beacons, live links and adverts; route selection by expected utility, capacity-, deadline- and airtime-aware, with fallbacks counted, sequential failover and urgent replication when it pays |
 | `hm-sim` | Discrete-event simulator: multiple channels and radios per station, airtime with keyed-PTT bursts and AX.25/HDLC framing checked against the modulator, half-duplex, p-persistent CSMA with a measured carrier-detect delay, hidden-terminal collisions, Bernoulli / Gilbert–Elliott / hourly HF loss or the built-in modem's measured loss by SNR and frame length, outages, partitions, clock drift, corrupted frames, airtime split by purpose, delivery and latency metrics; deterministic routing comparisons against epidemic, Spray-and-Wait, PRoPHET-like and MEED baselines |
 | `hm-bearer` | KISS framing (streaming decoder) and AX.25 UI encapsulation for Direwolf and hardware TNCs |
 | `hm-xfer` | Fountain-coded (RaptorQ) transfer engine: OFFER + symbol bursts, ACKs with the missing count, hash-verified delivery, signed delivery receipts, duplicate suppression, per-sender resource limits, sessions (OPEN with feature bits and limits, CLOSE for busy, refused or too large), loss-adaptive burst sizing, random exponential backoff, airtime budget |
@@ -92,6 +103,7 @@ Wire details and test vectors: [`SPEC.md`](SPEC.md). Bulletin channels:
 | `hm-net` | Internet links: QUIC with TLS 1.3 on Ed25519 station keys (mutual trust by default; optional `open_hub` for public cores), automatic redial, one stream per bundle with a signed receipt |
 | `hm-modem-afsk` | Our own AFSK 1200 modem (Bell 202), pure Rust and `no_std`: HDLC framing and CRC, multi-slicer demodulator with per-tone AGC and PLL clock recovery, carrier detect |
 | `hm-rig` | Radio hardware: sound cards through `cpal` (ALSA, CoreAudio, WASAPI); PTT by rigctld (Hamlib CAT), serial RTS/DTR, CM108 GPIO (AIOC, Digirig) or VOX; a virtual radio channel for tests |
+| `hm-node` | A station's decisions without I/O: the acceptance gate, control plane (adverts, holdings SYNC, control budget), stations heard, RF policy, routing and custody as a `Node` state machine; the radio side (transfer engine, beacons, SYNC under the budget) as a `Radio` machine; both together as a `Station` for simulators |
 | `hm-cli` | The `hm` command: interactive first-run `setup`; `node` (the station daemon: packet radio, ARQ modems (VARA, Mercury, ARDOP) and/or Internet links, relay/mailbox, web interface, JSON API with access token, settings applied live); `keygen`, `whoami`, `trust`, `send` and `listen`; KISS links over TCP or a serial port, and a real-time driver |
 
 ## Status: Phase 0 complete; Phase 1 hardware validation open; Phase 2 relay software implemented
@@ -667,6 +679,7 @@ at the weakest SNR it meets.
 | 2 kB over the modem's measured loss at 7 / 8 / 9 dB SNR | 100/100 delivered at each; latency p50 25.1 / 17.5 / 17.5 s | `cargo test -p hm-xfer --release --test sim measured_modem -- --nocapture` |
 | Four stations to one hub, 1.5 kB each, 9 dB, all hear each other | without CSMA: last delivery p50 205 s, 5.4 overs per object, 136 receptions lost to collisions per run; with CSMA: p50 72 s, 1.8 overs per object, 39 lost, all from stations keying up within the 125 ms carrier-detect delay of each other | `cargo test -p hm-xfer --release --test sim busy_channel -- --nocapture` |
 | Receiver never keys up during an over, 8 kB at 15% loss | 0 frames talked over in 40 runs | `cargo test -p hm-xfer --release --test sim nobody_talks -- --nocapture` |
+| A week of HF: five real stations (node and radio machines, a store each) on one 300 bd channel whose paths open and close through the day and fade while open; 12 messages a day between random pairs, some only through relays | 216 of 240 delivered (all 240 were deliverable over the openings); half arrive within 1 h of the earliest possible, 90% within 30 h; the channel is busy 51% of the time (data 27%, session opens 19%), mostly with attempts into closed paths — what the forecasting model (P5 in [`MODEL_ASSESSMENT.md`](MODEL_ASSESSMENT.md)) is for | `cargo run --release -p hm-node --example hf_days -- 7 4` |
 | HF: 2 kB at 300 bd, 0.5 Hz Doppler spread, 20 dB mean SNR | 20/20 delivered, p50 199 s, 166 s of airtime; with the VHF link sizes used before, p50 344 s and 231 s | `cargo test -p hm-xfer --release --test sim hf_link_sizing -- --nocapture`; the grid of symbol sizes and over lengths behind the HF sizing: `... explore_hf_parameters_on_fading -- --ignored --nocapture` |
 | Modem frame loss vs SNR, 48 kHz, white noise | 38% of 40-byte frames lost at 5.5 dB, 40% of 360-byte frames at 7 dB, none at or above 9.5 dB; table in `crates/hm-sim/src/afsk_1200.rs` | `HM_WRITE_CURVE=1 cargo test -p hm-sim --release --test afsk afsk_1200_curve -- --ignored` |
 | Modem carrier detect | 68–101 ms after key-up at 7–20 dB SNR | `cargo test -p hm-sim --release --test afsk carrier_detect -- --nocapture` |
