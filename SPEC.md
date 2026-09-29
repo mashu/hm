@@ -344,7 +344,7 @@ and index 0 (receivers ignore both). Payload, 108 + 7n bytes:
 
 | Offset | Size | Field |
 | --- | --- | --- |
-| 0 | 1 | flags: 0x01 mailbox (holds mail for other stations), 0x02 relay (passes mail on, Phase 2), 0x04 internet (has internet links); other bits 0 |
+| 0 | 1 | flags: 0x01 mailbox (holds mail for other stations), 0x02 relay (passes mail on, Phase 2), 0x04 internet (has internet links), 0x08 holding (holds bundles others may pull with holdings SYNC, section 11.3); other bits 0, and ignored by receivers |
 | 1 | 32 | the station's Ed25519 key |
 | 33 | 4 | Unix time in seconds when sent |
 | 37 | 6 | Maidenhead locator: 4 or 6 characters in upper-case ASCII (`JO89` or `JO89XI`), a 4-character one followed by two zero bytes; all zero when the station gives none |
@@ -477,6 +477,13 @@ failover, but activate only one.
 Routine and priority bundles have one active custodian. Immediate and flash
 bundles may have two copies only on edge-disjoint feasible routes and only when
 both fit the airtime budget. There is no neighbourhood payload flood.
+
+When no route to the destination is known, a station without internet links
+routes to a station whose beacon or advert carries both the internet flag and
+the relay or mailbox flag (a gateway), if one is reachable: the default route.
+The gateway plans again with what it knows of the internet core and of radio
+areas behind other gateways. Only when there is no gateway does a station try
+the destination directly on the radio, where it may be in range unheard.
 
 ### 11.2 Custody and end-to-end delivery
 
@@ -611,11 +618,45 @@ SYNC vectors (hex), using station secret `07` repeated 32 times for CONTACT:
 - OFFER: `04000100032a5159a9ca4717`
 - WANT: `0301032a5159a9ca4717`
 
-CONTACT dissemination uses the Trickle
-algorithm (RFC 6206): inconsistency resets the interval, consistent duplicates
-suppress transmission, and a stable network becomes quiet. Control traffic has
-a separate rolling radio budget, 2% by default. A beacon may carry a directory
-digest; peers request details only when state differs.
+CONTACT dissemination uses the Trickle algorithm (RFC 6206): inconsistency
+resets the interval, consistent duplicates suppress transmission, and a stable
+network becomes quiet. For that to hold on a shared channel:
+
+- An advert's identity is `(origin, peer, bearer, start)`. A live contact keeps
+  its `start` while it lasts; its origin refreshes the claim (new sequence
+  number, later `end`) every 30 minutes with a validity of 2 hours. A copy
+  that differs from the one held only in sequence, `end` and signature is
+  consistent: the newer copy replaces the held one, the interval is not reset.
+- Each station picks its moment in an interval with its own randomness. (With
+  moments derived only from the advert and the time it was heard, every
+  station that heard it at once would transmit at once, collide, and never
+  suppress.)
+- Scope: live contacts are advertised over internet links only, since on the
+  radio every station's beacon already lists whom it hears. Scheduled contacts
+  go on the radio too. An advert learned over the internet, and any advert of
+  an internet contact, is never transmitted on the radio.
+- A copy of an advert heard on air removes any copy of it, no newer, still
+  waiting to be sent.
+
+The radio control budget (2% of an hour by default) is the whole channel's:
+each station takes an equal share among the stations it heard within the
+last hour (or the live window, if longer), itself included. A frame longer
+than a station's whole share is sent into an empty window, after which the
+station stays quiet until the share covers it. SYNC frames waiting for the
+budget are replaced by newer ones about the same contact, or to the same
+station with the same filter scope, and dropped when what they say expires.
+
+Beacons follow the same rule: a station beacons at its configured interval,
+or less often while the stations sharing the channel would otherwise spend
+more than 2% of it on beacons. A station counts as in reach for 2.5 beacon
+intervals after its last beacon (at least 20 minutes), and lists in its
+beacons the stations heard within that time (at least an hour).
+
+Holdings are pulled over the radio only from stations whose beacon carries
+the holding flag, and at most every 30 minutes from each. A station holding
+mail for another sends it when it hears that station anyway; pulling covers
+bulletins and missed pushes. (A beacon digest saying whom the mail is for
+would narrow this further.)
 
 ### 11.4 Admission, expiry and cancellation
 

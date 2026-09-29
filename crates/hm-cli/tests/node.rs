@@ -726,6 +726,93 @@ fn internet_only_nodes_exchange_mail_both_ways() {
     server.stop().unwrap();
 }
 
+/// A radio-only station has never heard of the destination, which is on the
+/// internet only. It hands the mail to a relaying gateway it hears (the
+/// default route), the gateway carries it over the internet, and the
+/// destination's receipt finds its way back through the gateway.
+#[test]
+fn a_radio_only_station_reaches_an_internet_station_through_a_gateway() {
+    let tnc = fake_tnc(0);
+    let alice = KeyFile::generate(call("SA0KAM")).unwrap();
+    let gateway = KeyFile::generate(call("SM0GW")).unwrap();
+    let bob = KeyFile::generate(call("SO5KM-1")).unwrap();
+    let (a_db, g_db, b_db) = (Tmp::new("dr-a"), Tmp::new("dr-g"), Tmp::new("dr-b"));
+    let g = start_routed(
+        Setup {
+            key: &gateway,
+            me: "SM0GW",
+            peer: &alice,
+            also: &[&bob],
+            tnc: Some(tnc.addr),
+            internet: Some(InternetConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                peers: vec![],
+            }),
+            store: &g_db,
+            retry: QUICK,
+            beacon_every: Some(Duration::from_secs(2)),
+            trust_file: None,
+        },
+        RelaySettings {
+            enabled: true,
+            ..RelaySettings::default()
+        },
+        vec![],
+    );
+    let b = start(Setup {
+        key: &bob,
+        me: "SO5KM-1",
+        peer: &gateway,
+        also: &[&alice],
+        tnc: None,
+        internet: Some(InternetConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            peers: vec![(gateway.call, g.internet_addr.unwrap())],
+        }),
+        store: &b_db,
+        retry: QUICK,
+        beacon_every: None,
+        trust_file: None,
+    });
+    let a = start(Setup {
+        key: &alice,
+        me: "SA0KAM",
+        peer: &gateway,
+        also: &[&bob],
+        tnc: Some(tnc.addr),
+        internet: None,
+        store: &a_db,
+        retry: QUICK,
+        beacon_every: Some(Duration::from_secs(2)),
+        trust_file: None,
+    });
+    wait_for(Duration::from_secs(30), "the gateway's link and beacons", || {
+        let linked = get(g.http_addr, "/api/status")["internet_peers"] == json!(["SO5KM-1"]);
+        // The gateway's beacon says it hears us: a way to it.
+        let heard = get(a.http_addr, "/api/status")["heard"]
+            .as_array()
+            .is_some_and(|h| {
+                h.iter().any(|s| {
+                    s["station"] == "SM0GW"
+                        && s["hears"]
+                            .as_array()
+                            .is_some_and(|l| l.iter().any(|c| c == "SA0KAM"))
+                })
+            });
+        (linked && heard).then_some(())
+    });
+    send(
+        a.http_addr,
+        json!({"to": "SO5KM-1", "subject": "Via the gateway", "text": "A-G-B"}),
+    );
+    let sent = delivered(a.http_addr, 1, "delivery through the gateway");
+    assert_eq!(sent["state"], "Delivered");
+    assert_eq!(inbox(b.http_addr)[0]["text"], "A-G-B");
+    a.stop().unwrap();
+    g.stop().unwrap();
+    b.stop().unwrap();
+}
+
 /// Both stations have radio and internet. Mail goes by radio; when the band
 /// dies it moves to the internet by itself.
 #[test]

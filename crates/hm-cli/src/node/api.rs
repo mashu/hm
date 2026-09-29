@@ -570,11 +570,24 @@ async fn send(
             )));
         }
         let peer = hm_xfer::broadcast_peer();
+        let expires_at = Some(bundle.bundle().expires_at());
         let store = s.store.clone();
-        tokio::task::spawn_blocking(move || store.enqueue(id, &bytes, peer, 0, unix_now()))
-            .await
-            .map_err(internal)?
-            .map_err(internal)?;
+        tokio::task::spawn_blocking(move || {
+            store.enqueue_with(
+                id,
+                &bytes,
+                hm_store::EnqueueOpts {
+                    to: peer,
+                    precedence: 0,
+                    now: unix_now(),
+                    wire_seq: None,
+                    expires_at,
+                },
+            )
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
         s.notify.send("message");
         return Ok((
             StatusCode::CREATED,

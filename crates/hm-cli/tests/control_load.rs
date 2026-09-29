@@ -1,31 +1,38 @@
 //! Control-plane airtime on a shared radio channel.
 //!
-//! N stations that all hear each other run the daemon's radio control policy:
-//! signed beacons, live CONTACT adverts for the stations they hear, Trickle
-//! dissemination of every advert they learn, and the rolling control budget.
-//! The simulator puts the frames on one channel with p-persistent CSMA, so
-//! collisions and deferral are real. The question is the one that sinks
-//! flooding meshes: does control traffic stay small as the network grows?
+//! N stations that all hear each other run the daemon's radio control policy,
+//! built from the same pieces the daemon uses (`hm_cli::node::control`):
+//! signed beacons at an interval that grows with the stations sharing the
+//! channel, live contact claims (internet only), Trickle dissemination of
+//! scheduled contacts on air, holdings filters sent only to stations whose
+//! beacon says they hold something, and one control budget shared by the
+//! stations in reach. The simulator puts the frames on one channel with
+//! p-persistent CSMA, so collisions and deferral are real. The question is
+//! the one that sinks flooding meshes: does control traffic stay small as
+//! the network grows?
+//!
+//! Before this policy (commit 5ff3fef, the same harness on the old policy),
+//! control traffic took 19% of a VHF channel at 10 stations, 40% at 20 and
+//! 75% at 40, and more than an HF 300 bd channel could carry at 40.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use hm_cli::node::control::{
-    holdings_filter, ControlBudget, Trickle, CONTROL_BUDGET_PERMYRIAD, CONTROL_BUDGET_WINDOW_MS,
+    beacon_interval_ms, control_share_permyriad, holdings_filter, live_window_secs, radio_pull_due,
+    AdvertSource, ControlBudget, SyncQueue, Trickle, CONTROL_BUDGET_PERMYRIAD, CONTROL_BUDGET_WINDOW_MS,
+    LIVE_ADVERT_REFRESH_SECS, LIVE_ADVERT_VALIDITY_SECS, SYNC_QUEUE_FRAMES,
 };
 use hm_core::{DetRng, Input, Machine, Millis, Output};
 use hm_sim::{Csma, Loss, RadioParams, Sim};
 use hm_wire::{
     Beacon, Callsign, ContactAdvert, ContactBearer, Dest, FrameHeader, FrameType, Heard, ObjectId,
-    SyncMessage, FLAG_RELAY, MAX_HEARD,
+    SyncMessage, FLAG_HOLDING, FLAG_RELAY, MAX_HEARD,
 };
 
 const BEACON_EVERY_MS: u64 = 10 * 60 * 1000;
 const FIRST_BEACON_MS: (u64, u64) = (5_000, 30_000);
-const LIVE_BEACON_SECS: u64 = 20 * 60;
-const LIVE_READVERTISE_SECS: u64 = 10 * 60;
-const SYNC_QUEUE: usize = 64;
-/// Pairwise holdings SYNC with a station heard, at most this often.
-const PAIRWISE_SYNC_SECS: u64 = 5 * 60;
+/// Stations heard within this long share the channel, at least (as `radio.rs`).
+const SHARING_WINDOW_SECS: u64 = 3600;
 /// Objects in each station's store: what its holdings filters describe.
 const STORED_OBJECTS: usize = 50;
 const TICK_MS: u64 = 1_000;
@@ -37,6 +44,18 @@ enum Kind {
     Filter,
 }
 
+#[derive(Copy, Clone)]
+struct Scenario {
+    radio: RadioParams,
+    /// Every this-many-th station holds something for others (a mailbox or
+    /// relay with mail waiting); 1: all of them.
+    holding_every: usize,
+    /// Scheduled contacts each station claims (advertised on air).
+    schedules: usize,
+    /// Adverts station 0 learned over the internet (a gateway).
+    internet_adverts: usize,
+}
+
 /// One station's control plane, as the daemon runs it.
 struct Station {
     me: Callsign,
@@ -44,55 +63,72 @@ struct Station {
     rng: DetRng,
     next_tick: Millis,
     next_beacon: Millis,
+    beacon_interval_secs: u64,
+    holding: bool,
     /// Last time each station was heard, and the time in its last beacon.
     heard: BTreeMap<Callsign, (u64, u32)>,
     /// Radio links this station has seen evidence of, from beacons (the
     /// sender reaches us; each listed station reaches the sender): when.
     links: BTreeMap<(Callsign, Callsign), u64>,
-    advertised_live: BTreeMap<Callsign, u64>,
-    last_pairwise: BTreeMap<Callsign, u64>,
+    /// Live claims: `(since, claimed_at)` by peer.
+    claims: BTreeMap<Callsign, (u64, u64)>,
+    last_pull: BTreeMap<Callsign, u64>,
     trickle: Trickle,
     budget: ControlBudget,
-    queue: VecDeque<(Kind, Vec<u8>)>,
-    /// Adverts this station learned over the internet and refreshes every
-    /// ten minutes (a gateway): `(peer, last refresh)`.
+    sharing: usize,
+    queue: SyncQueue,
+    schedules: Vec<Callsign>,
+    /// Adverts learned over the internet, refreshed every half hour.
     internet: Vec<(Callsign, u64)>,
     sent: Vec<(u64, Kind, u64)>,
-    dropped: u64,
 }
 
 fn call(i: usize) -> Callsign {
     Callsign::parse(&format!("T{i}X")).unwrap()
 }
 
+fn airtime_estimate(radio: &RadioParams, frame_len: usize) -> u64 {
+    radio.txdelay.0 + ((frame_len as u64 + 24) * 8 * 1000).div_ceil(radio.bitrate_bps as u64)
+}
+
 impl Station {
-    fn new(me: Callsign, radio: RadioParams, mut rng: DetRng) -> Station {
+    fn new(me: Callsign, scenario: Scenario, holding: bool, mut rng: DetRng) -> Station {
         let first = FIRST_BEACON_MS.0 + rng.below(FIRST_BEACON_MS.1 - FIRST_BEACON_MS.0 + 1);
         Station {
             me,
-            radio,
+            radio: scenario.radio,
             rng,
             next_tick: Millis(TICK_MS),
             next_beacon: Millis(first),
+            beacon_interval_secs: BEACON_EVERY_MS / 1000,
+            holding,
             heard: BTreeMap::new(),
             links: BTreeMap::new(),
-            advertised_live: BTreeMap::new(),
-            last_pairwise: BTreeMap::new(),
-            trickle: Trickle::default(),
+            claims: BTreeMap::new(),
+            last_pull: BTreeMap::new(),
+            trickle: Trickle::default().with_salt(me.packed()),
             budget: ControlBudget::new(CONTROL_BUDGET_WINDOW_MS, CONTROL_BUDGET_PERMYRIAD).unwrap(),
-            queue: VecDeque::new(),
+            sharing: 1,
+            queue: SyncQueue::new(SYNC_QUEUE_FRAMES),
+            schedules: (0..scenario.schedules).map(|j| call(30_000 + j)).collect(),
             internet: Vec::new(),
             sent: Vec::new(),
-            dropped: 0,
         }
     }
 
-    fn advert(&self, peer: Callsign, bearer: ContactBearer, now_s: u64) -> ContactAdvert {
+    fn advert(
+        &self,
+        peer: Callsign,
+        bearer: ContactBearer,
+        since: u64,
+        now_s: u64,
+        valid: u64,
+    ) -> ContactAdvert {
         ContactAdvert {
             origin: self.me,
             sequence: now_s as u32,
-            start: now_s as u32,
-            end: (now_s + 20 * 60) as u32,
+            start: since as u32,
+            end: (now_s + valid) as u32,
             peer,
             bearer,
             success_permyriad: 7_000,
@@ -109,17 +145,22 @@ impl Station {
         out.push(Output::Transmit { port: 0, data });
     }
 
+    fn live_window(&self) -> u64 {
+        live_window_secs(self.beacon_interval_secs)
+    }
+
     fn beacon(&mut self, now: Millis, out: &mut Vec<Output<()>>) {
         let now_s = now.0 / 1000;
+        let window = self.live_window().max(SHARING_WINDOW_SECS);
         let mut heard: Vec<(Callsign, u64)> = self
             .heard
             .iter()
-            .filter(|(_, (at, _))| now_s.saturating_sub(*at) < 3600)
+            .filter(|(_, (at, _))| now_s.saturating_sub(*at) < window)
             .map(|(c, (at, _))| (*c, *at))
             .collect();
         heard.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
         let beacon = Beacon {
-            flags: FLAG_RELAY,
+            flags: FLAG_RELAY | if self.holding { FLAG_HOLDING } else { 0 },
             key: [7; 32],
             time: now_s as u32,
             locator: None,
@@ -142,77 +183,83 @@ impl Station {
         }
         .frame(&beacon.to_vec().unwrap())
         .unwrap();
+        let every = beacon_interval_ms(
+            BEACON_EVERY_MS,
+            self.sharing,
+            airtime_estimate(&self.radio, frame.len()),
+        );
+        self.beacon_interval_secs = every / 1000;
+        let jitter = every / 10;
+        self.next_beacon = Millis(now.0 + every - jitter + self.rng.below(2 * jitter + 1));
         self.transmit(now, Kind::Beacon, frame, out);
-    }
-
-    fn sync_frame(&self, dst: Dest, payload: &[u8]) -> Vec<u8> {
-        FrameHeader {
-            ftype: FrameType::Sync,
-            src: self.me,
-            dst,
-            session: 0,
-            index: 0,
-        }
-        .frame(payload)
-        .unwrap()
-    }
-
-    fn enqueue(&mut self, kind: Kind, frame: Vec<u8>) {
-        if self.queue.len() < SYNC_QUEUE {
-            self.queue.push_back((kind, frame));
-        } else {
-            self.dropped += 1;
-        }
-    }
-
-    /// The holdings filters the daemon sends a station it heard: mail held
-    /// for us, and relayable holdings.
-    fn filters(&mut self, to: Callsign, now_s: u64) {
-        let ids: Vec<ObjectId> = (0..STORED_OBJECTS)
-            .map(|i| {
-                ObjectId(
-                    *blake3::hash(&[self.me.to_bytes().as_slice(), &(i as u64).to_be_bytes()].concat())
-                        .as_bytes(),
-                )
-            })
-            .collect();
-        for scope in [0, 1] {
-            let filter = holdings_filter(scope, now_s as u32, &ids).unwrap();
-            let payload = SyncMessage::Filter(filter).encode().unwrap();
-            let frame = self.sync_frame(Dest::Station(to), &payload);
-            self.enqueue(Kind::Filter, frame);
-        }
     }
 
     fn tick(&mut self, now: Millis, out: &mut Vec<Output<()>>) {
         let now_s = now.0 / 1000;
+        let window = self.live_window().max(SHARING_WINDOW_SECS);
+        let sharing = self
+            .heard
+            .values()
+            .filter(|(at, _)| now_s.saturating_sub(*at) < window)
+            .count()
+            + 1;
+        if sharing != self.sharing {
+            self.sharing = sharing;
+            self.budget
+                .set_permyriad(control_share_permyriad(CONTROL_BUDGET_PERMYRIAD, sharing));
+        }
         if now >= self.next_beacon {
             self.beacon(now, out);
-            let jitter = BEACON_EVERY_MS / 10;
-            self.next_beacon = Millis(now.0 + BEACON_EVERY_MS - jitter + self.rng.below(2 * jitter + 1));
+        }
+        // Scheduled contacts: stable claims, on air.
+        for i in 0..self.schedules.len() {
+            if now_s % 3600 == 1 || now_s == 1 {
+                let advert = self.advert(self.schedules[i], ContactBearer::Radio, 0, 1, 7 * 24 * 3600);
+                self.trickle
+                    .observe(advert, now_s * 1000, AdvertSource::Own { on_air: true })
+                    .unwrap();
+            }
         }
         for i in 0..self.internet.len() {
             let (peer, at) = self.internet[i];
-            if now_s.saturating_sub(at) >= LIVE_READVERTISE_SECS {
-                let mut advert = self.advert(peer, ContactBearer::Internet, now_s);
+            if at == 0 || now_s.saturating_sub(at) >= LIVE_ADVERT_REFRESH_SECS {
+                let mut advert =
+                    self.advert(peer, ContactBearer::Internet, 1, now_s, LIVE_ADVERT_VALIDITY_SECS);
                 advert.origin = call(10_000 + i);
-                self.trickle.observe(advert, now_s * 1000).unwrap();
+                self.trickle
+                    .observe(advert, now_s * 1000, AdvertSource::Internet)
+                    .unwrap();
                 self.internet[i].1 = now_s;
             }
         }
         self.trickle.expire(now_s);
-        for advert in self.trickle.poll(now_s * 1000) {
-            let payload = SyncMessage::Contact(advert).encode().unwrap();
-            let frame = self.sync_frame(Dest::Broadcast, &payload);
-            self.enqueue(Kind::Contact, frame);
+        for due in self.trickle.poll(now_s * 1000) {
+            if due.on_air {
+                let payload = SyncMessage::Contact(due.advert).encode().unwrap();
+                self.queue.push(Dest::Broadcast, payload, now_s);
+            }
         }
-        while let Some((_, frame)) = self.queue.front() {
-            let estimate = self.radio.txdelay.0
-                + ((frame.len() as u64 + 24) * 8 * 1000).div_ceil(self.radio.bitrate_bps as u64);
-            if !self.budget.admit(now.0, estimate) {
+        while let Some(item) = self.queue.front(now_s) {
+            let frame = FrameHeader {
+                ftype: FrameType::Sync,
+                src: self.me,
+                dst: item.to,
+                session: 0,
+                index: 0,
+            }
+            .frame(&item.payload)
+            .unwrap();
+            if !self
+                .budget
+                .admit(now.0, airtime_estimate(&self.radio, frame.len()))
+            {
                 break;
             }
-            let (kind, frame) = self.queue.pop_front().unwrap();
+            let kind = match SyncMessage::decode(&item.payload) {
+                Ok(SyncMessage::Contact(_)) => Kind::Contact,
+                _ => Kind::Filter,
+            };
+            self.queue.pop();
             self.transmit(now, kind, frame, out);
         }
     }
@@ -236,25 +283,53 @@ impl Station {
                     *entry = (*entry).max(at);
                 }
                 if seen == Some(beacon.time)
-                    || now_s.saturating_sub(u64::from(beacon.time)) >= LIVE_BEACON_SECS
+                    || now_s.saturating_sub(u64::from(beacon.time)) >= self.live_window()
                 {
                     return;
                 }
-                let advertised = self.advertised_live.get(&header.src).copied().unwrap_or(0);
-                if now_s.saturating_sub(advertised) >= LIVE_READVERTISE_SECS || advertised == 0 {
-                    let advert = self.advert(header.src, ContactBearer::Radio, now_s);
-                    self.trickle.observe(advert, now_s * 1000).unwrap();
-                    self.advertised_live.insert(header.src, now_s);
+                // A live claim, as `claim_live`: internet only.
+                let claim = self.claims.get(&header.src).copied();
+                if claim.is_none_or(|(_, at)| now_s.saturating_sub(at) >= LIVE_ADVERT_REFRESH_SECS) {
+                    let since = match claim {
+                        Some((since, at)) if now_s.saturating_sub(at) < LIVE_ADVERT_VALIDITY_SECS => since,
+                        _ => now_s,
+                    };
+                    let advert = self.advert(
+                        header.src,
+                        ContactBearer::Radio,
+                        since,
+                        now_s,
+                        LIVE_ADVERT_VALIDITY_SECS,
+                    );
+                    self.trickle
+                        .observe(advert, now_s * 1000, AdvertSource::Own { on_air: false })
+                        .unwrap();
+                    self.claims.insert(header.src, (since, now_s));
                 }
-                let last = self.last_pairwise.get(&header.src).copied();
-                if last.is_none_or(|at| now_s.saturating_sub(at) >= PAIRWISE_SYNC_SECS) {
-                    self.filters(header.src, now_s);
-                    self.last_pairwise.insert(header.src, now_s);
+                let last = self.last_pull.get(&header.src).copied();
+                if radio_pull_due(beacon.flags, last, now_s) {
+                    let ids: Vec<ObjectId> = (0..STORED_OBJECTS)
+                        .map(|i| {
+                            ObjectId(
+                                *blake3::hash(
+                                    &[self.me.to_bytes().as_slice(), &(i as u64).to_be_bytes()].concat(),
+                                )
+                                .as_bytes(),
+                            )
+                        })
+                        .collect();
+                    for scope in [0, 1] {
+                        let filter = holdings_filter(scope, now_s as u32, &ids).unwrap();
+                        let payload = SyncMessage::Filter(filter).encode().unwrap();
+                        self.queue.push(Dest::Station(header.src), payload, now_s);
+                    }
+                    self.last_pull.insert(header.src, now_s);
                 }
             }
             FrameType::Sync => {
+                self.queue.heard(payload);
                 if let Ok(SyncMessage::Contact(advert)) = SyncMessage::decode(payload) {
-                    let _ = self.trickle.observe(advert, now_s * 1000);
+                    let _ = self.trickle.observe(advert, now_s * 1000, AdvertSource::Radio);
                 }
             }
             _ => {}
@@ -289,23 +364,26 @@ struct Load {
     channel_share: f64,
     collisions: u64,
     dropped: u64,
-    /// Live radio contacts of the other stations that each station holds
-    /// from CONTACT adverts, as a share of all of them.
-    known: f64,
+    /// Scheduled contacts of the other stations each station holds, as a
+    /// share of all of them.
+    schedules_known: f64,
     /// Radio links between stations each station knows of lately, from
-    /// beacons or adverts, as a share of all of them.
-    known_any: f64,
+    /// beacons, as a share of all of them.
+    links_known: f64,
+    beacon_interval_min: f64,
 }
 
-fn run(n: usize, radio: RadioParams, internet_adverts: usize, seed: u64) -> Load {
-    let warmup = Millis(60 * 60 * 1000);
-    let end = Millis(3 * 60 * 60 * 1000);
-    let mut sim: Sim<Station, (), ()> = Sim::new(seed, radio);
+fn run(n: usize, scenario: Scenario, seed: u64) -> Load {
+    let warmup = Millis(2 * 60 * 60 * 1000);
+    let end = Millis(6 * 60 * 60 * 1000);
+    let mut sim: Sim<Station, (), ()> = Sim::new(seed, scenario.radio);
     for i in 0..n {
         let rng = sim.machine_rng(i as u64);
-        let mut station = Station::new(call(i), radio, rng);
+        let mut station = Station::new(call(i), scenario, i % scenario.holding_every == 0, rng);
         if i == 0 {
-            station.internet = (0..internet_adverts).map(|j| (call(20_000 + j), 0)).collect();
+            station.internet = (0..scenario.internet_adverts)
+                .map(|j| (call(20_000 + j), 0))
+                .collect();
         }
         let id = sim.add_node(station);
         sim.set_csma(id, 0, Some(Csma::DEFAULT));
@@ -321,6 +399,8 @@ fn run(n: usize, radio: RadioParams, internet_adverts: usize, seed: u64) -> Load
     let after = sim.report().total();
     let span = (end.0 - warmup.0) as f64;
     let (mut beacon, mut contact, mut filter, mut dropped) = (0u64, 0u64, 0u64, 0u64);
+    let now_s = end.0 / 1000;
+    let (mut schedules_known, mut links_known, mut interval) = (0usize, 0usize, 0u64);
     for station in sim.machines() {
         for (at, kind, airtime) in &station.sent {
             if *at >= warmup.0 {
@@ -331,32 +411,24 @@ fn run(n: usize, radio: RadioParams, internet_adverts: usize, seed: u64) -> Load
                 }
             }
         }
-        dropped += station.dropped;
-    }
-    let now_s = end.0 / 1000;
-    let (mut known, mut known_any) = (0usize, 0usize);
-    for station in sim.machines() {
-        let from_adverts: std::collections::BTreeSet<_> = station
+        dropped += station.queue.dropped();
+        schedules_known += station
             .trickle
             .adverts()
             .filter(|a| {
-                a.bearer == ContactBearer::Radio && u64::from(a.end) > now_s && a.origin != station.me
+                a.origin != station.me && a.bearer == ContactBearer::Radio && u64::from(a.end) > now_s
             })
             .map(|a| (a.origin, a.peer))
-            .collect();
-        known += from_adverts.len();
-        let mut any: std::collections::BTreeSet<_> = station
+            .collect::<BTreeSet<_>>()
+            .len();
+        links_known += station
             .links
             .iter()
-            .filter(|(_, at)| now_s.saturating_sub(**at) < LIVE_BEACON_SECS)
-            .map(|(link, _)| *link)
-            .collect();
-        any.extend(from_adverts);
-        known_any += any.len();
+            .filter(|(_, at)| now_s.saturating_sub(**at) < station.live_window())
+            .count();
+        interval += station.beacon_interval_secs;
     }
-    // Each station can learn the contacts of the other n - 1 stations, to
-    // any of their n - 1 neighbours.
-    let possible = n * (n - 1) * (n - 1);
+    let schedules_possible = (n * (n - 1) * scenario.schedules).max(1);
     Load {
         beacon_share: beacon as f64 / span,
         contact_share: contact as f64 / span,
@@ -364,35 +436,106 @@ fn run(n: usize, radio: RadioParams, internet_adverts: usize, seed: u64) -> Load
         channel_share: (after.airtime_ms - before.airtime_ms) as f64 / span,
         collisions: after.lost_collision - before.lost_collision,
         dropped,
-        known: known as f64 / possible as f64,
-        known_any: known_any as f64 / (n * n * (n - 1)) as f64,
+        schedules_known: schedules_known as f64 / schedules_possible as f64,
+        links_known: links_known as f64 / (n * n * (n - 1)) as f64,
+        beacon_interval_min: interval as f64 / n as f64 / 60.0,
     }
 }
 
-fn table(radio: RadioParams, name: &str, internet_adverts: usize) {
-    println!("{name}, {internet_adverts} internet adverts at station 0:");
-    println!("   N  beacons  contacts  filters  channel  collisions  dropped  adverts  links");
+fn table(name: &str, scenario: Scenario) {
+    println!(
+        "{name}: 1 in {} stations holding, {} schedules each, {} internet adverts at station 0",
+        scenario.holding_every, scenario.schedules, scenario.internet_adverts
+    );
+    println!(
+        "   N  beacon every  beacons  contacts  filters  channel  collisions  dropped  schedules  links"
+    );
     for n in [5, 10, 20, 40] {
-        let l = run(n, radio, internet_adverts, 7);
+        let l = run(n, scenario, 7);
         println!(
-            "  {n:>2}  {:>6.1}%  {:>7.1}%  {:>6.1}%  {:>6.1}%  {:>10}  {:>7}  {:>6.0}%  {:>4.0}%",
+            "  {n:>2}  {:>8.0} min  {:>6.1}%  {:>7.1}%  {:>6.1}%  {:>6.1}%  {:>10}  {:>7}  {:>8.0}%  {:>4.0}%",
+            l.beacon_interval_min,
             100.0 * l.beacon_share,
             100.0 * l.contact_share,
             100.0 * l.filter_share,
             100.0 * l.channel_share,
             l.collisions,
             l.dropped,
-            100.0 * l.known,
-            100.0 * l.known_any
+            100.0 * l.schedules_known,
+            100.0 * l.links_known
         );
     }
 }
+
+const VHF: Scenario = Scenario {
+    radio: RadioParams::VHF_1200,
+    holding_every: 4,
+    schedules: 1,
+    internet_adverts: 0,
+};
 
 /// The table behind the control-plane numbers in the protocol assessment.
 #[test]
 #[ignore = "measurement: control-plane airtime by network size"]
 fn control_plane_load_by_network_size() {
-    table(RadioParams::VHF_1200, "VHF 1200 bd", 0);
-    table(RadioParams::HF_300, "HF 300 bd", 0);
-    table(RadioParams::VHF_1200, "VHF 1200 bd gateway", 50);
+    table("VHF 1200 bd", VHF);
+    table(
+        "HF 300 bd",
+        Scenario {
+            radio: RadioParams::HF_300,
+            ..VHF
+        },
+    );
+    table(
+        "VHF 1200 bd, every station holding",
+        Scenario {
+            holding_every: 1,
+            ..VHF
+        },
+    );
+    table(
+        "VHF 1200 bd gateway",
+        Scenario {
+            internet_adverts: 50,
+            ..VHF
+        },
+    );
+}
+
+/// However many stations share the channel, their control traffic together
+/// stays within the beacon and control budgets (2% each), and never goes out
+/// stale.
+#[test]
+fn control_traffic_stays_within_its_share_of_the_channel() {
+    for n in [10, 30] {
+        let l = run(
+            n,
+            Scenario {
+                holding_every: 1,
+                ..VHF
+            },
+            11,
+        );
+        assert!(
+            l.beacon_share < 0.025,
+            "{n} stations: beacons take {:.1}% of the channel",
+            100.0 * l.beacon_share
+        );
+        assert!(
+            l.contact_share + l.filter_share < 0.025,
+            "{n} stations: SYNC takes {:.1}% of the channel",
+            100.0 * (l.contact_share + l.filter_share)
+        );
+        assert!(
+            l.links_known > 0.4,
+            "{n} stations: links known {:.0}%",
+            100.0 * l.links_known
+        );
+        // The old policy spent up to 75% of the channel and taught nothing.
+        assert!(
+            l.schedules_known > 0.6,
+            "{n} stations: schedules known {:.0}%",
+            100.0 * l.schedules_known
+        );
+    }
 }

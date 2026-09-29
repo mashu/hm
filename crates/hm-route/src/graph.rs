@@ -615,6 +615,24 @@ impl ContactGraph {
         Ok(())
     }
 
+    /// How long a live contact seen in a beacon or on a link stays usable.
+    /// Follows the beacon interval, which grows on a busy channel.
+    pub fn set_live_contact_secs(&mut self, secs: u64) {
+        self.config.live_contact_secs = secs.max(1);
+    }
+
+    pub fn live_contact_secs(&self) -> u64 {
+        self.config.live_contact_secs
+    }
+
+    /// Stations whose latest beacon or advert carried every bit of `mask`.
+    pub fn stations_flagged(&self, mask: u8, now: u64) -> impl Iterator<Item = Callsign> + '_ {
+        self.node_flags
+            .iter()
+            .filter(move |(_, (flags, fresh_until))| *fresh_until > now && flags & mask == mask)
+            .map(|(station, _)| *station)
+    }
+
     pub fn flags(&self, station: Callsign, now: u64) -> Option<u8> {
         self.node_flags
             .get(&station)

@@ -12,13 +12,15 @@ use hm_route::{
     LiveContact, Route, RouteRequest, RoutingPolicy,
 };
 use hm_store::{Direction, ReclaimOutcome, Retry, Store};
-use hm_wire::{wrap_routed, Callsign, ObjectId, FLAG_INTERNET};
+use hm_wire::{wrap_routed, Callsign, ObjectId, FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY};
 use hm_xfer::{Failure, Receipt};
 
 use super::accept::{accept, Acceptance, AcceptanceGate};
 use super::arq;
 use super::choose::{Bearer, Chooser};
-use super::control::ControlPlane;
+use super::control::{
+    live_window_secs, radio_pull_due, ControlPlane, LIVE_ADVERT_REFRESH_SECS, LIVE_ADVERT_VALIDITY_SECS,
+};
 use super::heard;
 use super::internet::ensure_internet;
 use super::live::LiveConfig;
@@ -40,9 +42,59 @@ pub(crate) struct InFlight {
 
 pub(crate) type NetResult = (ObjectId, Callsign, Result<(), NetError>);
 
-/// A beacon heard this long ago no longer shows a live radio contact: a
-/// station beacons every 10 minutes by default, so two missed in a row.
-const LIVE_BEACON_SECS: u64 = 20 * 60;
+/// Check this often whether we hold anything others may pull (our beacons say so).
+const HOLDING_CHECK_SECS: u64 = 30;
+
+/// Our claim of a live contact: since when it has lasted, and when we last
+/// claimed it. Refreshes keep `since`, so peers see one contact whose
+/// validity grows, not a new contact every time.
+#[derive(Copy, Clone, Debug)]
+struct LiveClaim {
+    since: u64,
+    claimed_at: u64,
+}
+
+/// Claim (or refresh) our live contact to `peer` over `bearer`. Live claims
+/// go to the internet core only: on the radio, beacons already tell every
+/// station in reach who hears whom.
+#[allow(clippy::too_many_arguments)]
+fn claim_live(
+    cfg: &NodeConfig,
+    relay: &crate::config::RelaySettings,
+    control: &mut ControlPlane,
+    claims: &mut BTreeMap<(Callsign, RouteBearer), LiveClaim>,
+    peer: Callsign,
+    bearer: RouteBearer,
+    rate_bps: u32,
+    capacity_bytes: u64,
+    now: u64,
+) {
+    let key = (peer, bearer);
+    let claim = claims.get(&key).copied();
+    if claim.is_some_and(|c| now.saturating_sub(c.claimed_at) < LIVE_ADVERT_REFRESH_SECS) {
+        return;
+    }
+    // The same stretch of contact while our last claim of it is still valid.
+    let since = match claim {
+        Some(c) if now.saturating_sub(c.claimed_at) < LIVE_ADVERT_VALIDITY_SECS => c.since,
+        _ => now,
+    };
+    match live_advert(cfg, relay, peer, bearer, rate_bps, capacity_bytes, since, now) {
+        Ok(advert) => match control.observe_local(advert, now.saturating_mul(1_000), false) {
+            Ok(()) => {
+                claims.insert(
+                    key,
+                    LiveClaim {
+                        since,
+                        claimed_at: now,
+                    },
+                );
+            }
+            Err(error) => log(format!("ignored local CONTACT advert: {error}")),
+        },
+        Err(error) => log(format!("ignored local CONTACT advert: {error}")),
+    }
+}
 
 fn enqueue_custody_fail(
     store: &Store,
@@ -169,7 +221,7 @@ fn advertise_schedules(
     for (index, schedule) in cfg.schedules.iter().copied().enumerate() {
         match scheduled_advert(cfg, relay, schedule, base.wrapping_add(index as u32)) {
             Ok(Some(advert)) => {
-                if let Err(error) = control.observe_local(advert, now.saturating_mul(1_000)) {
+                if let Err(error) = control.observe_local(advert, now.saturating_mul(1_000), true) {
                     log(format!("ignored local CONTACT advert: {error}"));
                 }
             }
@@ -210,7 +262,7 @@ pub(crate) async fn coordinator(
         }
     }
     let startup = unix_now();
-    let mut control = ControlPlane::default();
+    let mut control = ControlPlane::for_station(cfg.me);
     // The flags our adverts carry, from the relay settings in use; when they
     // change while running, the schedules are advertised again.
     let mut advertised = advertised_flags(cfg.internet.is_some(), &live.get().relay);
@@ -241,7 +293,13 @@ pub(crate) async fn coordinator(
     let mut known_internet_links = BTreeSet::new();
     let mut last_pairwise_sync: BTreeMap<(Callsign, Bearer), u64> = BTreeMap::new();
     let mut last_sync_ignore: Option<(Callsign, u64)> = None;
-    let mut advertised_live: BTreeMap<(Callsign, RouteBearer), u64> = BTreeMap::new();
+    let mut advertised_live: BTreeMap<(Callsign, RouteBearer), LiveClaim> = BTreeMap::new();
+    // A beacon heard this long ago no longer shows a live radio contact. It
+    // follows our beacon interval, which grows as more stations share the channel.
+    let mut live_window = live_window_secs(live.get().beacon_secs);
+    graph.set_live_contact_secs(live_window);
+    let mut holding_sent: Option<bool> = None;
+    let mut next_holding_check = 0u64;
     // When the beacon of each station last taken into the contact graph was heard.
     let mut beacons_seen: BTreeMap<Callsign, u64> = BTreeMap::new();
     let (net_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<NetResult>();
@@ -362,7 +420,14 @@ pub(crate) async fn coordinator(
                 RadioEvt::Up => {
                     radio_up = true;
                     last_down = None;
+                    // A new radio session starts without our holding flag.
+                    holding_sent = None;
+                    next_holding_check = 0;
                     log("radio up");
+                }
+                RadioEvt::BeaconInterval(secs) => {
+                    live_window = live_window_secs(secs);
+                    graph.set_live_contact_secs(live_window);
                 }
                 RadioEvt::Down(why) => {
                     radio_up = false;
@@ -455,36 +520,23 @@ pub(crate) async fn coordinator(
                         // claim a live contact only while one was heard lately.
                         if beacon.key != heard::KeyCheck::Trusted
                             || beacons_seen.get(&station.call) == Some(&beacon.at)
-                            || now.saturating_sub(beacon.at) >= LIVE_BEACON_SECS
+                            || now.saturating_sub(beacon.at) >= live_window
                         {
                             continue;
                         }
                         beacons_seen.insert(station.call, beacon.at);
                         wake_for(store, station.call, "heard", now);
-                        let advert_key = (station.call, RouteBearer::Radio);
-                        let advertised_at = advertised_live.get(&advert_key).copied().unwrap_or(0);
-                        if now.saturating_sub(advertised_at) >= 10 * 60 {
-                            match live_advert(
-                                cfg,
-                                &live.get().relay,
-                                station.call,
-                                RouteBearer::Radio,
-                                rate,
-                                capacity,
-                                now,
-                            ) {
-                                Ok(advert) => {
-                                    if let Err(error) =
-                                        control.observe_local(advert, now.saturating_mul(1_000))
-                                    {
-                                        log(format!("ignored local CONTACT advert: {error}"));
-                                    } else {
-                                        advertised_live.insert(advert_key, now);
-                                    }
-                                }
-                                Err(error) => log(format!("ignored local CONTACT advert: {error}")),
-                            }
-                        }
+                        claim_live(
+                            cfg,
+                            &live.get().relay,
+                            &mut control,
+                            &mut advertised_live,
+                            station.call,
+                            RouteBearer::Radio,
+                            rate,
+                            capacity,
+                            now,
+                        );
                         if let Err(error) = graph.observe_beacon(BeaconObservation {
                             origin: station.call,
                             receiver: cfg.me,
@@ -496,9 +548,10 @@ pub(crate) async fn coordinator(
                         }) {
                             log(format!("ignored beacon contact from {}: {error}", station.call));
                         }
+                        // Pull only from a station whose beacon says it holds something.
                         let sync_key = (station.call, Bearer::Radio);
-                        let last = last_pairwise_sync.get(&sync_key).copied().unwrap_or(0);
-                        if now.saturating_sub(last) >= 5 * 60 {
+                        let last = last_pairwise_sync.get(&sync_key).copied();
+                        if radio_pull_due(beacon.flags, last, now) {
                             match control.filters(
                                 station.call,
                                 store,
@@ -759,7 +812,9 @@ pub(crate) async fn coordinator(
                             .max(schedule_base.wrapping_add(cfg.schedules.len().max(1) as u32));
                         advertise_schedules(cfg, &snapshot.relay, &mut control, schedule_base, now);
                         // Live contacts are claimed again at once, with the new flags.
-                        advertised_live.clear();
+                        for claim in advertised_live.values_mut() {
+                            claim.claimed_at = now.saturating_sub(LIVE_ADVERT_REFRESH_SECS);
+                        }
                     }
                 }
                 let now = unix_now();
@@ -780,30 +835,17 @@ pub(crate) async fn coordinator(
                             log(format!("ignored internet contact {from} -> {to}: {error}"));
                         }
                     }
-                    let advert_key = (*peer, RouteBearer::Internet);
-                    let advertised_at = advertised_live.get(&advert_key).copied().unwrap_or(0);
-                    if now.saturating_sub(advertised_at) >= 10 * 60 {
-                        match live_advert(
-                            cfg,
-                            &live.get().relay,
-                            *peer,
-                            RouteBearer::Internet,
-                            10_000_000,
-                            64 * 1024 * 1024,
-                            now,
-                        ) {
-                            Ok(advert) => {
-                                if let Err(error) =
-                                    control.observe_local(advert, now.saturating_mul(1_000))
-                                {
-                                    log(format!("ignored local CONTACT advert: {error}"));
-                                } else {
-                                    advertised_live.insert(advert_key, now);
-                                }
-                            }
-                            Err(error) => log(format!("ignored local CONTACT advert: {error}")),
-                        }
-                    }
+                    claim_live(
+                        cfg,
+                        &live.get().relay,
+                        &mut control,
+                        &mut advertised_live,
+                        *peer,
+                        RouteBearer::Internet,
+                        10_000_000,
+                        64 * 1024 * 1024,
+                        now,
+                    );
                     if !known_internet_links.contains(peer) {
                         graph.record_delivery(cfg.me, *peer, RouteBearer::Internet, true, now);
                         wake_for(store, *peer, "linked", now);
@@ -868,20 +910,32 @@ pub(crate) async fn coordinator(
                     }
                 }
                 known_internet_links = current_links;
+                let no_links = BTreeSet::new();
                 graph.prune(now);
                 match control.due_contacts(now.saturating_mul(1_000), now) {
-                    Ok(messages) => {
-                        for payload in messages {
+                    Ok(due) => {
+                        for contact in due {
                             broadcast_sync(
                                 net.as_ref(),
                                 &radio_cmd,
-                                radio_up,
-                                &known_internet_links,
-                                payload,
+                                radio_up && contact.on_air,
+                                if contact.internet { &known_internet_links } else { &no_links },
+                                contact.payload,
                             );
                         }
                     }
                     Err(error) => log(format!("could not encode CONTACT advert: {error}")),
+                }
+                if now >= next_holding_check {
+                    next_holding_check = now.saturating_add(HOLDING_CHECK_SECS);
+                    match store.holds_for_others(now) {
+                        Ok(holding) if holding_sent != Some(holding) => {
+                            let _ = radio_cmd.send(RadioCmd::Holding(holding));
+                            holding_sent = Some(holding);
+                        }
+                        Ok(_) => {}
+                        Err(error) => log(format!("store: {error}")),
+                    }
                 }
                 match store.suspect_due(now) {
                     Ok(suspects) => {
@@ -1190,6 +1244,41 @@ pub(crate) async fn coordinator(
                         ..RoutingPolicy::default()
                     };
                     let mut plan = plan_routes(&graph, &make_request(), policy);
+                    // No path to the destination is known. A station without
+                    // internet links hands it to a relaying internet gateway it
+                    // can reach (a default route): the gateway sees the
+                    // internet core and the radio areas behind other gateways.
+                    if plan.is_err() && known_internet_links.is_empty() {
+                        let mut best: Option<(f64, hm_route::RoutePlan)> = None;
+                        let gateways: Vec<Callsign> = graph
+                            .stations_flagged(FLAG_INTERNET, now)
+                            .filter(|gateway| {
+                                *gateway != cfg.me
+                                    && *gateway != destination
+                                    && !visited.contains(gateway)
+                                    && graph
+                                        .flags(*gateway, now)
+                                        .is_some_and(|flags| flags & (FLAG_RELAY | FLAG_MAILBOX) != 0)
+                            })
+                            .collect();
+                        for gateway in gateways {
+                            let request = RouteRequest {
+                                destination: gateway,
+                                ..make_request()
+                            };
+                            if let Ok(found) = plan_routes(&graph, &request, policy) {
+                                let score = found.combined_success_probability;
+                                if best.as_ref().is_none_or(|(b, _)| score > *b) {
+                                    best = Some((score, found));
+                                }
+                            }
+                        }
+                        if let Some((_, found)) = best {
+                            plan = Ok(found);
+                        }
+                    }
+                    // The destination may be in radio range, unheard: try it there
+                    // before the internet, which costs more.
                     if plan.is_err() && radio_up && rf_ok {
                         let rate = live.get().radio.bitrate;
                         let _ = graph.observe_live_link(LiveContact {

@@ -777,3 +777,39 @@ fn a_receipt_passing_through_closes_the_relay_holding_it_answers() {
     s.enqueue(id(2), b"own", destination, 0, 0).unwrap();
     assert!(!s.relay_receipted(id(2), id(8), destination, 120).unwrap());
 }
+
+#[test]
+fn a_station_holds_something_while_mail_waits_or_its_bulletins_live() {
+    let db = TempDb::new("holds");
+    let s = Store::open(&db.0).unwrap();
+    assert!(!s.holds_for_others(100).unwrap());
+    s.enqueue(id(1), b"mail", call("SO5KM"), 0, 100).unwrap();
+    assert!(s.holds_for_others(100).unwrap());
+    s.delivered(id(1), true, "radio", 110).unwrap();
+    assert!(!s.holds_for_others(110).unwrap());
+
+    let all = call("ALL");
+    s.enqueue_with(
+        id(2),
+        b"bulletin",
+        EnqueueOpts {
+            to: all,
+            precedence: 0,
+            now: 200,
+            wire_seq: None,
+            expires_at: Some(1_000),
+        },
+    )
+    .unwrap();
+    s.delivered(id(2), true, "radio", 210).unwrap();
+    assert!(s.holds_for_others(999).unwrap(), "a live bulletin can be pulled");
+    assert_eq!(s.holding_ids(call("M0AAA"), false, 999).unwrap(), vec![id(2)]);
+    assert!(!s.holds_for_others(1_000).unwrap(), "an expired one cannot");
+    assert!(s.holding_ids(call("M0AAA"), false, 1_000).unwrap().is_empty());
+
+    // Stored by an older version without its expiry: a day, as bulletins live.
+    s.enqueue(id(3), b"old bulletin", all, 0, 2_000).unwrap();
+    s.delivered(id(3), true, "radio", 2_010).unwrap();
+    assert!(s.holds_for_others(2_000 + 24 * 3600 - 1).unwrap());
+    assert!(!s.holds_for_others(2_000 + 24 * 3600).unwrap());
+}

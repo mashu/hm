@@ -9,7 +9,7 @@ use hm_store::Store;
 use hm_wire::{Callsign, ContactAdvert, ContactBearer, Dest, FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY};
 
 use super::choose::Bearer;
-use super::control::{sign_contact, ControlAction, ControlPlane};
+use super::control::{sign_contact, ControlAction, ControlPlane, LIVE_ADVERT_VALIDITY_SECS};
 use super::live::LiveConfig;
 use super::radio::RadioCmd;
 use super::types::{log, short, NodeConfig};
@@ -81,6 +81,8 @@ pub(crate) fn receive_sync(
         store,
         graph,
         live.get().relay.enabled || live.get().relay.mailbox,
+        // SYNC from the radio comes without an internet link.
+        net.is_none(),
         unix_now(),
     ) {
         Ok(actions) => actions,
@@ -158,6 +160,9 @@ pub(crate) fn scheduled_advert(
         .map_err(str::to_string)
 }
 
+/// Our signed claim of a live contact to `peer`, lasting since `since`:
+/// numbered by `now`, valid for [`LIVE_ADVERT_VALIDITY_SECS`] from now.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn live_advert(
     cfg: &NodeConfig,
     relay: &crate::config::RelaySettings,
@@ -165,16 +170,19 @@ pub(crate) fn live_advert(
     bearer: RouteBearer,
     rate_bps: u32,
     capacity_bytes: u64,
+    since: u64,
     now: u64,
 ) -> Result<ContactAdvert, String> {
-    let start = u32::try_from(now).map_err(|_| "contact start exceeds wire range")?;
-    let end = u32::try_from(now.saturating_add(20 * 60)).map_err(|_| "contact end exceeds wire range")?;
+    let start = u32::try_from(since).map_err(|_| "contact start exceeds wire range")?;
+    let sequence = u32::try_from(now).map_err(|_| "contact time exceeds wire range")?;
+    let end = u32::try_from(now.saturating_add(LIVE_ADVERT_VALIDITY_SECS))
+        .map_err(|_| "contact end exceeds wire range")?;
     let capacity_bytes = u32::try_from(capacity_bytes.min(u64::from(u32::MAX))).expect("bounded to u32");
     sign_contact(
         &cfg.key.identity,
         ContactAdvert {
             origin: cfg.me,
-            sequence: start,
+            sequence,
             start,
             end,
             peer,

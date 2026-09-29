@@ -1,6 +1,5 @@
 //! Radio bearer thread: KISS / built-in modem, transfer engine, beacons.
 
-use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -9,13 +8,16 @@ use std::time::{Duration, Instant};
 
 use hm_core::{DetRng, Input, Machine, Millis, Output};
 use hm_wire::{
-    Callsign, Dest, FrameHeader, FrameType, ObjectId, FEATURE_MAILBOX, FEATURE_RELAY, FLAG_INTERNET,
-    FLAG_MAILBOX, FLAG_RELAY,
+    Callsign, Dest, FrameHeader, FrameType, ObjectId, FEATURE_MAILBOX, FEATURE_RELAY, FLAG_HOLDING,
+    FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY,
 };
 use hm_xfer::beacon::{beacon_frame, read_beacon};
 use hm_xfer::{Command, Event, Failure, Receipt};
 
-use super::control::{ControlBudget, CONTROL_BUDGET_WINDOW_MS};
+use super::control::{
+    beacon_interval_ms, control_share_permyriad, live_window_secs, ControlBudget, SyncQueue,
+    CONTROL_BUDGET_WINDOW_MS, SYNC_QUEUE_FRAMES,
+};
 use super::heard;
 use super::live::LiveConfig;
 use super::types::{log, NodeConfig, RadioConfig, RadioLink};
@@ -47,6 +49,8 @@ pub(crate) enum RadioCmd {
         to: Dest,
         payload: Vec<u8>,
     },
+    /// Whether we hold bundles others may pull: our beacons say so.
+    Holding(bool),
 }
 
 pub(crate) enum RadioEvt {
@@ -74,6 +78,8 @@ pub(crate) enum RadioEvt {
         payload: Vec<u8>,
     },
     Heard(Vec<heard::Station>),
+    /// We now beacon every this many seconds (more stations, longer).
+    BeaconInterval(u64),
 }
 
 const RECONNECT: Duration = Duration::from_secs(5);
@@ -83,6 +89,8 @@ const RECONNECT: Duration = Duration::from_secs(5);
 const FIRST_BEACON_MS: (u64, u64) = (5_000, 30_000);
 /// Heard-table updates reach the status API at least this often.
 const HEARD_REPORT: Duration = Duration::from_secs(30);
+/// Stations heard within this long share the channel with us, at least.
+const SHARING_WINDOW_SECS: u64 = 3600;
 const MAX_WAIT: Duration = Duration::from_millis(200);
 
 /// How a radio session ended.
@@ -246,7 +254,13 @@ pub(crate) fn radio_session(
         .clamp(0.0, 10_000.0) as u16;
     let mut control_budget =
         ControlBudget::new(CONTROL_BUDGET_WINDOW_MS, control_permyriad).map_err(io::Error::other)?;
-    let mut sync_queue = VecDeque::<(Dest, Vec<u8>)>::new();
+    let mut sync_queue = SyncQueue::new(SYNC_QUEUE_FRAMES);
+    let mut holding = false;
+    // The stations sharing the channel (ourselves included) share its
+    // control and beacon budgets.
+    let mut sharing = 1usize;
+    let mut beacon_interval_secs = beacon_secs;
+    let _ = events.send(RadioEvt::BeaconInterval(beacon_interval_secs));
     loop {
         if live.version() != live_version {
             live_version = live.version();
@@ -274,8 +288,11 @@ pub(crate) fn radio_session(
                 control_permyriad = (relay.control_airtime_fraction * 10_000.0)
                     .round()
                     .clamp(0.0, 10_000.0) as u16;
-                control_budget = ControlBudget::new(CONTROL_BUDGET_WINDOW_MS, control_permyriad)
-                    .map_err(io::Error::other)?;
+                control_budget = ControlBudget::new(
+                    CONTROL_BUDGET_WINDOW_MS,
+                    control_share_permyriad(control_permyriad, sharing),
+                )
+                .map_err(io::Error::other)?;
             }
             x.set_trust(live.trust.iter());
             if live.beacon_secs != beacon_secs {
@@ -284,22 +301,39 @@ pub(crate) fn radio_session(
                 next_beacon = beacon_every(beacon_secs).map(|e| Instant::now() + e);
             }
         }
+        let window = live_window_secs(beacon_interval_secs).max(SHARING_WINDOW_SECS);
+        let now_sharing = heard.active(unix_now(), window) + 1;
+        if now_sharing != sharing {
+            sharing = now_sharing;
+            control_budget.set_permyriad(control_share_permyriad(control_permyriad, sharing));
+        }
         if let (Some(at), Some(every)) = (next_beacon, beacon_every(beacon_secs)) {
             if Instant::now() >= at {
                 let t = unix_now();
                 let locator = live.get().locator;
+                let beacon_flags = if holding { flags | FLAG_HOLDING } else { flags };
                 let frame = beacon_frame(
                     &cfg.key.identity,
                     cfg.me,
-                    flags,
+                    beacon_flags,
                     t as u32,
                     locator,
-                    heard.for_beacon(t),
+                    heard.for_beacon(t, live_window_secs(beacon_interval_secs)),
                 )
                 .map_err(|e| io::Error::other(format!("beacon: {e}")))?;
                 link.send(&frame)?;
-                let jitter = every.as_millis() as u64 / 10;
-                let ms = every.as_millis() as u64 - jitter + rng.below(2 * jitter + 1);
+                // Every station in reach beacons about this often: together
+                // they keep to the beacon share of the channel.
+                let airtime_ms = rc.timing.txdelay_ms.saturating_add(
+                    ((frame.len() as u64 + 24) * 8 * 1_000).div_ceil(u64::from(rc.timing.bitrate_bps)),
+                );
+                let every = beacon_interval_ms(every.as_millis() as u64, sharing, airtime_ms);
+                if every / 1_000 != beacon_interval_secs {
+                    beacon_interval_secs = every / 1_000;
+                    let _ = events.send(RadioEvt::BeaconInterval(beacon_interval_secs));
+                }
+                let jitter = every / 10;
+                let ms = every - jitter + rng.below(2 * jitter + 1);
                 next_beacon = Some(Instant::now() + Duration::from_millis(ms));
             }
         }
@@ -344,28 +378,26 @@ pub(crate) fn radio_session(
                     }),
                     &mut out,
                 ),
-                RadioCmd::Sync { to, payload } if sync_queue.len() < 64 => {
-                    sync_queue.push_back((to, payload));
-                }
-                RadioCmd::Sync { .. } => {}
+                RadioCmd::Sync { to, payload } => sync_queue.push(to, payload, unix_now()),
+                RadioCmd::Holding(now_holding) => holding = now_holding,
             }
         }
-        if let Some((to, payload)) = sync_queue.front() {
+        if let Some(item) = sync_queue.front(unix_now()) {
             let frame = FrameHeader {
                 ftype: FrameType::Sync,
                 src: cfg.me,
-                dst: *to,
+                dst: item.to,
                 session: 0,
                 index: 0,
             }
-            .frame(payload)
+            .frame(&item.payload)
             .map_err(|error| io::Error::other(error.to_string()))?;
             let airtime_ms = rc.timing.txdelay_ms.saturating_add(
                 ((frame.len() as u64 + 24) * 8 * 1_000).div_ceil(u64::from(rc.timing.bitrate_bps)),
             );
             if control_budget.admit(now().0, airtime_ms) {
                 link.send(&frame)?;
-                sync_queue.pop_front();
+                sync_queue.pop();
             }
         }
         for o in out.drain(..) {
@@ -433,6 +465,9 @@ pub(crate) fn radio_session(
                 if let Some(frame) = link.recv_timeout(wait)? {
                     heard_changed |= hear(&mut heard, &live.get().trust, cfg.me, &frame);
                     if let Ok((header, payload)) = FrameHeader::decode(&frame) {
+                        if header.ftype == FrameType::Sync && header.src != cfg.me {
+                            sync_queue.heard(payload);
+                        }
                         if header.ftype == FrameType::Sync
                             && (matches!(header.dst, Dest::Broadcast) || header.dst == Dest::Station(cfg.me))
                             && header.src != cfg.me

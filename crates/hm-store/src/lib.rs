@@ -30,6 +30,9 @@ const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const CONTACT_EVIDENCE: TableDefinition<[u8; 16], &[u8]> = TableDefinition::new("contact_evidence");
 /// Per-peer outbound chat sequence (callsign bytes → last assigned seq).
 const PEER_SEQ: TableDefinition<[u8; 6], u64> = TableDefinition::new("peer_seq");
+/// A bulletin stored without its expiry (by older versions) is offered for
+/// this long after it was queued: a bulletin's lifetime.
+const BULLETIN_FALLBACK_SECS: u64 = 24 * 3600;
 
 #[derive(Debug)]
 pub enum Error {
@@ -1289,6 +1292,32 @@ impl Store {
     }
 
     /// Active ids to advertise to `peer` during pairwise holdings sync.
+    /// Whether this station holds anything another may pull with holdings
+    /// SYNC: an outbound or relayed bundle still queued or in its shadow
+    /// period, or one of its own bulletins. Beacons say so ([`hm_wire::FLAG_HOLDING`]).
+    pub fn holds_for_others(&self, now: u64) -> Result<bool> {
+        let tx = self.read_tx()?;
+        let messages = tx.open_table(MESSAGES)?;
+        let bulletin_dest = Callsign::parse("ALL").expect("ALL is a valid callsign");
+        for entry in messages.iter()? {
+            let (_, bytes) = entry?;
+            let record = decode(bytes.value())?;
+            if record.expires_at.is_some_and(|expires| expires <= now)
+                || !matches!(record.direction, Direction::Out | Direction::Relay)
+            {
+                continue;
+            }
+            let bulletin = record.direction == Direction::Out
+                && record.final_destination() == bulletin_dest
+                && matches!(record.state, State::Queued | State::Delivered)
+                && (record.expires_at.is_some() || record.at.saturating_add(BULLETIN_FALLBACK_SECS) > now);
+            if bulletin || record.state == State::Queued || record.in_shadow(now) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn holding_ids(&self, peer: Callsign, relayable: bool, now: u64) -> Result<Vec<ObjectId>> {
         let tx = self.read_tx()?;
         let messages = tx.open_table(MESSAGES)?;
@@ -1305,7 +1334,8 @@ impl Store {
             }
             let bulletin = record.direction == Direction::Out
                 && record.final_destination() == bulletin_dest
-                && matches!(record.state, State::Queued | State::Delivered);
+                && matches!(record.state, State::Queued | State::Delivered)
+                && (record.expires_at.is_some() || record.at.saturating_add(BULLETIN_FALLBACK_SECS) > now);
             let shadowed = record.in_shadow(now);
             if !bulletin && record.state != State::Queued && !shadowed {
                 continue;
