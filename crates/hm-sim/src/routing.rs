@@ -22,9 +22,17 @@ const PROPHET_FORWARD_MARGIN: f64 = 0.05;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RoutingAlgorithm {
+    /// Contact graph routing given the whole contact plan in advance.
     BayesianCgr,
+    /// The same router knowing, as a station does, only the contacts open
+    /// now (heard, linked, or advertised while they last), not when closed
+    /// links will open again. Not in [`RoutingAlgorithm::comparison_set`]: it
+    /// measures what the plan is worth on links that open and close.
+    BayesianCgrLive,
     Epidemic,
-    SprayAndWait { copies: u8 },
+    SprayAndWait {
+        copies: u8,
+    },
     Prophet,
     Meed,
 }
@@ -169,7 +177,7 @@ pub fn run_routing(
     update_storage(&messages, &mut counters);
 
     for (contact_index, contact) in contacts {
-        model.observe_contact(contact, scenario.nodes);
+        model.observe_contact(contact, contact_index, scenario.nodes);
         let control_bytes = model.control_bytes(contact, &messages, scenario.nodes);
         counters.control_bytes = counters.control_bytes.saturating_add(control_bytes);
         counters.control_airtime_ms = counters.control_airtime_ms.saturating_add(airtime_ms(
@@ -341,8 +349,11 @@ impl Decision {
 enum Model {
     BayesianCgr {
         graph: Box<ContactGraph>,
-        contacts: Vec<ContactKey>,
+        /// Each scenario contact's key, once the graph knows it.
+        contacts: Vec<Option<ContactKey>>,
         advertised: BTreeSet<(NodeId, NodeId, Bearer)>,
+        /// Contacts become known only when they open.
+        live: bool,
     },
     Epidemic,
     SprayAndWait,
@@ -353,31 +364,21 @@ enum Model {
 impl Model {
     fn new(scenario: &RoutingScenario, algorithm: RoutingAlgorithm) -> Result<Self, RoutingSimError> {
         Ok(match algorithm {
-            RoutingAlgorithm::BayesianCgr => {
+            RoutingAlgorithm::BayesianCgr | RoutingAlgorithm::BayesianCgrLive => {
+                let live = algorithm == RoutingAlgorithm::BayesianCgrLive;
                 let mut graph = ContactGraph::new(GraphConfig::default())
                     .map_err(|error| RoutingSimError::Route(error.to_string()))?;
-                let mut contacts = Vec::with_capacity(scenario.contacts.len());
-                for contact in &scenario.contacts {
-                    contacts.push(
-                        graph
-                            .add_schedule(ScheduledContact {
-                                from: station(contact.from)?,
-                                to: station(contact.to)?,
-                                bearer: contact.bearer,
-                                start: contact.start,
-                                end: contact.end,
-                                rate_bps: contact.rate_bps,
-                                capacity_bytes: contact.capacity_bytes,
-                                success_permyriad: Some(contact.success_permyriad),
-                                flags: 0,
-                            })
-                            .map_err(|error| RoutingSimError::Route(error.to_string()))?,
-                    );
+                let mut contacts = vec![None; scenario.contacts.len()];
+                if !live {
+                    for (index, contact) in scenario.contacts.iter().enumerate() {
+                        contacts[index] = Some(add_contact(&mut graph, *contact)?);
+                    }
                 }
                 Self::BayesianCgr {
                     graph: Box::new(graph),
                     contacts,
                     advertised: BTreeSet::new(),
+                    live,
                 }
             }
             RoutingAlgorithm::Epidemic => Self::Epidemic,
@@ -387,10 +388,21 @@ impl Model {
         })
     }
 
-    fn observe_contact(&mut self, contact: ContactOpportunity, nodes: usize) {
+    fn observe_contact(&mut self, contact: ContactOpportunity, contact_index: usize, nodes: usize) {
         match self {
             Self::Prophet(state) => state.observe(contact, nodes),
             Self::Meed(state) => state.observe(contact),
+            Self::BayesianCgr {
+                graph,
+                contacts,
+                live: true,
+                ..
+            } => {
+                // Every station learns of the contact as it opens: more than
+                // a real station knows, which hears only its own and its
+                // neighbours' adverts.
+                contacts[contact_index] = add_contact(graph, contact).ok();
+            }
             _ => {}
         }
     }
@@ -464,7 +476,7 @@ impl Model {
                     urgent: message.bundle.urgent,
                 };
                 let plan = plan_routes(graph, &request, RoutingPolicy::default()).ok()?;
-                let current = *contacts.get(contact_index)?;
+                let current = (*contacts.get(contact_index)?)?;
                 if !plan
                     .active
                     .iter()
@@ -669,9 +681,12 @@ fn report(
         storage_high_water_objects: counters.storage_high_water_objects,
         latency_secs: Percentiles::of(&latencies),
         source_fairness,
-        calibration_brier: matches!(algorithm, RoutingAlgorithm::BayesianCgr)
-            .then_some(calibration_brier)
-            .flatten(),
+        calibration_brier: matches!(
+            algorithm,
+            RoutingAlgorithm::BayesianCgr | RoutingAlgorithm::BayesianCgrLive
+        )
+        .then_some(calibration_brier)
+        .flatten(),
     }
 }
 
@@ -698,6 +713,22 @@ fn source_fairness(nodes: usize, messages: &[MessageState]) -> f64 {
     } else {
         sum * sum / (ratios.len() as f64 * squares)
     }
+}
+
+fn add_contact(graph: &mut ContactGraph, contact: ContactOpportunity) -> Result<ContactKey, RoutingSimError> {
+    graph
+        .add_schedule(ScheduledContact {
+            from: station(contact.from)?,
+            to: station(contact.to)?,
+            bearer: contact.bearer,
+            start: contact.start,
+            end: contact.end,
+            rate_bps: contact.rate_bps,
+            capacity_bytes: contact.capacity_bytes,
+            success_permyriad: Some(contact.success_permyriad),
+            flags: 0,
+        })
+        .map_err(|error| RoutingSimError::Route(error.to_string()))
 }
 
 fn station(node: NodeId) -> Result<Callsign, RoutingSimError> {
@@ -812,6 +843,22 @@ mod tests {
         let active_copy_bound =
             line().bundles.len() + line().bundles.iter().filter(|bundle| bundle.urgent).count();
         assert!(cgr.storage_high_water_objects <= active_copy_bound);
+    }
+
+    #[test]
+    fn live_cgr_knows_only_open_contacts() {
+        // On the line each hop opens as the one before it closes: a message
+        // must wait at each station for the next link.
+        let planned = run_routing(&line(), RoutingAlgorithm::BayesianCgr).unwrap();
+        let live = run_routing(&line(), RoutingAlgorithm::BayesianCgrLive).unwrap();
+        assert_eq!(planned.delivered, planned.generated);
+        assert_eq!(live.delivered, 0);
+        assert_eq!(live.payload_transmissions, 0);
+        // With a link straight to the destination it knows enough.
+        let mut direct = line();
+        direct.contacts.push(contact(15, 0, 3));
+        let live = run_routing(&direct, RoutingAlgorithm::BayesianCgrLive).unwrap();
+        assert!(live.delivered > 0);
     }
 
     #[test]
