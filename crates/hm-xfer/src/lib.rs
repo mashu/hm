@@ -146,8 +146,16 @@ pub fn broadcast_peer() -> Callsign {
 
 /// Assumed frame loss when sizing a one-shot broadcast over, per mille.
 const BROADCAST_LOSS_PERMILLE: u32 = 300;
-/// Most overs a broadcast publish may take before local completion.
+/// Most overs a broadcast publish may take before it listens for repair requests.
 const BROADCAST_MAX_ROUNDS: u8 = 2;
+/// A listener missing symbols of a broadcast waits a random part of this many
+/// ACK airtimes before asking, so that one request, heard by the others,
+/// stands for them all.
+const NACK_SPREAD_ACKS: u64 = 3;
+/// Requests for at least as much, heard from other listeners, before a
+/// listener keeps its own to itself: one heard request may itself have been
+/// lost on the way to the broadcaster.
+const NACK_SUPPRESS_AFTER: u8 = 2;
 
 /// The statement a receiver signs to prove it holds object `id`.
 pub fn receipt_statement(receiver: Callsign, sender: Callsign, session: u16, id: &ObjectId) -> Vec<u8> {
@@ -224,6 +232,9 @@ pub struct Config {
     pub features: u32,
     /// A busy receiver asks senders to come back after this many seconds.
     pub busy_retry_secs: u16,
+    /// Repair overs a broadcast may send after its first, when listeners ask
+    /// for more (0: publish once and forget, as before repair existed).
+    pub broadcast_repairs: u8,
 }
 
 impl Config {
@@ -253,6 +264,7 @@ impl Config {
             sessions: true,
             features: 0,
             busy_retry_secs: 60,
+            broadcast_repairs: 3,
         }
     }
 
@@ -443,8 +455,18 @@ struct Outgoing {
     sent_last_round: u32,
     /// The last over carried an OPEN, so the answer may carry one too.
     opened: bool,
-    /// RF bulletin publish: no ACK wait.
+    /// RF bulletin publish: no ACK; listeners may ask for repair.
     broadcast: bool,
+    /// Broadcast: repair overs sent, and the most symbols a listener asked
+    /// for since the last over.
+    repairs: u8,
+    asked: u32,
+    /// Broadcast: repair windows in a row that brought no request. Two
+    /// requests sent at once collide unheard, so one quiet window is not
+    /// proof that nobody is missing anything.
+    quiet_windows: u8,
+    /// Broadcast: nothing more to send; report it done.
+    finished: bool,
     /// How long to wait for the ACK once our last over has left the air: the
     /// peer's guard and answer, our slack and a random part.
     ack_wait: Millis,
@@ -465,8 +487,13 @@ struct Incoming {
     receipt: Option<[u8; 64]>,
     ack_at: Option<Millis>,
     last_heard: Millis,
-    /// Heard on `Dest::Broadcast`: store locally, never ACK.
+    /// Heard on `Dest::Broadcast`: store locally, never ACK; ask for repair.
     broadcast: bool,
+    /// Other listeners' repair requests heard since the last over that ask
+    /// for at least as much as ours would.
+    covering_nacks: u8,
+    /// Repair requests we may still repeat if no repair follows ours.
+    nack_retries: u8,
 }
 
 impl Incoming {
@@ -485,6 +512,8 @@ impl Incoming {
             ack_at: None,
             last_heard: now,
             broadcast,
+            covering_nacks: 0,
+            nack_retries: 0,
         }
     }
 
@@ -826,6 +855,10 @@ impl Xfer {
             sent_last_round: 0,
             opened: false,
             broadcast: p.broadcast,
+            repairs: 0,
+            asked: 0,
+            quiet_windows: 0,
+            finished: false,
             ack_wait: Millis::ZERO,
             state: OutState::Ready { at: now },
         });
@@ -851,7 +884,7 @@ impl Xfer {
     }
 
     fn receiving(&self) -> bool {
-        self.incoming.values().any(|i| i.ack_at.is_some())
+        self.incoming.values().any(|i| i.ack_at.is_some() && !i.broadcast)
     }
 
     /// One of our overs is waiting for its ACK: nothing else goes out, since
@@ -889,7 +922,7 @@ impl Xfer {
             let due = matches!(o.state, OutState::Ready { at } if at <= now);
             let done = due
                 && if o.broadcast {
-                    o.rounds >= BROADCAST_MAX_ROUNDS
+                    o.finished
                 } else {
                     o.stalls >= max_rounds
                 };
@@ -1032,9 +1065,20 @@ impl Xfer {
             };
             return true;
         }
-        // One-shot publish: no ACK. Finish when enough source symbols went
-        // out or the round cap is reached.
-        if o.next_esi >= o.k || o.rounds >= BROADCAST_MAX_ROUNDS {
+        // A broadcast has no ACK. Once enough source symbols went out (or the
+        // round cap is reached) it listens for listeners asking for more, and
+        // answers with fresh symbols: any new symbol helps every listener.
+        if o.next_esi < o.k && o.rounds < BROADCAST_MAX_ROUNDS {
+            o.state = OutState::Ready { at: now + cost };
+        } else if o.repairs < self.cfg.broadcast_repairs {
+            let repair_wait = self.repair_wait();
+            let o = &mut self.active[i];
+            o.asked = 0;
+            o.ack_wait = repair_wait;
+            o.state = OutState::Waiting {
+                until: now + cost + repair_wait,
+            };
+        } else {
             let o = self.active.remove(i);
             out.push(Output::Event(Event::Delivered {
                 to: o.to,
@@ -1043,8 +1087,6 @@ impl Xfer {
                 receipt: Receipt::Unverified,
             }));
             self.pump(now, out);
-        } else {
-            o.state = OutState::Ready { at: now + cost };
         }
         true
     }
@@ -1058,6 +1100,20 @@ impl Xfer {
         out: &mut Vec<Output<Event>>,
     ) {
         let Ok(ack) = Ack::decode(payload) else { return };
+        // A listener asking for more of our broadcast (a NACK).
+        if let Some(o) = self
+            .active
+            .iter_mut()
+            .find(|o| o.broadcast && o.session == session)
+        {
+            let need = if ack.need == NEED_OFFER {
+                1
+            } else {
+                u32::from(ack.need)
+            };
+            o.asked = o.asked.max(need);
+            return;
+        }
         let Some(i) = self
             .active
             .iter()
@@ -1129,6 +1185,30 @@ impl Xfer {
             if now < until {
                 continue;
             }
+            if self.active[i].broadcast {
+                // The repair window closed: answer the largest request, or finish.
+                let repairs = self.cfg.broadcast_repairs;
+                let repair_wait = self.repair_wait();
+                let o = &mut self.active[i];
+                if o.asked > 0 && o.repairs < repairs {
+                    o.repairs += 1;
+                    o.need = o.asked;
+                    o.offer_next = true;
+                    o.quiet_windows = 0;
+                    o.state = OutState::Ready { at: now };
+                } else if o.asked == 0 && o.quiet_windows == 0 && o.repairs < repairs {
+                    // Listen once more: a request may have been lost in a collision.
+                    o.quiet_windows = 1;
+                    o.state = OutState::Waiting {
+                        until: now + repair_wait,
+                    };
+                } else {
+                    o.finished = true;
+                    o.state = OutState::Ready { at: now };
+                }
+                o.asked = 0;
+                continue;
+            }
             let to = self.active[i].to;
             let halved = (self.window(to) / 2).max(MIN_WINDOW);
             self.window.insert(to, halved);
@@ -1164,11 +1244,69 @@ impl Xfer {
         now + self.cfg.air(remaining, self.cfg.data_frame_len(symbol_size)) + self.cfg.ack_guard
     }
 
+    /// When to ask for more of an unfinished broadcast: after the over, at a
+    /// random moment, so the first request heard silences the others. None
+    /// when this station does not ask for repairs.
+    fn nack_at(&mut self, now: Millis, remaining: u8, symbol_size: usize) -> Option<Millis> {
+        if self.cfg.broadcast_repairs == 0 {
+            return None;
+        }
+        let spread = self.ack_air().0 * NACK_SPREAD_ACKS;
+        Some(self.ack_at(now, remaining, symbol_size) + Millis(self.rng.below(spread + 1)))
+    }
+
+    /// Symbols an unfinished broadcast still lacks, as a repair request says.
+    fn broadcast_need(inc: &Incoming) -> u32 {
+        let have = inc.esis.len() as u32;
+        if have < inc.k {
+            inc.k - have
+        } else {
+            1
+        }
+    }
+
+    /// Another listener asked the broadcaster `to` for more of `session`: if
+    /// it asked for at least as much as we would, the answer covers us too.
+    fn overhear_nack(&mut self, to: Callsign, session: u16, payload: &[u8]) {
+        let Ok(ack) = Ack::decode(payload) else { return };
+        let Some(inc) = self.incoming.get_mut(&(to, session)) else {
+            return;
+        };
+        if !inc.broadcast || inc.done || inc.ack_at.is_none() {
+            return;
+        }
+        let asked = if ack.need == NEED_OFFER {
+            1
+        } else {
+            u32::from(ack.need)
+        };
+        if asked >= Self::broadcast_need(inc) {
+            inc.covering_nacks = inc.covering_nacks.saturating_add(1);
+            if inc.covering_nacks >= NACK_SUPPRESS_AFTER {
+                inc.ack_at = None;
+            }
+        }
+    }
+
     /// We answer once every over we are hearing has ended, so an ACK never
     /// talks over another station's over.
     fn answer_at(&self) -> Option<Millis> {
-        let acks = self.incoming.values().filter_map(|i| i.ack_at);
+        let acks = self
+            .incoming
+            .values()
+            .filter(|i| !i.broadcast)
+            .filter_map(|i| i.ack_at);
         acks.chain(self.closes.values().map(|(_, at)| *at)).max()
+    }
+
+    /// The next moment we ask a broadcaster for more (independent of our
+    /// answers to unicast senders, which must not wait for it).
+    fn nack_due(&self) -> Option<Millis> {
+        self.incoming
+            .values()
+            .filter(|i| i.broadcast)
+            .filter_map(|i| i.ack_at)
+            .min()
     }
 
     /// Whether a new transfer from `sender` would have to push out work in
@@ -1286,7 +1424,12 @@ impl Xfer {
         let already = self.seen.contains_key(&id);
         let receipt = self.sign_receipt(key, &id);
         let ack_at = if broadcast {
-            None
+            let done = already || self.incoming.get(&key).is_some_and(|i| i.done);
+            if done {
+                None
+            } else {
+                self.nack_at(now, offer.remaining, offer.symbol_size as usize)
+            }
         } else {
             Some(self.ack_at(now, offer.remaining, t as usize))
         };
@@ -1340,7 +1483,11 @@ impl Xfer {
             return;
         }
         let ack_at = if broadcast {
-            None
+            if self.incoming.get(&key).is_some_and(|i| i.done) {
+                None
+            } else {
+                self.nack_at(now, pre.remaining, t as usize)
+            }
         } else {
             Some(self.ack_at(now, pre.remaining, t as usize))
         };
@@ -1348,6 +1495,9 @@ impl Xfer {
         inc.last_heard = now;
         if broadcast {
             inc.broadcast = true;
+            // A new over: requests heard after it are counted afresh.
+            inc.covering_nacks = 0;
+            inc.nack_retries = 1;
         }
         inc.ack_at = ack_at;
         if inc.done || inc.awaiting_application || inc.decoded.is_some() || !inc.esis.insert(esi) {
@@ -1458,6 +1608,33 @@ impl Xfer {
     }
 
     fn send_due_acks(&mut self, now: Millis, out: &mut Vec<Output<Event>>) {
+        let repair_wait = self.repair_wait();
+        let nacks: Vec<(Callsign, u16)> = self
+            .incoming
+            .iter()
+            .filter(|(_, i)| i.broadcast && i.ack_at.is_some_and(|at| at <= now))
+            .map(|(k, _)| *k)
+            .collect();
+        for key in nacks {
+            let inc = self.incoming.get_mut(&key).expect("collected above");
+            inc.ack_at = None;
+            if inc.done {
+                continue;
+            }
+            let need = Self::broadcast_need(inc);
+            // If no repair follows, ask once more a window later.
+            if inc.nack_retries > 0 {
+                inc.nack_retries -= 1;
+                inc.ack_at = Some(now + repair_wait);
+            }
+            let ack = Ack {
+                need: need.min(NEED_OFFER as u32 - 1) as u16,
+                ..Ack::default()
+            };
+            let payload = ack.to_vec().expect("fields in range");
+            let f = self.frame(FrameType::Ack, key.0, key.1, 0, &payload, false);
+            self.transmit(f, out);
+        }
         if self.answer_at().is_none_or(|t| t > now) {
             return;
         }
@@ -1467,6 +1644,7 @@ impl Xfer {
             .filter(|(_, i)| i.ack_at.is_some() && !i.broadcast)
             .map(|(k, _)| *k)
             .collect();
+
         let closes: Vec<((Callsign, u16), Close)> = core::mem::take(&mut self.closes)
             .into_iter()
             .map(|(k, (c, _))| (k, c))
@@ -1615,6 +1793,13 @@ impl Xfer {
         }));
     }
 
+    /// How long a broadcaster listens for repair requests after an over: the
+    /// listeners' guard, the spread of their moments, one request, our slack.
+    fn repair_wait(&self) -> Millis {
+        let ack_air = self.ack_air();
+        self.cfg.ack_guard + Millis(ack_air.0 * NACK_SPREAD_ACKS) + ack_air + self.cfg.ack_guard
+    }
+
     /// Airtime of an OPEN frame.
     fn open_air(&self) -> Millis {
         self.cfg.air(1, HEADER_LEN + OPEN_LEN)
@@ -1635,6 +1820,11 @@ impl Xfer {
         self.hear_traffic(now, &h, payload);
         let for_me = h.dst == Dest::Station(self.cfg.me);
         let broadcast = h.dst == Dest::Broadcast;
+        if let (FrameType::Ack, Dest::Station(to)) = (h.ftype, h.dst) {
+            if !for_me {
+                self.overhear_nack(to, h.session, payload);
+            }
+        }
         if !for_me && !broadcast {
             return;
         }
@@ -1701,6 +1891,9 @@ impl Machine for Xfer {
         let mut take = |t: Millis| d = Some(d.map_or(t, |x| x.min(t)));
         let receiving = self.receiving();
         if let Some(t) = self.answer_at() {
+            take(t);
+        }
+        if let Some(t) = self.nack_due() {
             take(t);
         }
         for i in self.incoming.values() {
