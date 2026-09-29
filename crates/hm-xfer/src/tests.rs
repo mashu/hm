@@ -1,5 +1,6 @@
 use super::*;
 use alloc::vec;
+use hm_wire::{Ack, CloseReason, DataPreamble, DATA_PREAMBLE_LEN, HEADER_LEN, NEED_OFFER};
 
 fn call(s: &str) -> Callsign {
     Callsign::parse(s).unwrap()
