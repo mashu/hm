@@ -40,6 +40,10 @@ pub(crate) struct InFlight {
 
 pub(crate) type NetResult = (ObjectId, Callsign, Result<(), NetError>);
 
+/// A beacon heard this long ago no longer shows a live radio contact: a
+/// station beacons every 10 minutes by default, so two missed in a row.
+const LIVE_BEACON_SECS: u64 = 20 * 60;
+
 fn enqueue_custody_fail(
     store: &Store,
     me: Callsign,
@@ -205,6 +209,8 @@ pub(crate) async fn coordinator(
     let mut last_pairwise_sync: BTreeMap<(Callsign, Bearer), u64> = BTreeMap::new();
     let mut last_sync_ignore: Option<(Callsign, u64)> = None;
     let mut advertised_live: BTreeMap<(Callsign, RouteBearer), u64> = BTreeMap::new();
+    // When the beacon of each station last taken into the contact graph was heard.
+    let mut beacons_seen: BTreeMap<Callsign, u64> = BTreeMap::new();
     let (net_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<NetResult>();
     let (modem_tx, mut modem_rx) =
         tokio::sync::mpsc::unbounded_channel::<(ObjectId, Callsign, Result<(), String>)>();
@@ -222,10 +228,7 @@ pub(crate) async fn coordinator(
         match outcome {
             Ok(()) => {
                 chooser.record(peer, bearer, true, now);
-                let (key, evidence) = graph.record_delivery(cfg.me, peer, route_bearer(bearer), true, now);
-                if let Err(error) = store.save_contact_evidence(key, evidence) {
-                    log(format!("store: {error}"));
-                }
+                graph.record_delivery(cfg.me, peer, route_bearer(bearer), true, now);
                 if let Some(first) = flight.route.hops.first() {
                     if let Err(error) = graph.consume(first.contact, flight.object_bytes) {
                         log(format!("route capacity: {error}"));
@@ -259,10 +262,7 @@ pub(crate) async fn coordinator(
             }
             Err((reason, permanent)) => {
                 chooser.record(peer, bearer, false, now);
-                let (key, evidence) = graph.record_delivery(cfg.me, peer, route_bearer(bearer), false, now);
-                if let Err(error) = store.save_contact_evidence(key, evidence) {
-                    log(format!("store: {error}"));
-                }
+                graph.record_delivery(cfg.me, peer, route_bearer(bearer), false, now);
                 for hop in &flight.route.hops {
                     let _ = graph.release(hop.contact, flight.object_bytes);
                 }
@@ -409,9 +409,16 @@ pub(crate) async fn coordinator(
                         let Some(beacon) = &station.beacon else {
                             continue;
                         };
-                        if beacon.key != heard::KeyCheck::Trusted {
+                        // The table lists each station's latest beacon for a day, and
+                        // comes again every half minute: take each beacon once, and
+                        // claim a live contact only while one was heard lately.
+                        if beacon.key != heard::KeyCheck::Trusted
+                            || beacons_seen.get(&station.call) == Some(&beacon.at)
+                            || now.saturating_sub(beacon.at) >= LIVE_BEACON_SECS
+                        {
                             continue;
                         }
+                        beacons_seen.insert(station.call, beacon.at);
                         let advert_key = (station.call, RouteBearer::Radio);
                         let advertised_at = advertised_live.get(&advert_key).copied().unwrap_or(0);
                         if now.saturating_sub(advertised_at) >= 10 * 60 {
@@ -443,7 +450,7 @@ pub(crate) async fn coordinator(
                             rate_bps: rate,
                             capacity_bytes: capacity,
                             flags: beacon.flags,
-                            observed_at: now,
+                            observed_at: beacon.at,
                         }) {
                             log(format!("ignored beacon contact from {}: {error}", station.call));
                         }
@@ -470,12 +477,6 @@ pub(crate) async fn coordinator(
                                 }
                                 Err(error) => log(format!("could not SYNC with {}: {error}", station.call)),
                             }
-                        }
-                    }
-                    for (key, evidence) in graph.evidence() {
-                        if let Err(error) = store.save_contact_evidence(key, evidence) {
-                            log(format!("store: {error}"));
-                            break;
                         }
                     }
                     status.lock().expect("lock").heard = list;
@@ -580,11 +581,7 @@ pub(crate) async fn coordinator(
                         match result {
                             Ok(()) => {
                                 chooser.record(peer, flight.bearer, true, now);
-                                let (key, evidence) =
-                                    graph.record_delivery(cfg.me, peer, route_bearer(flight.bearer), true, now);
-                                if let Err(error) = store.save_contact_evidence(key, evidence) {
-                                    log(format!("store: {error}"));
-                                }
+                                graph.record_delivery(cfg.me, peer, route_bearer(flight.bearer), true, now);
                                 match store.delivered(id, false, "internet", now) {
                                     Ok(()) => log(format!(
                                         "published bulletin {} to {peer} over the internet",
@@ -595,11 +592,7 @@ pub(crate) async fn coordinator(
                             }
                             Err(e) => {
                                 chooser.record(peer, flight.bearer, false, now);
-                                let (key, evidence) =
-                                    graph.record_delivery(cfg.me, peer, route_bearer(flight.bearer), false, now);
-                                if let Err(error) = store.save_contact_evidence(key, evidence) {
-                                    log(format!("store: {error}"));
-                                }
+                                graph.record_delivery(cfg.me, peer, route_bearer(flight.bearer), false, now);
                                 let reason = match e {
                                     NetError::Busy {
                                         retry_after,
@@ -689,6 +682,13 @@ pub(crate) async fn coordinator(
                     Some(Err(e)) => log(format!("settings file not applied, keeping the settings in use: {e}")),
                     None => {}
                 }
+                // Link evidence changed since the last tick, in one transaction.
+                let changed = graph.take_changed_evidence();
+                if !changed.is_empty() {
+                    if let Err(error) = store.save_contact_evidence_batch(&changed) {
+                        log(format!("store: {error}"));
+                    }
+                }
                 if live.version() != live_version {
                     live_version = live.version();
                     notify.send("settings");
@@ -763,11 +763,7 @@ pub(crate) async fn coordinator(
                         }
                     }
                     if !known_internet_links.contains(peer) {
-                        let (key, evidence) =
-                            graph.record_delivery(cfg.me, *peer, RouteBearer::Internet, true, now);
-                        if let Err(error) = store.save_contact_evidence(key, evidence) {
-                            log(format!("store: {error}"));
-                        }
+                        graph.record_delivery(cfg.me, *peer, RouteBearer::Internet, true, now);
                         match control.contact_messages() {
                             Ok(messages) => {
                                 for payload in messages {

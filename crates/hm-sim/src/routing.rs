@@ -340,7 +340,7 @@ impl Decision {
 
 enum Model {
     BayesianCgr {
-        graph: ContactGraph,
+        graph: Box<ContactGraph>,
         contacts: Vec<ContactKey>,
         advertised: BTreeSet<(NodeId, NodeId, Bearer)>,
     },
@@ -375,7 +375,7 @@ impl Model {
                     );
                 }
                 Self::BayesianCgr {
-                    graph,
+                    graph: Box::new(graph),
                     contacts,
                     advertised: BTreeSet::new(),
                 }

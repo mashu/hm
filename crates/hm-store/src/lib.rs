@@ -1253,18 +1253,27 @@ impl Store {
     }
 
     pub fn save_contact_evidence(&self, key: EdgeKey, evidence: Evidence) -> Result<()> {
-        if !evidence.successes.is_finite()
-            || !evidence.failures.is_finite()
-            || evidence.successes < 0.0
-            || evidence.failures < 0.0
-            || key.utc_hour.is_some_and(|hour| hour > 23)
-        {
-            return Err(Error::Corrupt("invalid contact evidence".into()));
+        self.save_contact_evidence_batch(&[(key, evidence)])
+    }
+
+    /// Save several links' evidence in one transaction.
+    pub fn save_contact_evidence_batch(&self, entries: &[(EdgeKey, Evidence)]) -> Result<()> {
+        for (key, evidence) in entries {
+            if !evidence.successes.is_finite()
+                || !evidence.failures.is_finite()
+                || evidence.successes < 0.0
+                || evidence.failures < 0.0
+                || key.utc_hour.is_some_and(|hour| hour > 23)
+            {
+                return Err(Error::Corrupt("invalid contact evidence".into()));
+            }
         }
         let tx = self.write_tx()?;
         {
-            tx.open_table(CONTACT_EVIDENCE)?
-                .insert(evidence_key(key), evidence_value(evidence).as_slice())?;
+            let mut table = tx.open_table(CONTACT_EVIDENCE)?;
+            for (key, evidence) in entries {
+                table.insert(evidence_key(*key), evidence_value(*evidence).as_slice())?;
+            }
         }
         tx.commit()?;
         Ok(())
