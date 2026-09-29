@@ -1001,6 +1001,11 @@ pub(crate) async fn coordinator(
                     }
                     Err(error) => log(format!("store: {error}")),
                 }
+                // Cooldowns that ran out: a message sent or given up on leaves none.
+                failed_contacts.retain(|_, contacts| {
+                    contacts.retain(|_, until| *until > now);
+                    !contacts.is_empty()
+                });
                 let due = match store.due(now) {
                     Ok(d) => d,
                     Err(e) => {
@@ -1207,9 +1212,9 @@ pub(crate) async fn coordinator(
                         });
                     }
                     let mut excluded: Vec<ContactKey> = failed_contacts
-                        .entry(r.id)
-                        .or_default()
-                        .iter()
+                        .get(&r.id)
+                        .into_iter()
+                        .flatten()
                         .filter_map(|(contact, until)| (*until > now).then_some(*contact))
                         .collect();
                     excluded.extend(
