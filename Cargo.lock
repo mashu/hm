@@ -722,6 +722,7 @@ dependencies = [
  "hm-net",
  "hm-rig",
  "hm-route",
+ "hm-sim",
  "hm-store",
  "hm-wire",
  "hm-xfer",

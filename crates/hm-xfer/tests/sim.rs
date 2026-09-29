@@ -539,6 +539,16 @@ fn a_silent_station_does_not_hold_up_the_others() {
 /// One 2 kB transfer on a 300 bd HF path fading at `spread` Hz around
 /// `snr_db`, with `cfg` at both ends: (delivered, latency, airtime of both).
 fn hf_run(seed: u64, cfg: &dyn Fn(&str) -> Config, snr_db: f64, spread: f64) -> (bool, Millis, Millis) {
+    hf_run_len(seed, 2000, cfg, snr_db, spread)
+}
+
+fn hf_run_len(
+    seed: u64,
+    len: usize,
+    cfg: &dyn Fn(&str) -> Config,
+    snr_db: f64,
+    spread: f64,
+) -> (bool, Millis, Millis) {
     let mut sim = XferSim::new(seed, RadioParams::HF_300);
     let [ra, rb] = [sim.machine_rng(0), sim.machine_rng(1)];
     let make = |me: &str, rng, peer: &str| {
@@ -563,7 +573,7 @@ fn hf_run(seed: u64, cfg: &dyn Fn(&str) -> Config, snr_db: f64, spread: f64) -> 
         a,
         Command::Send {
             to: call("SO5KM-1"),
-            object: object(2000, seed),
+            object: object(len, seed),
             precedence: 0,
         },
     );
@@ -662,4 +672,45 @@ fn an_object_needing_many_overs_is_not_abandoned() {
         o.failed
     );
     assert_eq!(o.received, 1);
+}
+
+/// Time for one short chat message (a 150-byte bundle) to reach the other
+/// station and for its signed receipt to come back, over one hop.
+#[test]
+#[ignore = "measurement: one-hop chat latency"]
+fn chat_latency_one_hop() {
+    let pct = |v: &mut Vec<u64>, p: usize| {
+        v.sort_unstable();
+        v[(v.len() - 1) * p / 100] as f64 / 1e3
+    };
+    for (name, loss) in [("clean", 0.0), ("10% loss", 0.1), ("30% loss", 0.3)] {
+        let mut arrive = Vec::new();
+        for seed in 0..200 {
+            let o = run(
+                seed,
+                150,
+                Loss::Bernoulli(loss),
+                Loss::Bernoulli(loss),
+                0.0,
+                Millis::from_secs(600),
+            );
+            arrive.push(o.latency.expect("delivered").0);
+        }
+        eprintln!(
+            "VHF 1200 bd, {name}: arrives p50 {:.1} s p95 {:.1} s",
+            pct(&mut arrive, 50),
+            pct(&mut arrive, 95)
+        );
+    }
+    let hf = |me: &str| Config::hf_300(call(me));
+    for snr in [17.0, 20.0, 24.0] {
+        let runs: Vec<_> = (0..50).map(|s| hf_run_len(s, 150, &hf, snr, 0.5)).collect();
+        let mut lat: Vec<u64> = runs.iter().filter(|r| r.0).map(|r| r.1 .0).collect();
+        eprintln!(
+            "HF 300 bd, 0.5 Hz fading, {snr} dB: {}/50 confirmed, receipt back p50 {:.1} s p95 {:.1} s",
+            lat.len(),
+            pct(&mut lat, 50),
+            pct(&mut lat, 95)
+        );
+    }
 }
