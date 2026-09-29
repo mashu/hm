@@ -244,17 +244,29 @@ impl ContactGraph {
 
     /// Contacts shown by a verified beacon: from its origin to the receiver,
     /// and from every station it lists to its origin, at the time it heard it.
+    /// A beacon shows radio paths open: from its origin to us when it was
+    /// heard, and from each station it lists to its origin when that station
+    /// was last heard there. A radio path open one way is open both ways
+    /// (propagation is reciprocal; how likely a handoff over it is to
+    /// complete is the beliefs' business), so each becomes a contact in both
+    /// directions: without them, a station could not route through a
+    /// neighbour to the stations only the neighbour hears.
     pub fn observe_beacon(&mut self, beacon: BeaconObservation<'_>) -> Result<(), GraphError> {
+        let contact = |from, to, flags, observed_at| LiveContact {
+            from,
+            to,
+            bearer: Bearer::Radio,
+            rate_bps: beacon.rate_bps,
+            capacity_bytes: beacon.capacity_bytes,
+            flags,
+            observed_at,
+        };
         self.put_live(
-            LiveContact {
-                from: beacon.origin,
-                to: beacon.receiver,
-                bearer: Bearer::Radio,
-                rate_bps: beacon.rate_bps,
-                capacity_bytes: beacon.capacity_bytes,
-                flags: beacon.flags,
-                observed_at: beacon.observed_at,
-            },
+            contact(beacon.origin, beacon.receiver, beacon.flags, beacon.observed_at),
+            ContactSource::Beacon,
+        )?;
+        self.put_live(
+            contact(beacon.receiver, beacon.origin, 0, beacon.observed_at),
             ContactSource::Beacon,
         )?;
         self.node_flags.insert(
@@ -265,16 +277,9 @@ impl ContactGraph {
             ),
         );
         for (station, at) in beacon.hearings() {
+            self.put_live(contact(station, beacon.origin, 0, at), ContactSource::Beacon)?;
             self.put_live(
-                LiveContact {
-                    from: station,
-                    to: beacon.origin,
-                    bearer: Bearer::Radio,
-                    rate_bps: beacon.rate_bps,
-                    capacity_bytes: beacon.capacity_bytes,
-                    flags: 0,
-                    observed_at: at,
-                },
+                contact(beacon.origin, station, beacon.flags, at),
                 ContactSource::Beacon,
             )?;
         }
@@ -543,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn beacon_builds_observed_directed_edges() {
+    fn beacon_builds_both_directions_of_each_path_heard() {
         let (a, b, c) = (call("M0AAA"), call("M0BBB"), call("M0CCC"));
         let mut graph = graph();
         let beacon = BeaconObservation {
@@ -567,7 +572,9 @@ mod tests {
         // B heard C two minutes before its beacon: a live contact from then,
         // over by now with this graph's one-minute window.
         assert!(edges(900).contains(&(c, b)));
+        assert!(edges(900).contains(&(b, c)));
         assert!(!edges(1_000).contains(&(c, b)));
+        assert!(!edges(1_000).contains(&(b, c)));
         assert_eq!(graph.flags(b, 1_000), Some(3));
         assert_eq!(beacon.hearings().collect::<Vec<_>>(), vec![(a, 1_000), (c, 880)]);
         assert!(graph.contacts(1_000).all(|c| c.stated().is_none()));

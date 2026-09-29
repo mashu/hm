@@ -63,6 +63,7 @@ impl core::fmt::Display for RestoreError {
 }
 
 pub struct Beliefs {
+    /// By [path](LinkKey::path).
     links: BTreeMap<LinkKey, LinkModel>,
     custodians: BTreeMap<Callsign, CustodianModel>,
     link_priors: [LinkPrior; 3],
@@ -98,10 +99,12 @@ impl Beliefs {
         &self.custodian_prior
     }
 
+    /// What is believed about the path `key` runs over.
     pub fn link(&self, key: LinkKey) -> Option<&LinkModel> {
-        self.links.get(&key)
+        self.links.get(&key.path())
     }
 
+    /// Every path believed in.
     pub fn links(&self) -> impl Iterator<Item = (&LinkKey, &LinkModel)> {
         self.links.iter()
     }
@@ -111,6 +114,7 @@ impl Beliefs {
     }
 
     pub fn observe_link(&mut self, key: LinkKey, at: u64, observation: LinkObservation) {
+        let key = key.path();
         let prior = self.link_priors[key.bearer.index()];
         self.links
             .entry(key)
@@ -125,6 +129,7 @@ impl Beliefs {
     /// `interval` seconds until the link's own interval is learned. Returns
     /// how many were missed.
     pub fn note_silence(&mut self, key: LinkKey, now: u64, interval: u64) -> usize {
+        let key = key.path();
         let Some(link) = self.links.get(&key) else {
             return 0;
         };
@@ -156,7 +161,7 @@ impl Beliefs {
 
     /// Chance the link is open at `t`.
     pub fn p_open(&self, key: LinkKey, t: u64, now: u64) -> f64 {
-        match self.links.get(&key) {
+        match self.links.get(&key.path()) {
             Some(link) => link.p_open(t, now),
             None => self.unseen(key.bearer, now).p_open(t, now),
         }
@@ -165,7 +170,7 @@ impl Beliefs {
     /// Chance a handoff over the link completes, started at `t`.
     pub fn link_success(&self, key: LinkKey, t: u64, now: u64) -> f64 {
         let prior = self.link_prior(key.bearer);
-        match self.links.get(&key) {
+        match self.links.get(&key.path()) {
             Some(link) => link.success(prior, t, now),
             None => self.unseen(key.bearer, now).success(prior, t, now),
         }
@@ -173,7 +178,7 @@ impl Beliefs {
 
     /// Weight of this station's own handoff evidence on the link.
     fn handoff_weight(&self, key: LinkKey, now: u64) -> f64 {
-        self.links.get(&key).map_or(0.0, |link| {
+        self.links.get(&key.path()).map_or(0.0, |link| {
             let (ok, failed) = link.handoff_counts(now);
             ok + failed
         })
@@ -182,7 +187,7 @@ impl Beliefs {
     /// Frame-loss belief for the link, to size overs with.
     pub fn erasure(&self, key: LinkKey, now: u64) -> Erasure {
         let prior = self.link_prior(key.bearer);
-        match self.links.get(&key) {
+        match self.links.get(&key.path()) {
             Some(link) => link.erasure(prior, now),
             None => Erasure::from_prior(prior.erasure, prior.dispersion),
         }
@@ -304,8 +309,17 @@ impl Beliefs {
         match parse_key(key)? {
             Subject::Link(link) => {
                 let model: LinkModel = minicbor::decode(body).map_err(|_| RestoreError("link record"))?;
-                self.links.insert(link, model);
-                let at = self.links[&link].observed_at();
+                let at = model.observed_at();
+                // Saved by a version that kept the two directions apart:
+                // keep the direction observed last.
+                let path = link.path();
+                if path != link {
+                    self.removed.insert(Subject::Link(link));
+                    self.changed.insert(Subject::Link(path));
+                }
+                if self.links.get(&path).is_none_or(|kept| kept.observed_at() <= at) {
+                    self.links.insert(path, model);
+                }
                 self.refit_link_prior(link.bearer, at);
             }
             Subject::Custodian(station) => {
@@ -501,9 +515,9 @@ impl Estimate for Thompson<'_> {
     fn link(&mut self, link: LinkKey, t: u64, stated: Option<f64>) -> f64 {
         let (beliefs, now) = (self.beliefs, self.now);
         let rng = &mut self.rng;
-        let sampled = *self.links.entry(link).or_insert_with(|| {
+        let sampled = *self.links.entry(link.path()).or_insert_with(|| {
             let prior = beliefs.link_prior(link.bearer);
-            match beliefs.links.get(&link) {
+            match beliefs.links.get(&link.path()) {
                 Some(model) => model.sample(prior, rng, now),
                 None => beliefs.unseen(link.bearer, now).sample(prior, rng, now),
             }
@@ -579,6 +593,32 @@ mod tests {
             beliefs.link_prior(Bearer::Radio).handoff,
             LinkPrior::for_bearer(Bearer::Radio).handoff
         );
+    }
+
+    /// A beacon heard from a station and a handoff to it are evidence about
+    /// one path: what is learned one way holds the other.
+    #[test]
+    fn both_directions_of_a_path_share_one_belief() {
+        let mut beliefs = Beliefs::new();
+        let (out, back) = (
+            key("M0ME", "M0AAA", Bearer::Radio),
+            key("M0AAA", "M0ME", Bearer::Radio),
+        );
+        let unseen = beliefs.p_open(out, 0, 0);
+        for t in 0..6 {
+            beliefs.observe_link(back, t * 600, LinkObservation::Missed);
+        }
+        let now = 3_000;
+        assert!(beliefs.p_open(out, now, now) < unseen / 2.0);
+        assert_eq!(beliefs.p_open(out, now, now), beliefs.p_open(back, now, now));
+        assert_eq!(beliefs.link(out), beliefs.link(back));
+        assert_eq!(beliefs.links().count(), 1);
+        // A record saved per direction comes back as the path's.
+        let mut restored = Beliefs::new();
+        for (k, v) in beliefs.take_changed() {
+            restored.restore(&k, &v.unwrap()).unwrap();
+        }
+        assert_eq!(restored.link(back), beliefs.link(out));
     }
 
     #[test]

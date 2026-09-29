@@ -122,9 +122,37 @@ impl From<Bearer> for ContactBearer {
 }
 
 /// A directed link: frames or bundles from `from` to `to` over `bearer`.
+///
+/// What is believed about a link is believed about its [path](LinkKey::path):
+/// both directions share it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LinkKey {
     pub from: Callsign,
     pub to: Callsign,
     pub bearer: Bearer,
+}
+
+impl LinkKey {
+    /// The path the link runs over, the same for both directions. Whether a
+    /// path is open is one fact for both ways: radio propagation is
+    /// reciprocal (the same ionosphere, the same fading), an ARQ or internet
+    /// session carries both ways, and a handoff needs both (the object one
+    /// way, the receipt back). So a beacon heard from a station, a report
+    /// that it heard us, and a handoff to it are evidence about one path.
+    pub fn path(self) -> LinkKey {
+        if self.to < self.from {
+            LinkKey {
+                from: self.to,
+                to: self.from,
+                bearer: self.bearer,
+            }
+        } else {
+            self
+        }
+    }
+
+    /// Whether `station` is at either end.
+    pub fn touches(&self, station: Callsign) -> bool {
+        self.from == station || self.to == station
+    }
 }

@@ -173,6 +173,9 @@ pub struct Node {
     next_holding_check: u64,
     /// When the beacon of each station last taken in was heard.
     beacons_seen: BTreeMap<Callsign, u64>,
+    /// Stations not heard here: when the last of their transmissions that
+    /// neighbours reported was counted as missed.
+    unheard_until: BTreeMap<Callsign, u64>,
     heard: Vec<heard::Station>,
 }
 
@@ -226,6 +229,7 @@ impl Node {
             holding_sent: None,
             next_holding_check: 0,
             beacons_seen: BTreeMap::new(),
+            unheard_until: BTreeMap::new(),
             heard: Vec::new(),
         };
         node.advertise_schedules(now);
@@ -259,10 +263,10 @@ impl Node {
             estimates: self
                 .beliefs
                 .links()
-                .filter(|(key, _)| key.from == self.id.me)
+                .filter(|(key, _)| key.touches(self.id.me))
                 .map(|(key, _)| {
                     (
-                        key.to,
+                        if key.from == self.id.me { key.to } else { key.from },
                         key.bearer.name(),
                         self.beliefs.link_success(*key, now, now),
                     )

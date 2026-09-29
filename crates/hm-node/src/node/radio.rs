@@ -1,7 +1,7 @@
 //! Radio events: the link up and down, objects received and sent, beacons
 //! heard and beacons due but not heard.
 
-use hm_model::{Bearer, LinkKey, LinkObservation};
+use hm_model::{Bearer, LinkKey, LinkObservation, MISS_HORIZON};
 use hm_route::BeaconObservation;
 use hm_wire::{Callsign, ObjectId};
 use hm_xfer::Receipt;
@@ -172,6 +172,7 @@ impl Node {
             to,
             bearer: Bearer::Radio,
         };
+        let mut on_air = Vec::new();
         for station in &list {
             let Some(beacon) = &station.beacon else {
                 continue;
@@ -203,6 +204,7 @@ impl Node {
             for (hearing, at) in observation.hearings() {
                 self.beliefs
                     .observe_link(radio(hearing, station.call), at, LinkObservation::Reported);
+                on_air.push((hearing, at));
             }
             let success = self.beliefs.link_success(radio(me, station.call), now, now);
             self.claim_live(station.call, Bearer::Radio, success, rate, capacity, now);
@@ -219,17 +221,52 @@ impl Node {
         // Beacons due from stations heard before, and not heard: closed
         // links, or open ones that lost them.
         if self.beacon_interval > 0 {
-            let listened: Vec<LinkKey> = self
+            let listened: Vec<Callsign> = self
                 .beliefs
                 .links()
                 .map(|(key, _)| *key)
-                .filter(|key| key.to == me && key.bearer == Bearer::Radio)
+                .filter(|key| key.touches(me) && key.bearer == Bearer::Radio)
+                .map(|key| if key.from == me { key.to } else { key.from })
                 .collect();
-            for key in listened {
-                self.beliefs.note_silence(key, now, self.beacon_interval);
+            for station in listened {
+                self.beliefs
+                    .note_silence(radio(station, me), now, self.beacon_interval);
             }
         }
+        self.unheard(&on_air);
         self.heard = list;
         self.notify.send("status");
+    }
+
+    /// Stations our neighbours hear and we do not: each transmission of
+    /// theirs that a neighbour reports was on the air, and did not reach us.
+    /// For a station heard lately, the beacons due from it count instead
+    /// ([`hm_model::Beliefs::note_silence`]); this is the evidence about stations never
+    /// heard here, or not for longer than that counts.
+    fn unheard(&mut self, on_air: &[(Callsign, u64)]) {
+        let me = self.id.me;
+        // Two neighbours reporting one beacon are one miss, not two.
+        let apart = (self.beacon_interval / 2).max(60);
+        for &(station, at) in on_air {
+            if station == me {
+                continue;
+            }
+            let key = LinkKey {
+                from: station,
+                to: me,
+                bearer: Bearer::Radio,
+            };
+            let followed = self
+                .beliefs
+                .link(key)
+                .and_then(|link| link.last_open())
+                .is_some_and(|open| open.saturating_add(MISS_HORIZON) >= at);
+            let counted = self.unheard_until.get(&station).copied();
+            if followed || counted.is_some_and(|last| at < last.saturating_add(apart)) {
+                continue;
+            }
+            self.unheard_until.insert(station, at);
+            self.beliefs.observe_link(key, at, LinkObservation::Missed);
+        }
     }
 }
