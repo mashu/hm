@@ -104,3 +104,17 @@ path = "fuzz_targets/il2p.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "sync"
+path = "fuzz_targets/sync.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "routed"
+path = "fuzz_targets/routed.rs"
+test = false
+doc = false
+bench = false
