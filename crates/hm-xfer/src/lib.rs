@@ -69,6 +69,17 @@ const MAX_BACKOFF_DOUBLINGS: u32 = 5;
 /// symbol costs one frame of airtime, a failed over costs a turnaround and
 /// another over, so aiming for certainty wastes airtime.
 pub const BURST_SUCCESS_TARGET: f64 = 0.9;
+/// Smallest congestion window: a sender that keeps missing ACKs still sends
+/// overs of this many symbols once a probe gets through.
+const MIN_WINDOW: u32 = 2;
+/// Most transfers under way at once, to different peers.
+const MAX_ACTIVE: usize = 4;
+/// Below 1200 bit/s, DATA frames are sized to take about this long on air.
+pub const SLOW_FRAME_SECS: u64 = 3;
+/// Smallest symbol a slow link is given.
+const MIN_SLOW_SYMBOL: usize = 32;
+/// Longest over on a link below 1200 bit/s.
+pub const SLOW_MAX_OVER: Millis = Millis::from_secs(60);
 
 /// `P[X >= k]` for `X ~ Binomial(n, q)`.
 fn prob_at_least(n: u32, k: u32, q: f64) -> f64 {
@@ -109,6 +120,21 @@ pub fn burst_size(need: u32, loss_permille: u32, cap: u32) -> u32 {
     n.min(cap)
 }
 
+/// The smallest symbol size, a multiple of 8 and at most `max`, that keeps an
+/// object of `len` bytes in as few symbols as `max` would. Every symbol,
+/// repair symbols included, is sent whole, so the padding after the object is
+/// airtime: a 119-byte chat bundle goes out as one 120-byte symbol, not a
+/// 200-byte one.
+pub fn fit_symbol(len: u32, max: u16) -> u16 {
+    let align = u32::from(SYMBOL_ALIGNMENT);
+    let max = u32::from(max.max(SYMBOL_ALIGNMENT)) / align * align;
+    if len == 0 {
+        return max as u16;
+    }
+    let k = len.div_ceil(max);
+    (len.div_ceil(k).div_ceil(align) * align).min(max) as u16
+}
+
 /// Domain prefix of the receipt signature.
 pub const RECEIPT_PREFIX: &[u8] = b"hm/xfer-receipt/v0";
 
@@ -120,8 +146,16 @@ pub fn broadcast_peer() -> Callsign {
 
 /// Assumed frame loss when sizing a one-shot broadcast over, per mille.
 const BROADCAST_LOSS_PERMILLE: u32 = 300;
-/// Most overs a broadcast publish may take before local completion.
+/// Most overs a broadcast publish may take before it listens for repair requests.
 const BROADCAST_MAX_ROUNDS: u8 = 2;
+/// A listener missing symbols of a broadcast waits a random part of this many
+/// ACK airtimes before asking, so that one request, heard by the others,
+/// stands for them all.
+const NACK_SPREAD_ACKS: u64 = 3;
+/// Requests for at least as much, heard from other listeners, before a
+/// listener keeps its own to itself: one heard request may itself have been
+/// lost on the way to the broadcaster.
+const NACK_SUPPRESS_AFTER: u8 = 2;
 
 /// The statement a receiver signs to prove it holds object `id`.
 pub fn receipt_statement(receiver: Callsign, sender: Callsign, session: u16, id: &ObjectId) -> Vec<u8> {
@@ -163,9 +197,19 @@ pub struct Config {
     pub stuffing_permille: u16,
     /// Most DATA frames in one over.
     pub max_burst: u8,
+    /// Longest over, key-up to key-down, OPEN and OFFER included (an over
+    /// always carries at least one symbol). Long overs spread the key-up and
+    /// the ACK's round trip over more symbols, and with fountain coding a fade
+    /// costs only the frames it overlaps however long the over is; the limit
+    /// keeps one station from holding a shared channel too long.
+    pub max_over: Millis,
     /// Frame loss assumed at least, per mille, when sizing bursts.
     pub redundancy_permille: u32,
-    /// Overs per object before giving up.
+    /// Overs in a row that bring no progress (no ACK, or an ACK that asks for
+    /// no fewer symbols than the one before) before a transfer fails. Overs
+    /// that do bring progress never count against it, so a large object, or
+    /// a slow link that needs many overs, is not abandoned while it gets
+    /// through.
     pub max_rounds: u8,
     /// Slack added to every predicted end of an over.
     pub ack_guard: Millis,
@@ -188,6 +232,9 @@ pub struct Config {
     pub features: u32,
     /// A busy receiver asks senders to come back after this many seconds.
     pub busy_retry_secs: u16,
+    /// Repair overs a broadcast may send after its first, when listeners ask
+    /// for more (0: publish once and forget, as before repair existed).
+    pub broadcast_repairs: u8,
 }
 
 impl Config {
@@ -203,6 +250,7 @@ impl Config {
             frame_overhead_bytes: 19,
             stuffing_permille: 20,
             max_burst: 16,
+            max_over: Millis::from_secs(30),
             redundancy_permille: 20,
             max_rounds: 12,
             ack_guard: Millis(1500),
@@ -216,7 +264,45 @@ impl Config {
             sessions: true,
             features: 0,
             busy_retry_secs: 60,
+            broadcast_repairs: 3,
         }
+    }
+
+    /// A link at `bitrate_bps` with key-up delay `txdelay`, starting from the
+    /// VHF 1200 parameters. Below 1200 bit/s whatever is measured in airtime
+    /// scales with the rate: symbols are sized so a DATA frame takes about
+    /// [`SLOW_FRAME_SECS`] on air, overs may last up to [`SLOW_MAX_OVER`], more
+    /// loss is assumed before any is measured, and a receiver keeps a partial
+    /// transfer longer, because a sender backing off after missed ACKs goes
+    /// quiet for longer on a slow link.
+    ///
+    /// On a simulated 300 bd path with Watterson-style fading (0.5 to 1 Hz
+    /// Doppler spread, `hm-sim`'s `Loss::Fading`), 64-byte symbols delivered
+    /// more, sooner and with less airtime than 128 or 200 bytes: a shorter
+    /// frame is less likely to meet a fade. Overs of up to 60 s did better
+    /// than 20 s: fewer key-ups and ACK round trips for the same symbols.
+    pub fn for_link(me: Callsign, bitrate_bps: u32, txdelay: Millis) -> Config {
+        let mut cfg = Config::vhf_1200(me);
+        cfg.bitrate_bps = bitrate_bps.max(1);
+        cfg.txdelay = txdelay;
+        if cfg.bitrate_bps < 1200 {
+            let on_air = (u64::from(cfg.bitrate_bps) * SLOW_FRAME_SECS / 8) as usize;
+            let symbol = on_air
+                .saturating_sub(HEADER_LEN + DATA_PREAMBLE_LEN + cfg.frame_overhead_bytes as usize)
+                .clamp(MIN_SLOW_SYMBOL, cfg.symbol_size as usize);
+            cfg.symbol_size = (symbol - symbol % SYMBOL_ALIGNMENT as usize) as u16;
+            cfg.max_over = SLOW_MAX_OVER;
+            cfg.redundancy_permille = 50;
+            cfg.idle_timeout = Millis::from_secs(900);
+        }
+        cfg
+    }
+
+    /// HF packet at 300 bd through a KISS TNC (Direwolf's `MODEM 300` or a
+    /// hardware HF TNC): 64-byte symbols, about 2.9 s per DATA frame, and
+    /// overs of up to 60 s.
+    pub fn hf_300(me: Callsign) -> Config {
+        Config::for_link(me, 300, Millis(300))
     }
 
     fn validate(&self) -> Result<(), &'static str> {
@@ -280,7 +366,7 @@ pub enum Command {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Failure {
-    /// No complete acknowledgement within `max_rounds` overs.
+    /// `max_rounds` overs in a row brought no progress.
     NoAnswer,
     TooLarge,
     Empty,
@@ -350,7 +436,11 @@ struct Outgoing {
     source: Vec<EncodingPacket>,
     k: u32,
     next_esi: u32,
+    /// Overs sent (saturating).
     rounds: u8,
+    /// Overs in a row with no progress: counted when an over goes out, cleared
+    /// by an ACK that asks for fewer symbols.
+    stalls: u8,
     offer_next: bool,
     /// The next over starts with our OPEN (the peer has none from us lately).
     open_next: bool,
@@ -365,8 +455,21 @@ struct Outgoing {
     sent_last_round: u32,
     /// The last over carried an OPEN, so the answer may carry one too.
     opened: bool,
-    /// RF bulletin publish: no ACK wait.
+    /// RF bulletin publish: no ACK; listeners may ask for repair.
     broadcast: bool,
+    /// Broadcast: repair overs sent, and the most symbols a listener asked
+    /// for since the last over.
+    repairs: u8,
+    asked: u32,
+    /// Broadcast: repair windows in a row that brought no request. Two
+    /// requests sent at once collide unheard, so one quiet window is not
+    /// proof that nobody is missing anything.
+    quiet_windows: u8,
+    /// Broadcast: nothing more to send; report it done.
+    finished: bool,
+    /// How long to wait for the ACK once our last over has left the air: the
+    /// peer's guard and answer, our slack and a random part.
+    ack_wait: Millis,
     state: OutState,
 }
 
@@ -384,8 +487,13 @@ struct Incoming {
     receipt: Option<[u8; 64]>,
     ack_at: Option<Millis>,
     last_heard: Millis,
-    /// Heard on `Dest::Broadcast`: store locally, never ACK.
+    /// Heard on `Dest::Broadcast`: store locally, never ACK; ask for repair.
     broadcast: bool,
+    /// Other listeners' repair requests heard since the last over that ask
+    /// for at least as much as ours would.
+    covering_nacks: u8,
+    /// Repair requests we may still repeat if no repair follows ours.
+    nack_retries: u8,
 }
 
 impl Incoming {
@@ -404,6 +512,8 @@ impl Incoming {
             ack_at: None,
             last_heard: now,
             broadcast,
+            covering_nacks: 0,
+            nack_retries: 0,
         }
     }
 
@@ -434,12 +544,21 @@ pub struct Xfer {
     rejected_receipts: u64,
     rng: DetRng,
     queue: VecDeque<Pending>,
-    active: Option<Outgoing>,
+    /// Transfers under way: at most one per peer and [`MAX_ACTIVE`] in all.
+    /// One over is outstanding at a time (the channel is half duplex), but
+    /// while one transfer backs off after a missed ACK, another may go, so a
+    /// station that does not answer cannot hold up traffic to the others.
+    active: Vec<Outgoing>,
     incoming: BTreeMap<(Callsign, u16), Incoming>,
     /// Objects delivered to our application recently, with their expiry.
     seen: BTreeMap<ObjectId, Millis>,
-    /// Estimated frame loss towards each peer, per mille.
+    /// Estimated frame loss towards each peer, per mille, from what its ACKs
+    /// say arrived. A missed ACK is not counted as loss: it may as well mean a
+    /// busy or colliding channel, where larger overs would make things worse.
     loss: BTreeMap<Callsign, u32>,
+    /// Congestion window towards each peer: most symbols in one over. Halved
+    /// when an ACK does not come, grown by one with each ACK that does.
+    window: BTreeMap<Callsign, u32>,
     tokens_ms: i64,
     tokens_at: Millis,
     /// Each peer's latest OPEN, and when we heard it.
@@ -464,10 +583,11 @@ impl Xfer {
             rejected_receipts: 0,
             rng,
             queue: VecDeque::new(),
-            active: None,
+            active: Vec::new(),
             incoming: BTreeMap::new(),
             seen: BTreeMap::new(),
             loss: BTreeMap::new(),
+            window: BTreeMap::new(),
             tokens_ms,
             tokens_at: Millis::ZERO,
             peers: BTreeMap::new(),
@@ -535,9 +655,19 @@ impl Xfer {
         self.loss.get(&peer).copied().unwrap_or(0)
     }
 
+    /// The congestion window towards `peer`: most symbols the next over to it
+    /// may carry. A missed ACK halves it (to no less than 2), each ACK that
+    /// arrives grows it by one, up to `max_burst`.
+    pub fn window(&self, peer: Callsign) -> u32 {
+        self.window
+            .get(&peer)
+            .copied()
+            .unwrap_or(self.cfg.max_burst as u32)
+    }
+
     /// Transfers waiting or in progress.
     pub fn outgoing_count(&self) -> usize {
-        self.queue.len() + self.active.is_some() as usize
+        self.queue.len() + self.active.len()
     }
 
     fn check_params(&self, len: u32, symbol_size: usize) -> Option<(u16, u32)> {
@@ -650,11 +780,24 @@ impl Xfer {
         let _ = now;
     }
 
+    /// Start queued transfers, highest precedence first, for peers that have
+    /// none under way, while there is room.
     fn start_next(&mut self, now: Millis, out: &mut Vec<Output<Event>>) {
-        if self.active.is_some() {
-            return;
+        while self.active.len() < MAX_ACTIVE {
+            let busy = |p: &Pending| {
+                self.active
+                    .iter()
+                    .any(|o| o.to == p.to && o.broadcast == p.broadcast)
+            };
+            let Some(i) = self.queue.iter().position(|p| !busy(p)) else {
+                return;
+            };
+            let p = self.queue.remove(i).expect("index from position");
+            self.start(now, p, out);
         }
-        let Some(p) = self.queue.pop_front() else { return };
+    }
+
+    fn start(&mut self, now: Millis, p: Pending, out: &mut Vec<Output<Event>>) {
         let len = p.object.len() as u32;
         // What the peer told us it takes: larger objects fail at once, and
         // symbols are no larger than it accepts. Broadcast has no peer OPEN.
@@ -667,7 +810,7 @@ impl Xfer {
                         id: object_id(&p.object),
                         reason: Failure::TooLarge,
                     }));
-                    return self.start_next(now, out);
+                    return;
                 }
                 let theirs = open.max_symbol - open.max_symbol % SYMBOL_ALIGNMENT;
                 if theirs >= SYMBOL_ALIGNMENT {
@@ -675,11 +818,11 @@ impl Xfer {
                 }
             }
         }
-        let (t, k) = match self.check_params(len, t as usize) {
+        let (t, k) = match self.check_params(len, fit_symbol(len, t) as usize) {
             Some(tk) => tk,
             // Too many symbols at the peer's size: ours was checked when queued.
             None => self
-                .check_params(len, self.cfg.symbol_size as usize)
+                .check_params(len, fit_symbol(len, self.cfg.symbol_size) as usize)
                 .expect("checked when queued"),
         };
         // The block encoder wants whole symbols; the decoder truncates to `len` again.
@@ -689,9 +832,10 @@ impl Xfer {
         padded.truncate(len as usize);
         let id = object_id(&padded);
         let source = encoder.source_packets();
-        self.active = Some(Outgoing {
+        let session = self.new_session();
+        self.active.push(Outgoing {
             to: p.to,
-            session: self.rng.next_u64() as u16,
+            session,
             id,
             len,
             t,
@@ -701,6 +845,7 @@ impl Xfer {
             k,
             next_esi: 0,
             rounds: 0,
+            stalls: 0,
             offer_next: true,
             open_next: !p.broadcast && self.cfg.sessions && !self.knows(p.to, now),
             need: k,
@@ -710,8 +855,24 @@ impl Xfer {
             sent_last_round: 0,
             opened: false,
             broadcast: p.broadcast,
+            repairs: 0,
+            asked: 0,
+            quiet_windows: 0,
+            finished: false,
+            ack_wait: Millis::ZERO,
             state: OutState::Ready { at: now },
         });
+    }
+
+    /// A random session id: never 0, which a CLOSE uses for "every transfer",
+    /// and not one of ours already under way.
+    fn new_session(&mut self) -> u16 {
+        loop {
+            let s = self.rng.next_u64() as u16;
+            if s != 0 && self.active.iter().all(|o| o.session != s) {
+                return s;
+            }
+        }
     }
 
     fn symbol(o: &Outgoing, esi: u32) -> Vec<u8> {
@@ -723,48 +884,94 @@ impl Xfer {
     }
 
     fn receiving(&self) -> bool {
-        self.incoming.values().any(|i| i.ack_at.is_some())
+        self.incoming.values().any(|i| i.ack_at.is_some() && !i.broadcast)
+    }
+
+    /// One of our overs is waiting for its ACK: nothing else goes out, since
+    /// the answer comes back on the same channel.
+    fn waiting(&self) -> bool {
+        self.active
+            .iter()
+            .any(|o| matches!(o.state, OutState::Waiting { .. }))
+    }
+
+    /// The transfer whose over goes next among those due now: highest
+    /// precedence first, then the one due longest.
+    fn next_due(&self, now: Millis) -> Option<usize> {
+        self.active
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| match o.state {
+                OutState::Ready { at } if at <= now => Some((i, o.precedence, at)),
+                _ => None,
+            })
+            .min_by_key(|&(i, precedence, at)| (core::cmp::Reverse(precedence), at, i))
+            .map(|(i, _, _)| i)
     }
 
     /// Start the next over if one is due and the channel is ours.
     fn pump(&mut self, now: Millis, out: &mut Vec<Output<Event>>) {
         self.start_next(now, out);
-        if self.receiving() {
-            return; // a peer's over is still under way; answer it first
+        if self.receiving() || self.waiting() {
+            return; // a peer's over, or the answer to ours, is still to come
         }
-        let Some(o) = self.active.as_ref() else { return };
-        let OutState::Ready { at } = o.state else { return };
-        if at > now {
-            return;
-        }
-        if o.rounds >= self.cfg.max_rounds && !o.broadcast {
-            let o = self.active.take().expect("checked");
-            out.push(Output::Event(Event::Failed {
-                to: o.to,
-                id: o.id,
-                reason: Failure::NoAnswer,
-            }));
-            self.start_next(now, out);
+        // Transfers out of rounds end before anything more is sent.
+        let before = self.active.len();
+        let (max_rounds, mut ended) = (self.cfg.max_rounds, Vec::new());
+        self.active.retain(|o| {
+            let due = matches!(o.state, OutState::Ready { at } if at <= now);
+            let done = due
+                && if o.broadcast {
+                    o.finished
+                } else {
+                    o.stalls >= max_rounds
+                };
+            if done {
+                ended.push(if o.broadcast {
+                    Event::Delivered {
+                        to: o.to,
+                        id: o.id,
+                        rounds: o.rounds,
+                        receipt: Receipt::Unverified,
+                    }
+                } else {
+                    Event::Failed {
+                        to: o.to,
+                        id: o.id,
+                        reason: Failure::NoAnswer,
+                    }
+                });
+            }
+            !done
+        });
+        out.extend(ended.into_iter().map(Output::Event));
+        if self.active.len() < before {
             return self.pump(now, out);
         }
-        if o.broadcast && o.rounds >= BROADCAST_MAX_ROUNDS {
-            let o = self.active.take().expect("checked");
-            out.push(Output::Event(Event::Delivered {
-                to: o.to,
-                id: o.id,
-                rounds: o.rounds,
-                receipt: Receipt::Unverified,
-            }));
-            self.start_next(now, out);
-            return self.pump(now, out);
+        while let Some(i) = self.next_due(now) {
+            if self.send_over(now, i, out) {
+                return;
+            }
         }
+    }
 
+    /// Send the next over of transfer `i`, or put it off until the airtime
+    /// budget allows it. True when the over went out.
+    fn send_over(&mut self, now: Millis, i: usize, out: &mut Vec<Output<Event>>) -> bool {
+        let o = &self.active[i];
+        let (to, session, broadcast) = (o.to, o.session, o.broadcast);
         let loss = if o.broadcast {
             BROADCAST_LOSS_PERMILLE.max(self.cfg.redundancy_permille)
         } else {
             self.loss_estimate(o.to).max(self.cfg.redundancy_permille)
         };
+        let window = if o.broadcast {
+            self.cfg.max_burst as u32
+        } else {
+            self.window(o.to)
+        };
         let cap = (self.cfg.max_burst as u32)
+            .min(window)
             .min(MAX_INDEX - o.next_esi.min(MAX_INDEX))
             .max(1);
         let n = if o.probe {
@@ -782,32 +989,28 @@ impl Xfer {
         if open {
             fixed += self.open_air();
         }
-        // An over never costs more than the bucket holds (but always carries a symbol).
-        let n = if self.cfg.duty_cycle_permille < 1000 {
-            let room = self.cfg.bucket.0.saturating_sub(fixed.0) / frame_air.0.max(1);
-            n.min(room.max(1) as u32)
-        } else {
-            n
-        };
+        // An over never lasts longer than `max_over`, nor costs more than the
+        // bucket holds, but it always carries a symbol.
+        let room = |limit: u64| (limit.saturating_sub(fixed.0) / frame_air.0.max(1)).max(1) as u32;
+        let mut n = n.min(room(self.cfg.max_over.0));
+        if self.cfg.duty_cycle_permille < 1000 {
+            n = n.min(room(self.cfg.bucket.0));
+        }
         let cost = fixed + Millis(frame_air.0 * n as u64);
         self.refill(now);
         let when = self.affordable_at(now, cost);
         if when > now {
-            self.active.as_mut().expect("checked").state = OutState::Ready { at: when };
-            return;
+            self.active[i].state = OutState::Ready { at: when };
+            return false;
         }
 
-        let (to, session, broadcast) = {
-            let o = self.active.as_ref().expect("checked");
-            (o.to, o.session, o.broadcast)
-        };
         let mut frames = Vec::with_capacity(n as usize + 2);
         if open {
             let reply = self.open_replies.remove(&to);
             let ours = self.our_open(reply).to_bytes().expect("in range");
             frames.push(self.frame(FrameType::Ctrl, to, session, 0, &ours, false));
         }
-        let o = self.active.as_ref().expect("checked");
+        let o = &self.active[i];
         if o.offer_next {
             let offer = Offer {
                 hash: o.id.0,
@@ -825,11 +1028,11 @@ impl Xfer {
                 broadcast,
             ));
         }
-        for i in 0..n {
-            let esi = o.next_esi + i;
+        for j in 0..n {
+            let esi = o.next_esi + j;
             let pre = DataPreamble {
                 object_len: o.len,
-                remaining: (n - 1 - i) as u8,
+                remaining: (n - 1 - j) as u8,
             };
             let mut payload = pre.to_bytes().expect("len checked").to_vec();
             payload.extend_from_slice(&Self::symbol(o, esi));
@@ -840,48 +1043,52 @@ impl Xfer {
         }
         self.tokens_ms -= cost.0 as i64;
 
-        let broadcast_done = {
-            let o = self.active.as_mut().expect("checked");
-            o.next_esi += n;
-            o.rounds += 1;
-            o.offer_next = false;
-            o.open_next = false;
-            o.opened = open;
-            o.probe = false;
-            o.last_cost = cost;
-            o.sent_last_round = n;
-            if o.broadcast {
-                // One-shot publish: no ACK. Finish when we have sent enough source
-                // coverage or hit the round cap.
-                let done = o.next_esi >= o.k || o.rounds >= BROADCAST_MAX_ROUNDS;
-                if !done {
-                    o.state = OutState::Ready { at: now + cost };
-                }
-                Some(done)
-            } else {
-                None
-            }
-        };
-        if let Some(done) = broadcast_done {
-            if done {
-                let o = self.active.take().expect("checked");
-                out.push(Output::Event(Event::Delivered {
-                    to: o.to,
-                    id: o.id,
-                    rounds: o.rounds,
-                    receipt: Receipt::Unverified,
-                }));
-                self.start_next(now, out);
-                return self.pump(now, out);
-            }
-            return;
-        }
         // The peer answers after our over: its guard, its key-up, a full ACK
         // (and its OPEN, if we sent ours), our slack.
         let ack_air = self.ack_air() + if open { self.open_air() } else { Millis::ZERO };
         let jitter = Millis(self.rng.below(self.cfg.ack_guard.0 + 1));
-        let until = now + cost + self.cfg.ack_guard + ack_air + self.cfg.ack_guard + jitter;
-        self.active.as_mut().expect("checked").state = OutState::Waiting { until };
+        let ack_wait = self.cfg.ack_guard + ack_air + self.cfg.ack_guard + jitter;
+        let o = &mut self.active[i];
+        o.next_esi += n;
+        o.rounds = o.rounds.saturating_add(1);
+        o.stalls = o.stalls.saturating_add(1);
+        o.offer_next = false;
+        o.open_next = false;
+        o.opened = open;
+        o.probe = false;
+        o.last_cost = cost;
+        o.sent_last_round = n;
+        if !o.broadcast {
+            o.ack_wait = ack_wait;
+            o.state = OutState::Waiting {
+                until: now + cost + ack_wait,
+            };
+            return true;
+        }
+        // A broadcast has no ACK. Once enough source symbols went out (or the
+        // round cap is reached) it listens for listeners asking for more, and
+        // answers with fresh symbols: any new symbol helps every listener.
+        if o.next_esi < o.k && o.rounds < BROADCAST_MAX_ROUNDS {
+            o.state = OutState::Ready { at: now + cost };
+        } else if o.repairs < self.cfg.broadcast_repairs {
+            let repair_wait = self.repair_wait();
+            let o = &mut self.active[i];
+            o.asked = 0;
+            o.ack_wait = repair_wait;
+            o.state = OutState::Waiting {
+                until: now + cost + repair_wait,
+            };
+        } else {
+            let o = self.active.remove(i);
+            out.push(Output::Event(Event::Delivered {
+                to: o.to,
+                id: o.id,
+                rounds: o.rounds,
+                receipt: Receipt::Unverified,
+            }));
+            self.pump(now, out);
+        }
+        true
     }
 
     fn on_ack(
@@ -893,10 +1100,30 @@ impl Xfer {
         out: &mut Vec<Output<Event>>,
     ) {
         let Ok(ack) = Ack::decode(payload) else { return };
-        let Some(o) = self.active.as_mut() else { return };
-        if o.to != from || o.session != session {
+        // A listener asking for more of our broadcast (a NACK).
+        if let Some(o) = self
+            .active
+            .iter_mut()
+            .find(|o| o.broadcast && o.session == session)
+        {
+            let need = if ack.need == NEED_OFFER {
+                1
+            } else {
+                u32::from(ack.need)
+            };
+            o.asked = o.asked.max(need);
             return;
         }
+        let Some(i) = self
+            .active
+            .iter()
+            .position(|o| !o.broadcast && o.to == from && o.session == session)
+        else {
+            return;
+        };
+        // An answer came: the channel carried our over and the reply.
+        let grown = self.window(from).saturating_add(1).min(self.cfg.max_burst as u32);
+        let o = &mut self.active[i];
         o.timeouts = 0;
         if ack.need == 0 || ack.completed.contains(&o.id.prefix8()) {
             let receipt = match key_for(&self.keys, o.to) {
@@ -913,9 +1140,10 @@ impl Xfer {
                     }
                 }
             };
-            let o = self.active.take().expect("checked");
+            let o = self.active.remove(i);
             let p = self.loss.entry(o.to).or_insert(0);
             *p = *p * 9 / 10;
+            self.window.insert(o.to, grown);
             out.push(Output::Event(Event::Delivered {
                 to: o.to,
                 id: o.id,
@@ -928,6 +1156,9 @@ impl Xfer {
             o.offer_next = true;
         } else {
             let new_need = ack.need as u32;
+            if new_need < o.need {
+                o.stalls = 0; // the over got something through
+            }
             let sent = o.sent_last_round;
             if sent > 0 && new_need <= o.need {
                 let got = (o.need - new_need).min(sent);
@@ -938,23 +1169,70 @@ impl Xfer {
             o.need = new_need;
         }
         o.state = OutState::Ready { at: now };
+        self.window.insert(from, grown);
     }
 
     /// No ACK: probe again after a random, exponentially growing backoff, so
-    /// stations that cannot hear each other stop colliding in lockstep.
+    /// stations that cannot hear each other stop colliding in lockstep, and
+    /// halve the congestion window. The loss estimate stays as the ACKs left
+    /// it: a missing answer may mean a busy or colliding channel, where larger
+    /// overs, to make up for "loss", would only make it worse.
     fn on_ack_timeout(&mut self, now: Millis) {
-        let Some(o) = self.active.as_mut() else { return };
-        if let OutState::Waiting { until } = o.state {
-            if now >= until {
-                let p = self.loss.entry(o.to).or_insert(0);
-                *p = ((*p * 7 + 1000 * 3) / 10).min(MAX_LOSS_PERMILLE);
-                o.timeouts += 1;
-                let window = (o.last_cost.0 + self.cfg.ack_guard.0) << o.timeouts.min(MAX_BACKOFF_DOUBLINGS);
-                let backoff = Millis(self.rng.below(window + 1));
-                o.offer_next = true;
-                o.open_next = o.opened;
-                o.probe = true;
-                o.state = OutState::Ready { at: now + backoff };
+        for i in 0..self.active.len() {
+            let OutState::Waiting { until } = self.active[i].state else {
+                continue;
+            };
+            if now < until {
+                continue;
+            }
+            if self.active[i].broadcast {
+                // The repair window closed: answer the largest request, or finish.
+                let repairs = self.cfg.broadcast_repairs;
+                let repair_wait = self.repair_wait();
+                let o = &mut self.active[i];
+                if o.asked > 0 && o.repairs < repairs {
+                    o.repairs += 1;
+                    o.need = o.asked;
+                    o.offer_next = true;
+                    o.quiet_windows = 0;
+                    o.state = OutState::Ready { at: now };
+                } else if o.asked == 0 && o.quiet_windows == 0 && o.repairs < repairs {
+                    // Listen once more: a request may have been lost in a collision.
+                    o.quiet_windows = 1;
+                    o.state = OutState::Waiting {
+                        until: now + repair_wait,
+                    };
+                } else {
+                    o.finished = true;
+                    o.state = OutState::Ready { at: now };
+                }
+                o.asked = 0;
+                continue;
+            }
+            let to = self.active[i].to;
+            let halved = (self.window(to) / 2).max(MIN_WINDOW);
+            self.window.insert(to, halved);
+            let o = &mut self.active[i];
+            o.timeouts += 1;
+            let window = (o.last_cost.0 + self.cfg.ack_guard.0) << o.timeouts.min(MAX_BACKOFF_DOUBLINGS);
+            let backoff = Millis(self.rng.below(window + 1));
+            o.offer_next = true;
+            o.open_next = o.opened;
+            o.probe = true;
+            o.state = OutState::Ready { at: now + backoff };
+        }
+    }
+
+    /// The link has put on air everything we gave it, the last frame ending at
+    /// `now`. A link that waits for a clear channel may have held our over
+    /// back, so the wait for its ACK starts from here, not from when we
+    /// handed the over to the link.
+    fn on_transmitted(&mut self, now: Millis) {
+        for o in &mut self.active {
+            if let OutState::Waiting { .. } = o.state {
+                o.state = OutState::Waiting {
+                    until: now + o.ack_wait,
+                };
             }
         }
     }
@@ -966,11 +1244,69 @@ impl Xfer {
         now + self.cfg.air(remaining, self.cfg.data_frame_len(symbol_size)) + self.cfg.ack_guard
     }
 
+    /// When to ask for more of an unfinished broadcast: after the over, at a
+    /// random moment, so the first request heard silences the others. None
+    /// when this station does not ask for repairs.
+    fn nack_at(&mut self, now: Millis, remaining: u8, symbol_size: usize) -> Option<Millis> {
+        if self.cfg.broadcast_repairs == 0 {
+            return None;
+        }
+        let spread = self.ack_air().0 * NACK_SPREAD_ACKS;
+        Some(self.ack_at(now, remaining, symbol_size) + Millis(self.rng.below(spread + 1)))
+    }
+
+    /// Symbols an unfinished broadcast still lacks, as a repair request says.
+    fn broadcast_need(inc: &Incoming) -> u32 {
+        let have = inc.esis.len() as u32;
+        if have < inc.k {
+            inc.k - have
+        } else {
+            1
+        }
+    }
+
+    /// Another listener asked the broadcaster `to` for more of `session`: if
+    /// it asked for at least as much as we would, the answer covers us too.
+    fn overhear_nack(&mut self, to: Callsign, session: u16, payload: &[u8]) {
+        let Ok(ack) = Ack::decode(payload) else { return };
+        let Some(inc) = self.incoming.get_mut(&(to, session)) else {
+            return;
+        };
+        if !inc.broadcast || inc.done || inc.ack_at.is_none() {
+            return;
+        }
+        let asked = if ack.need == NEED_OFFER {
+            1
+        } else {
+            u32::from(ack.need)
+        };
+        if asked >= Self::broadcast_need(inc) {
+            inc.covering_nacks = inc.covering_nacks.saturating_add(1);
+            if inc.covering_nacks >= NACK_SUPPRESS_AFTER {
+                inc.ack_at = None;
+            }
+        }
+    }
+
     /// We answer once every over we are hearing has ended, so an ACK never
     /// talks over another station's over.
     fn answer_at(&self) -> Option<Millis> {
-        let acks = self.incoming.values().filter_map(|i| i.ack_at);
+        let acks = self
+            .incoming
+            .values()
+            .filter(|i| !i.broadcast)
+            .filter_map(|i| i.ack_at);
         acks.chain(self.closes.values().map(|(_, at)| *at)).max()
+    }
+
+    /// The next moment we ask a broadcaster for more (independent of our
+    /// answers to unicast senders, which must not wait for it).
+    fn nack_due(&self) -> Option<Millis> {
+        self.incoming
+            .values()
+            .filter(|i| i.broadcast)
+            .filter_map(|i| i.ack_at)
+            .min()
     }
 
     /// Whether a new transfer from `sender` would have to push out work in
@@ -1088,7 +1424,12 @@ impl Xfer {
         let already = self.seen.contains_key(&id);
         let receipt = self.sign_receipt(key, &id);
         let ack_at = if broadcast {
-            None
+            let done = already || self.incoming.get(&key).is_some_and(|i| i.done);
+            if done {
+                None
+            } else {
+                self.nack_at(now, offer.remaining, offer.symbol_size as usize)
+            }
         } else {
             Some(self.ack_at(now, offer.remaining, t as usize))
         };
@@ -1142,7 +1483,11 @@ impl Xfer {
             return;
         }
         let ack_at = if broadcast {
-            None
+            if self.incoming.get(&key).is_some_and(|i| i.done) {
+                None
+            } else {
+                self.nack_at(now, pre.remaining, t as usize)
+            }
         } else {
             Some(self.ack_at(now, pre.remaining, t as usize))
         };
@@ -1150,6 +1495,9 @@ impl Xfer {
         inc.last_heard = now;
         if broadcast {
             inc.broadcast = true;
+            // A new over: requests heard after it are counted afresh.
+            inc.covering_nacks = 0;
+            inc.nack_retries = 1;
         }
         inc.ack_at = ack_at;
         if inc.done || inc.awaiting_application || inc.decoded.is_some() || !inc.esis.insert(esi) {
@@ -1260,6 +1608,33 @@ impl Xfer {
     }
 
     fn send_due_acks(&mut self, now: Millis, out: &mut Vec<Output<Event>>) {
+        let repair_wait = self.repair_wait();
+        let nacks: Vec<(Callsign, u16)> = self
+            .incoming
+            .iter()
+            .filter(|(_, i)| i.broadcast && i.ack_at.is_some_and(|at| at <= now))
+            .map(|(k, _)| *k)
+            .collect();
+        for key in nacks {
+            let inc = self.incoming.get_mut(&key).expect("collected above");
+            inc.ack_at = None;
+            if inc.done {
+                continue;
+            }
+            let need = Self::broadcast_need(inc);
+            // If no repair follows, ask once more a window later.
+            if inc.nack_retries > 0 {
+                inc.nack_retries -= 1;
+                inc.ack_at = Some(now + repair_wait);
+            }
+            let ack = Ack {
+                need: need.min(NEED_OFFER as u32 - 1) as u16,
+                ..Ack::default()
+            };
+            let payload = ack.to_vec().expect("fields in range");
+            let f = self.frame(FrameType::Ack, key.0, key.1, 0, &payload, false);
+            self.transmit(f, out);
+        }
         if self.answer_at().is_none_or(|t| t > now) {
             return;
         }
@@ -1269,6 +1644,7 @@ impl Xfer {
             .filter(|(_, i)| i.ack_at.is_some() && !i.broadcast)
             .map(|(k, _)| *k)
             .collect();
+
         let closes: Vec<((Callsign, u16), Close)> = core::mem::take(&mut self.closes)
             .into_iter()
             .map(|(k, (c, _))| (k, c))
@@ -1339,15 +1715,17 @@ impl Xfer {
         };
         let ack_air = self.ack_air();
         let guard = self.cfg.ack_guard;
-        let Some(o) = self.active.as_mut() else { return };
-        if h.src == o.to && h.dst == Dest::Station(self.cfg.me) {
-            return; // our peer answering us
-        }
-        if let OutState::Waiting { until } = o.state {
-            let later = traffic_end + guard + o.last_cost + guard + ack_air + guard;
-            o.state = OutState::Waiting {
-                until: until.max(later),
-            };
+        let me = Dest::Station(self.cfg.me);
+        for o in &mut self.active {
+            if h.src == o.to && h.dst == me {
+                continue; // our peer answering us
+            }
+            if let OutState::Waiting { until } = o.state {
+                let later = traffic_end + guard + o.last_cost + guard + ack_air + guard;
+                o.state = OutState::Waiting {
+                    until: until.max(later),
+                };
+            }
         }
     }
 
@@ -1374,10 +1752,14 @@ impl Xfer {
                 .retain(|(c, s), i| !(*c == from && (session == 0 || *s == session) && i.done));
             return;
         }
-        let Some(o) = self.active.as_mut() else { return };
-        if o.to != from || (session != 0 && session != o.session) {
+        let Some(i) = self
+            .active
+            .iter()
+            .position(|o| !o.broadcast && o.to == from && (session == 0 || session == o.session))
+        else {
             return;
-        }
+        };
+        let o = &mut self.active[i];
         let reason = match close.reason {
             CloseReason::Busy => {
                 // Not a failure: come back when asked, starting afresh.
@@ -1390,10 +1772,10 @@ impl Xfer {
             // Believed only when the peer's own OPEN agrees; otherwise the
             // CLOSE answered a corrupted OFFER, so offer again.
             CloseReason::TooLarge
-                if !self
+                if self
                     .peers
                     .get(&from)
-                    .is_some_and(|(open, _)| o.len > open.max_object) =>
+                    .is_none_or(|(open, _)| o.len <= open.max_object) =>
             {
                 o.offer_next = true;
                 o.open_next = true;
@@ -1403,12 +1785,19 @@ impl Xfer {
             CloseReason::TooLarge => Failure::TooLarge,
             _ => Failure::Refused,
         };
-        let o = self.active.take().expect("checked");
+        let o = self.active.remove(i);
         out.push(Output::Event(Event::Failed {
             to: o.to,
             id: o.id,
             reason,
         }));
+    }
+
+    /// How long a broadcaster listens for repair requests after an over: the
+    /// listeners' guard, the spread of their moments, one request, our slack.
+    fn repair_wait(&self) -> Millis {
+        let ack_air = self.ack_air();
+        self.cfg.ack_guard + Millis(ack_air.0 * NACK_SPREAD_ACKS) + ack_air + self.cfg.ack_guard
     }
 
     /// Airtime of an OPEN frame.
@@ -1431,6 +1820,11 @@ impl Xfer {
         self.hear_traffic(now, &h, payload);
         let for_me = h.dst == Dest::Station(self.cfg.me);
         let broadcast = h.dst == Dest::Broadcast;
+        if let (FrameType::Ack, Dest::Station(to)) = (h.ftype, h.dst) {
+            if !for_me {
+                self.overhear_nack(to, h.session, payload);
+            }
+        }
         if !for_me && !broadcast {
             return;
         }
@@ -1486,11 +1880,20 @@ impl Machine for Xfer {
         self.pump(now, out);
     }
 
+    fn transmitted(&mut self, now: Millis, port: Port) {
+        if port == self.cfg.port {
+            self.on_transmitted(now);
+        }
+    }
+
     fn next_deadline(&self) -> Option<Millis> {
         let mut d: Option<Millis> = None;
         let mut take = |t: Millis| d = Some(d.map_or(t, |x| x.min(t)));
         let receiving = self.receiving();
         if let Some(t) = self.answer_at() {
+            take(t);
+        }
+        if let Some(t) = self.nack_due() {
             take(t);
         }
         for i in self.incoming.values() {
@@ -1506,11 +1909,15 @@ impl Machine for Xfer {
         if let Some(t) = self.seen.values().min() {
             take(*t);
         }
-        match self.active.as_ref().map(|o| o.state) {
-            Some(OutState::Waiting { until }) => take(until),
-            // While a peer's over is under way its ACK deadline wakes us instead.
-            Some(OutState::Ready { at }) if !receiving => take(at),
-            _ => {}
+        let waiting = self.waiting();
+        for o in &self.active {
+            match o.state {
+                OutState::Waiting { until } => take(until),
+                // While a peer's over, or the answer to ours, is under way,
+                // those deadlines wake us instead.
+                OutState::Ready { at } if !receiving && !waiting => take(at),
+                OutState::Ready { .. } => {}
+            }
         }
         d
     }

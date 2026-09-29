@@ -27,6 +27,7 @@ use std::time::Duration;
 use hm_ident::Identity;
 use hm_net::{Accept, Verdict};
 use hm_rig::ptt::Ptt;
+use hm_wire::stream::{next_message, StreamLimits, StreamMessage, OBJECT_MAGIC};
 use hm_wire::Callsign;
 use hm_xfer::{object_id, receipt_statement};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -36,9 +37,13 @@ use tokio::sync::{mpsc, oneshot};
 use super::live::LiveConfig;
 use crate::sound_link::PttFactory;
 
-const MAGIC: &[u8; 4] = b"HMD0";
 /// Largest bundle accepted over a modem connection.
 pub const MAX_OBJECT: usize = 256 * 1024;
+/// A modem connection carries bundles and their answers, no control messages.
+const LIMITS: StreamLimits = StreamLimits {
+    max_object: MAX_OBJECT,
+    max_control: 0,
+};
 /// A call not answered in this long has failed.
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Longest wait for a receipt once a bundle is sent (HF is slow).
@@ -208,55 +213,53 @@ impl Inbox {
     /// `"HMD0"` and answers with `0x00` or `0x01`, so both can share one
     /// connection (both stations may send at once).
     fn next(&mut self) -> Option<Message> {
-        let b = &self.buf;
-        let (msg, used) = match *b.first()? {
-            0 if b.len() >= 65 => (Message::Receipt(b[1..65].try_into().expect("64 bytes")), 65),
-            1 if b.len() >= 3 => {
-                let n = u16::from_be_bytes([b[1], b[2]]) as usize;
-                if b.len() < 3 + n {
-                    return None;
-                }
-                (
-                    Message::Rejected(String::from_utf8_lossy(&b[3..3 + n]).into_owned()),
-                    3 + n,
-                )
+        let (msg, used) = match next_message(&self.buf, LIMITS) {
+            Ok(None) => return None,
+            Ok(Some((message, used))) => {
+                let msg = match message {
+                    StreamMessage::Object(object) => Message::Bundle(object.to_vec()),
+                    StreamMessage::Stored(receipt) => Message::Receipt(receipt),
+                    StreamMessage::Rejected(reason) => {
+                        Message::Rejected(String::from_utf8_lossy(reason).into_owned())
+                    }
+                    StreamMessage::Busy { retry_after, reason } => Message::Rejected(format!(
+                        "busy for {retry_after} s: {}",
+                        String::from_utf8_lossy(reason)
+                    )),
+                    StreamMessage::Control(_) => {
+                        Message::Bad("no control messages on a modem connection".into())
+                    }
+                };
+                (msg, used)
             }
-            0 | 1 => return None,
-            b'H' if b.len() < 8 => return None,
-            b'H' if &b[..4] == MAGIC => {
-                let len = u32::from_be_bytes([b[4], b[5], b[6], b[7]]) as usize;
-                if len > MAX_OBJECT {
-                    (
-                        Message::Bad(format!("object of {len} bytes is too large")),
-                        b.len(),
-                    )
-                } else if b.len() < 8 + len {
-                    return None;
-                } else {
-                    (Message::Bundle(b[8..8 + len].to_vec()), 8 + len)
-                }
-            }
-            _ => (Message::Bad("unknown message type".into()), b.len()),
+            // Nothing after it can be told apart from it: drop what is buffered.
+            Err(error) => (Message::Bad(error.to_string()), self.buf.len()),
         };
         self.buf.drain(..used);
         Some(msg)
     }
 }
 
-fn bundle_message(object: &[u8]) -> Vec<u8> {
-    let mut m = Vec::with_capacity(8 + object.len());
-    m.extend_from_slice(MAGIC);
-    m.extend_from_slice(&(object.len() as u32).to_be_bytes());
-    m.extend_from_slice(object);
-    m
+/// Most data kept while waiting for the CONNECTED line it belongs to: one
+/// whole bundle message.
+const EARLY_LIMIT: usize = 8 + MAX_OBJECT;
+
+/// Whether `bytes` can be the start of what a peer sends on a new connection.
+/// Each side's first message is a bundle (answers only follow bundles), so
+/// anything else is left over from an earlier connection.
+fn opens_connection(bytes: &[u8]) -> bool {
+    let n = bytes.len().min(OBJECT_MAGIC.len());
+    n > 0 && bytes[..n] == OBJECT_MAGIC[..n]
 }
 
+fn bundle_message(object: &[u8]) -> Vec<u8> {
+    StreamMessage::Object(object).encode()
+}
+
+/// A refusal. Busy is sent as a refusal saying so: modem peers of older
+/// versions know no busy answer.
 fn rejection(reason: &str) -> Vec<u8> {
-    let bytes = &reason.as_bytes()[..reason.len().min(512)];
-    let mut r = vec![1u8];
-    r.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-    r.extend_from_slice(bytes);
-    r
+    StreamMessage::Rejected(reason.as_bytes()).encode()
 }
 
 /// The modem program's two ports.
@@ -433,6 +436,10 @@ impl Task {
         let mut state = State::Idle;
         let mut line = Vec::new();
         let mut buf = vec![0u8; 4096];
+        // Data that arrives before the CONNECTED line saying whose it is: the
+        // modem's command and data ports are separate streams, so a peer that
+        // starts sending as soon as it is connected can beat that line here.
+        let mut early: Vec<u8> = Vec::new();
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             // Start the next delivery when free.
@@ -460,7 +467,24 @@ impl Task {
                     }
                     let text = String::from_utf8_lossy(&line).trim().to_string();
                     line.clear();
+                    let was_connected = matches!(state, State::Connected { .. });
                     state = self.on_event(&mut p, &mut keyer, state, &text).await?;
+                    match (matches!(state, State::Connected { .. }), was_connected) {
+                        (true, false) => {
+                            let bytes = std::mem::take(&mut early);
+                            if opens_connection(&bytes) {
+                                state = self.on_data(&mut p, state, &bytes).await?;
+                            } else if !bytes.is_empty() {
+                                super::log(format!(
+                                    "modem: dropped {} bytes left over from an earlier connection",
+                                    bytes.len()
+                                ));
+                            }
+                        }
+                        // The connection ended: nothing before it belongs to the next one.
+                        (false, true) => early.clear(),
+                        _ => {}
+                    }
                 }
                 r = p.data_r.read(&mut buf) => {
                     let n = r?;
@@ -470,7 +494,13 @@ impl Task {
                     let mut bytes = Vec::new();
                     let chunk = buf[..n].to_vec();
                     self.unwrap_data(&mut p, &chunk, &mut bytes);
-                    state = self.on_data(&mut p, state, &bytes).await?;
+                    if matches!(state, State::Connected { .. }) {
+                        state = self.on_data(&mut p, state, &bytes).await?;
+                    } else if early.len() + bytes.len() <= EARLY_LIMIT {
+                        early.extend_from_slice(&bytes);
+                    } else {
+                        early.clear();
+                    }
                 }
                 _ = tick.tick() => {
                     state = self.on_tick(&mut p, state).await?;
@@ -615,9 +645,7 @@ impl Task {
                             let sig =
                                 self.identity
                                     .sign(&receipt_statement(self.me.base(), peer.base(), 0, &id));
-                            let mut r = vec![0u8];
-                            r.extend_from_slice(&sig);
-                            r
+                            StreamMessage::Stored(sig).encode()
                         }
                         Verdict::Busy { retry_after, reason } => {
                             rejection(&format!("busy for {retry_after} s: {reason}"))
@@ -742,5 +770,37 @@ impl Task {
             }
             s => Ok(s),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_connection_opens_with_a_bundle() {
+        let message = bundle_message(b"object");
+        // Whole, or only its first bytes so far.
+        for n in 1..=message.len() {
+            assert!(opens_connection(&message[..n]), "{n} bytes");
+        }
+        // Answers and stray bytes only follow a bundle on a live connection.
+        assert!(!opens_connection(&[]));
+        assert!(!opens_connection(&[0; 65]));
+        assert!(!opens_connection(&rejection("no")));
+        assert!(!opens_connection(b"HMX0"));
+    }
+
+    #[test]
+    fn inbox_splits_bundles_and_answers() {
+        let mut inbox = Inbox::default();
+        inbox.buf.extend_from_slice(&bundle_message(b"one"));
+        inbox.buf.push(0);
+        inbox.buf.extend_from_slice(&[7; 64]);
+        inbox.buf.extend_from_slice(&rejection("busy"));
+        assert!(matches!(inbox.next(), Some(Message::Bundle(b)) if b == b"one"));
+        assert!(matches!(inbox.next(), Some(Message::Receipt(r)) if r == [7; 64]));
+        assert!(matches!(inbox.next(), Some(Message::Rejected(r)) if r == "busy"));
+        assert!(inbox.next().is_none());
     }
 }

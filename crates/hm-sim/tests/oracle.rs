@@ -30,7 +30,7 @@ struct Scenario {
 }
 
 fn random_loss(g: &mut DetRng) -> Loss {
-    match g.below(6) {
+    match g.below(7) {
         0 => Loss::None,
         1 => Loss::Bernoulli(g.next_f64() * 0.3),
         2 => Loss::GilbertElliott {
@@ -47,6 +47,12 @@ fn random_loss(g: &mut DetRng) -> Loss {
             Loss::Hourly(t)
         }
         4 => Loss::afsk_1200(4.0 + g.next_f64() * 8.0),
+        5 => Loss::Fading {
+            curve: &hm_sim::afsk_1200::CURVE,
+            mean_snr_db: 8.0 + g.next_f64() * 16.0,
+            doppler_spread_hz: 0.05 + g.next_f64() * 2.0,
+            rician_k: if g.chance(0.5) { 0.0 } else { g.next_f64() * 10.0 },
+        },
         _ => Loss::Bernoulli(0.0),
     }
 }

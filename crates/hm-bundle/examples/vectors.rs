@@ -164,8 +164,11 @@ fn main() {
     let ui = ax25::wrap(call("SA0KAM"), &hm_frame).unwrap();
     println!("ax25 {}", hex(&ui));
     println!("kiss {}", hex(&kiss::data_frame(0, &ui)));
+    let compact = ax25::wrap_frame(call("SA0KAM"), &hm_frame, true).unwrap();
+    println!("compact {}", hex(&compact));
+    assert_eq!(ax25::unwrap_frame(&compact), Some(hm_frame.clone()));
 
-    println!("\n## Transfer of the chat bundle (SA0KAM -> SO5KM-1, symbol size 200, first over, opening the session)");
+    println!("\n## Transfer of the chat bundle (SA0KAM -> SO5KM-1, symbols of up to 200 bytes: one of 120, first over, opening the session)");
     let object = chat.to_vec();
     println!("object_id {}", object_id(&object));
     let mut cfg = Config::vhf_1200(call("SA0KAM"));

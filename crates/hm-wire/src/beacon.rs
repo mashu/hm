@@ -16,6 +16,10 @@ pub const FLAG_MAILBOX: u8 = 0x01;
 pub const FLAG_RELAY: u8 = 0x02;
 /// Flag: the station has internet links.
 pub const FLAG_INTERNET: u8 = 0x04;
+/// Flag: the station holds bundles others may pull with holdings SYNC (mail
+/// waiting for a station, relayable holdings, its own bulletins). Stations
+/// ask only those that set it.
+pub const FLAG_HOLDING: u8 = 0x08;
 
 /// A station heard recently by the beaconing station.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -28,7 +32,8 @@ pub struct Heard {
 /// Presence and identification: BEACON frame payload, broadcast.
 ///
 /// ```text
-/// flags     u8        FLAG_MAILBOX | FLAG_RELAY | FLAG_INTERNET; other bits 0
+/// flags     u8        FLAG_MAILBOX | FLAG_RELAY | FLAG_INTERNET | FLAG_HOLDING;
+///                     other bits 0, and ignored by receivers
 /// key       [u8; 32]  the station's Ed25519 key
 /// time      u32       Unix seconds when sent
 /// locator   [u8; 6]   Maidenhead locator, upper case ASCII, 4 characters

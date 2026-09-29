@@ -13,7 +13,7 @@ use hm_wire::{Callsign, ObjectId};
 
 use super::choose::Bearer;
 use super::live::{Live, Overrides};
-use crate::config::{RadioSettings, RelaySettings};
+use crate::config::RadioSettings;
 use crate::files::KeyFile;
 use crate::kiss_link::{KissTarget, TncParams};
 use crate::sound_link::{AudioFactory, Csma, Framing, PttFactory};
@@ -128,7 +128,6 @@ pub struct NodeConfig {
     pub internet: Option<InternetConfig>,
     /// An ARQ modem program (VARA, Mercury, ARDOP) as a third bearer.
     pub modem: Option<super::arq::ArqConfig>,
-    pub relay: RelaySettings,
     /// Planned directed contacts loaded from `[[contact]]`.
     pub schedules: Vec<ScheduledContact>,
     pub store: PathBuf,

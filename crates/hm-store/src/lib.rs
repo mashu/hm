@@ -30,6 +30,9 @@ const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const CONTACT_EVIDENCE: TableDefinition<[u8; 16], &[u8]> = TableDefinition::new("contact_evidence");
 /// Per-peer outbound chat sequence (callsign bytes → last assigned seq).
 const PEER_SEQ: TableDefinition<[u8; 6], u64> = TableDefinition::new("peer_seq");
+/// A bulletin stored without its expiry (by older versions) is offered for
+/// this long after it was queued: a bulletin's lifetime.
+const BULLETIN_FALLBACK_SECS: u64 = 24 * 3600;
 
 #[derive(Debug)]
 pub enum Error {
@@ -231,6 +234,22 @@ pub struct RelayMetadata<'a> {
     pub max_hops: u8,
     pub expires_at: u64,
     pub wire_seq: Option<u64>,
+}
+
+impl RelayMetadata<'_> {
+    /// Hop accounting that adds up, no loop in the path, not yet expired.
+    fn is_valid(&self, now: u64) -> bool {
+        self.max_hops != 0
+            && self.max_hops <= 16
+            && self.hop_count <= self.max_hops
+            && usize::from(self.hop_count) == self.visited.len()
+            && self.expires_at > now
+            && !self
+                .visited
+                .iter()
+                .enumerate()
+                .any(|(index, callsign)| self.visited[..index].contains(callsign))
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -676,17 +695,7 @@ impl Store {
         metadata: RelayMetadata<'_>,
         now: u64,
     ) -> Result<bool> {
-        if metadata.max_hops == 0
-            || metadata.max_hops > 16
-            || metadata.hop_count > metadata.max_hops
-            || usize::from(metadata.hop_count) != metadata.visited.len()
-            || metadata.expires_at <= now
-            || metadata
-                .visited
-                .iter()
-                .enumerate()
-                .any(|(index, callsign)| metadata.visited[..index].contains(callsign))
-        {
+        if !metadata.is_valid(now) {
             return Err(Error::Corrupt("invalid relay metadata".into()));
         }
         let tx = self.write_tx()?;
@@ -785,13 +794,34 @@ impl Store {
         policy: RetryPolicy,
         now: u64,
     ) -> Result<(Retry, Option<Callsign>)> {
+        self.attempt_failed_or_hold(id, reason, policy, now, false)
+    }
+
+    /// An attempt failed. With `hold`, a message that has used up its
+    /// attempts is not given up but kept queued, tried again every
+    /// `max_delay_secs` and whenever [`Store::wake`] says its destination is
+    /// in reach, until the bundle expires: store and forward over links that
+    /// open for an hour a day must not drop a message after a few hours of
+    /// retries. Without `hold` it fails, as [`Store::attempt_failed`] does.
+    pub fn attempt_failed_or_hold(
+        &self,
+        id: ObjectId,
+        reason: &str,
+        policy: RetryPolicy,
+        now: u64,
+        hold: bool,
+    ) -> Result<(Retry, Option<Callsign>)> {
         self.update(id, |r| {
             if r.state != State::Queued {
                 return (Retry::Inactive, None);
             }
             r.attempts += 1;
             r.note = Some(reason.to_string());
-            if r.attempts >= policy.max_attempts {
+            if r.attempts >= policy.max_attempts && hold {
+                r.next_attempt = now + policy.max_delay_secs.max(1);
+                r.note = Some(format!("{reason}; held until it expires"));
+                (Retry::At(r.next_attempt), None)
+            } else if r.attempts >= policy.max_attempts {
                 r.state = State::Failed;
                 let notify = if r.direction == Direction::Relay {
                     r.custody_from
@@ -822,6 +852,67 @@ impl Store {
             } else {
                 None
             }
+        })
+    }
+
+    /// `destination` is in reach (heard on the radio, or linked): its queued
+    /// messages waiting for a later attempt are tried now. Returns how many.
+    pub fn wake(&self, destination: Callsign, now: u64) -> Result<usize> {
+        let tx = self.write_tx()?;
+        let mut woken = 0;
+        {
+            let queue = tx.open_table(QUEUE)?;
+            let mut messages = tx.open_table(MESSAGES)?;
+            let mut records = Vec::new();
+            for entry in queue.iter()? {
+                let (key, _) = entry?;
+                let (_, _, id) = key.value();
+                if let Some(bytes) = messages.get(id)? {
+                    records.push(decode(bytes.value())?);
+                }
+            }
+            for mut r in records {
+                if r.state == State::Queued && r.final_destination() == destination && r.next_attempt > now {
+                    r.next_attempt = now;
+                    messages.insert(r.id.0, encode(&r).as_slice())?;
+                    woken += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(woken)
+    }
+
+    /// Custody of a relay holding this node had given up on is offered again:
+    /// take it back on, with the new holding's metadata. False (and nothing
+    /// changed) unless the record is a failed relay holding.
+    pub fn revive_relay(&self, id: ObjectId, metadata: RelayMetadata<'_>, now: u64) -> Result<bool> {
+        if !metadata.is_valid(now) {
+            return Err(Error::Corrupt("invalid relay metadata".into()));
+        }
+        self.update(id, |r| {
+            if r.direction != Direction::Relay
+                || r.state != State::Failed
+                || r.final_destination() != metadata.destination
+            {
+                return false;
+            }
+            r.state = State::Queued;
+            r.attempts = 0;
+            r.next_attempt = now;
+            r.precedence = metadata.precedence;
+            r.custody_from = Some(metadata.custody_from);
+            r.hop_count = Some(metadata.hop_count);
+            r.visited = (!metadata.visited.is_empty()).then(|| metadata.visited.to_vec());
+            r.max_hops = Some(metadata.max_hops);
+            r.expires_at = Some(metadata.expires_at);
+            r.next_hop = None;
+            r.next_hops = None;
+            r.custody_by = None;
+            r.custody_copies = None;
+            r.shadow_until = None;
+            r.note = Some("custody offered again; relaying".into());
+            true
         })
     }
 
@@ -1051,6 +1142,39 @@ impl Store {
         })
     }
 
+    /// A receipt signed by `destination` for relay holding `id` passed through
+    /// this node: the bundle arrived, so neither send it on nor resend it when
+    /// the suspect timer fires. False unless an active holding for that
+    /// destination.
+    pub fn relay_receipted(
+        &self,
+        id: ObjectId,
+        receipt: ObjectId,
+        destination: Callsign,
+        now: u64,
+    ) -> Result<bool> {
+        match self.update(id, |r| {
+            if r.direction != Direction::Relay
+                || !matches!(r.state, State::Queued | State::InTransit)
+                || r.final_destination() != destination
+            {
+                return false;
+            }
+            r.state = State::Delivered;
+            r.verified = true;
+            r.e2e_receipt = Some(receipt);
+            r.next_attempt = now;
+            r.next_hop = None;
+            r.next_hops = None;
+            r.shadow_until = None;
+            r.note = Some("end-to-end receipt passed through".into());
+            true
+        }) {
+            Err(Error::NotFound) => Ok(false),
+            other => other,
+        }
+    }
+
     /// Drop a locally queued outbound message. Late handoff receipts are ignored.
     pub fn cancel(&self, id: ObjectId) -> Result<bool> {
         self.update(id, |r| {
@@ -1168,6 +1292,32 @@ impl Store {
     }
 
     /// Active ids to advertise to `peer` during pairwise holdings sync.
+    /// Whether this station holds anything another may pull with holdings
+    /// SYNC: an outbound or relayed bundle still queued or in its shadow
+    /// period, or one of its own bulletins. Beacons say so ([`hm_wire::FLAG_HOLDING`]).
+    pub fn holds_for_others(&self, now: u64) -> Result<bool> {
+        let tx = self.read_tx()?;
+        let messages = tx.open_table(MESSAGES)?;
+        let bulletin_dest = Callsign::parse("ALL").expect("ALL is a valid callsign");
+        for entry in messages.iter()? {
+            let (_, bytes) = entry?;
+            let record = decode(bytes.value())?;
+            if record.expires_at.is_some_and(|expires| expires <= now)
+                || !matches!(record.direction, Direction::Out | Direction::Relay)
+            {
+                continue;
+            }
+            let bulletin = record.direction == Direction::Out
+                && record.final_destination() == bulletin_dest
+                && matches!(record.state, State::Queued | State::Delivered)
+                && (record.expires_at.is_some() || record.at.saturating_add(BULLETIN_FALLBACK_SECS) > now);
+            if bulletin || record.state == State::Queued || record.in_shadow(now) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn holding_ids(&self, peer: Callsign, relayable: bool, now: u64) -> Result<Vec<ObjectId>> {
         let tx = self.read_tx()?;
         let messages = tx.open_table(MESSAGES)?;
@@ -1184,7 +1334,8 @@ impl Store {
             }
             let bulletin = record.direction == Direction::Out
                 && record.final_destination() == bulletin_dest
-                && matches!(record.state, State::Queued | State::Delivered);
+                && matches!(record.state, State::Queued | State::Delivered)
+                && (record.expires_at.is_some() || record.at.saturating_add(BULLETIN_FALLBACK_SECS) > now);
             let shadowed = record.in_shadow(now);
             if !bulletin && record.state != State::Queued && !shadowed {
                 continue;
@@ -1253,18 +1404,27 @@ impl Store {
     }
 
     pub fn save_contact_evidence(&self, key: EdgeKey, evidence: Evidence) -> Result<()> {
-        if !evidence.successes.is_finite()
-            || !evidence.failures.is_finite()
-            || evidence.successes < 0.0
-            || evidence.failures < 0.0
-            || key.utc_hour.is_some_and(|hour| hour > 23)
-        {
-            return Err(Error::Corrupt("invalid contact evidence".into()));
+        self.save_contact_evidence_batch(&[(key, evidence)])
+    }
+
+    /// Save several links' evidence in one transaction.
+    pub fn save_contact_evidence_batch(&self, entries: &[(EdgeKey, Evidence)]) -> Result<()> {
+        for (key, evidence) in entries {
+            if !evidence.successes.is_finite()
+                || !evidence.failures.is_finite()
+                || evidence.successes < 0.0
+                || evidence.failures < 0.0
+                || key.utc_hour.is_some_and(|hour| hour > 23)
+            {
+                return Err(Error::Corrupt("invalid contact evidence".into()));
+            }
         }
         let tx = self.write_tx()?;
         {
-            tx.open_table(CONTACT_EVIDENCE)?
-                .insert(evidence_key(key), evidence_value(evidence).as_slice())?;
+            let mut table = tx.open_table(CONTACT_EVIDENCE)?;
+            for (key, evidence) in entries {
+                table.insert(evidence_key(*key), evidence_value(*evidence).as_slice())?;
+            }
         }
         tx.commit()?;
         Ok(())

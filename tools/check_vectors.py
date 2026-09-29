@@ -95,7 +95,20 @@ def check(text: str) -> None:
     assert ax == expect_ax, "ax25 wrapper"
     esc = ax.replace(b"\xdb", b"\xdb\xdd").replace(b"\xc0", b"\xdb\xdc")
     assert kiss == b"\xc0\x00" + esc + b"\xc0", "kiss framing"
-    print("ok  AX.25 UI wrapper and KISS framing")
+    # Compact form: to the destination's own address (SO5KM-1), with a
+    # 6-byte header (version 1 | type, session, index) instead of 18 bytes.
+    compact = bytes.fromhex(re.search(r"compact ([0-9a-f]+)", s_ax).group(1))
+    expect_compact = (
+        ax25_addr("SO5KM", 1, 1, 0)
+        + ax25_addr("SA0KAM", 0, 0, 1)
+        + b"\x03\xf0"
+        + bytes([0x10 | (frame[0] & 0x0F)])
+        + frame[13:18]
+        + frame[18:]
+    )
+    assert compact == expect_compact, "compact AX.25 form"
+    assert len(ax) - len(compact) == 12
+    print("ok  AX.25 UI wrapper, compact form and KISS framing")
 
     sender = nacl.signing.SigningKey(bytes([7] * 32)).verify_key
     for title in ["## Chat bundle", "## Mail bundle"]:
@@ -109,7 +122,9 @@ def check(text: str) -> None:
         print(f"ok  {title[3:].lower()} (id, signature)")
 
     # Transfer: OFFER fields, DATA preamble, and the RaptorQ systematic property
-    # (source symbol 0 is the first 200 bytes of the object, zero-padded).
+    # (source symbol 0 is the start of the object, zero-padded to the symbol
+    # size). The object fits one symbol, so the sender sizes the symbol to the
+    # object rounded up to 8 bytes, not to its 200-byte maximum.
     chat_wire, _ = wire_and_id(text, "## Chat bundle")
     s_x = section(text, "## Transfer of the chat bundle")
     xid = re.search(r"object_id ([0-9a-f]{64})", s_x).group(1)
@@ -120,13 +135,15 @@ def check(text: str) -> None:
     body = offer[18:]
     assert body[0] == 0x01 and body[1:33].hex() == xid
     assert int.from_bytes(body[33:36], "big") == len(chat_wire)
-    assert int.from_bytes(body[36:38], "big") == 200 and body[38] == 0 and body[39] == len(datas)
+    t = int.from_bytes(body[36:38], "big")
+    assert t == -(-len(chat_wire) // 8) * 8, f"symbol size {t} fits the {len(chat_wire)}-byte object"
+    assert body[38] == 0 and body[39] == len(datas)
     for n, d in enumerate(datas):
         assert d[0] == 0x00 and d[13:15] == offer[13:15], "DATA type and session"
         esi = int.from_bytes(d[15:18], "big")
         assert int.from_bytes(d[18:21], "big") == len(chat_wire) and d[21] == len(datas) - 1 - n
         if esi == 0:
-            assert d[22:] == chat_wire.ljust(200, b"\x00"), "systematic source symbol"
+            assert d[22:] == chat_wire.ljust(t, b"\x00"), "systematic source symbol"
     print(f"ok  transfer OFFER and {len(datas)} DATA frame(s), systematic symbol")
 
     # The first over to a new peer opens the session: OPEN before the OFFER,

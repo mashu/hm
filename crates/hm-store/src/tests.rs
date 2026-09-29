@@ -610,3 +610,206 @@ fn final_delivery_and_e2e_receipt_queue_are_atomic_and_idempotent() {
     assert_eq!(store.list(Direction::Out, 10).unwrap().len(), 1);
     assert_eq!(store.due(100).unwrap()[0].id, id(2));
 }
+
+#[test]
+fn a_held_message_outlasts_its_retries_and_wakes_when_its_destination_is_heard() {
+    let db = TempDb::new("hold");
+    let s = Store::open(&db.0).unwrap();
+    let policy = RetryPolicy {
+        first_delay_secs: 10,
+        max_delay_secs: 25,
+        max_attempts: 2,
+    };
+    let destination = call("SO5KM");
+    s.enqueue(id(1), b"a", destination, 0, 0).unwrap();
+    s.enqueue(id(2), b"b", call("M0CCC"), 0, 0).unwrap();
+    assert_eq!(
+        s.attempt_failed_or_hold(id(1), "no answer", policy, 100, true)
+            .unwrap(),
+        (Retry::At(110), None)
+    );
+    assert_eq!(
+        s.attempt_failed_or_hold(id(1), "no answer", policy, 110, true)
+            .unwrap(),
+        (Retry::At(135), None),
+        "retries used up: held, tried again after the longest delay"
+    );
+    assert_eq!(
+        s.attempt_failed_or_hold(id(1), "no answer", policy, 135, true)
+            .unwrap(),
+        (Retry::At(160), None)
+    );
+    let r = s.record(id(1)).unwrap().unwrap();
+    assert_eq!(r.state, State::Queued);
+    assert_eq!(r.note.as_deref(), Some("no answer; held until it expires"));
+
+    for at in [120, 130] {
+        s.attempt_failed_or_hold(id(2), "no answer", policy, at, true)
+            .unwrap();
+    }
+    assert!(s.due(140).unwrap().is_empty());
+    assert_eq!(s.wake(destination, 140).unwrap(), 1, "only its own messages");
+    let due: Vec<ObjectId> = s.due(140).unwrap().into_iter().map(|r| r.id).collect();
+    assert_eq!(due, vec![id(1)]);
+    assert_eq!(s.wake(destination, 140).unwrap(), 0, "already due");
+
+    // Without a hold the same history gives up.
+    s.enqueue(id(3), b"c", destination, 0, 0).unwrap();
+    s.attempt_failed_or_hold(id(3), "no answer", policy, 100, false)
+        .unwrap();
+    assert_eq!(
+        s.attempt_failed_or_hold(id(3), "no answer", policy, 110, false)
+            .unwrap(),
+        (Retry::GaveUp, None)
+    );
+    assert_eq!(
+        s.wake(destination, 200).unwrap(),
+        0,
+        "a failed message stays failed"
+    );
+    assert_eq!(s.record(id(3)).unwrap().unwrap().state, State::Failed);
+}
+
+#[test]
+fn a_failed_relay_holding_is_taken_on_again_when_custody_is_offered_anew() {
+    let db = TempDb::new("revive");
+    let s = Store::open(&db.0).unwrap();
+    let origin = call("M0AAA");
+    let other = call("M0DDD");
+    let destination = call("M0CCC");
+    let metadata = |from: Callsign, visited: &'static [Callsign]| RelayMetadata {
+        custody_from: from,
+        destination,
+        precedence: 1,
+        hop_count: visited.len() as u8,
+        visited,
+        max_hops: 8,
+        expires_at: 1_000,
+        wire_seq: None,
+    };
+    let first: &'static [Callsign] = Box::leak(Box::new([origin]));
+    let second: &'static [Callsign] = Box::leak(Box::new([origin, other]));
+    assert!(s
+        .enqueue_relay(id(1), b"bundle", metadata(origin, first), 100)
+        .unwrap());
+    assert!(
+        !s.revive_relay(id(1), metadata(other, second), 150).unwrap(),
+        "still active"
+    );
+    assert_eq!(s.abandon(id(1), "no route").unwrap(), Some(origin));
+    assert_eq!(s.relay_usage(200).unwrap().count, 0);
+
+    let mut wrong = metadata(other, second);
+    wrong.destination = other;
+    assert!(
+        !s.revive_relay(id(1), wrong, 200).unwrap(),
+        "a different destination"
+    );
+    assert!(s.revive_relay(id(1), metadata(other, second), 200).unwrap());
+    let r = s.record(id(1)).unwrap().unwrap();
+    assert_eq!(
+        (r.state, r.attempts, r.custody_from, r.hop_count, r.next_attempt),
+        (State::Queued, 0, Some(other), Some(2), 200)
+    );
+    assert_eq!(r.visited.as_deref(), Some(second));
+    assert_eq!(s.relay_usage(200).unwrap().count, 1);
+    assert_eq!(s.due(200).unwrap()[0].id, id(1));
+    assert!(
+        s.revive_relay(id(1), metadata(other, second), 1_000).is_err(),
+        "expired"
+    );
+
+    s.enqueue(id(2), b"own", destination, 0, 0).unwrap();
+    s.abandon(id(2), "no route").unwrap();
+    assert!(
+        !s.revive_relay(id(2), metadata(other, second), 200).unwrap(),
+        "not a relay holding"
+    );
+}
+
+#[test]
+fn a_receipt_passing_through_closes_the_relay_holding_it_answers() {
+    let db = TempDb::new("relay-receipt");
+    let s = Store::open(&db.0).unwrap();
+    let origin = call("M0AAA");
+    let next = call("M0BBB");
+    let destination = call("M0CCC");
+    let metadata = RelayMetadata {
+        custody_from: origin,
+        destination,
+        precedence: 1,
+        hop_count: 1,
+        visited: &[origin],
+        max_hops: 8,
+        expires_at: 1_000,
+        wire_seq: None,
+    };
+    assert!(s.enqueue_relay(id(1), b"bundle", metadata, 100).unwrap());
+    assert!(s.set_next_hop(id(1), next).unwrap());
+    assert!(s
+        .custody_transferred(
+            id(1),
+            CustodyHandoff {
+                next_hop: next,
+                receipt_verified: true,
+                by: "radio",
+                now: 110,
+                grace_secs: 50,
+                suspect_secs: 30,
+            }
+        )
+        .unwrap());
+    assert!(
+        !s.relay_receipted(id(1), id(9), next, 120).unwrap(),
+        "only the destination's"
+    );
+    assert!(
+        !s.relay_receipted(id(7), id(9), destination, 120).unwrap(),
+        "unknown holding"
+    );
+    assert!(s.relay_receipted(id(1), id(9), destination, 120).unwrap());
+    let r = s.record(id(1)).unwrap().unwrap();
+    assert_eq!((r.state, r.e2e_receipt), (State::Delivered, Some(id(9))));
+    assert!(s.suspect_due(1_000).unwrap().is_empty(), "never resent");
+    assert!(!s.relay_receipted(id(1), id(9), destination, 130).unwrap());
+
+    // Our own messages are completed by e2e_delivered, not this.
+    s.enqueue(id(2), b"own", destination, 0, 0).unwrap();
+    assert!(!s.relay_receipted(id(2), id(8), destination, 120).unwrap());
+}
+
+#[test]
+fn a_station_holds_something_while_mail_waits_or_its_bulletins_live() {
+    let db = TempDb::new("holds");
+    let s = Store::open(&db.0).unwrap();
+    assert!(!s.holds_for_others(100).unwrap());
+    s.enqueue(id(1), b"mail", call("SO5KM"), 0, 100).unwrap();
+    assert!(s.holds_for_others(100).unwrap());
+    s.delivered(id(1), true, "radio", 110).unwrap();
+    assert!(!s.holds_for_others(110).unwrap());
+
+    let all = call("ALL");
+    s.enqueue_with(
+        id(2),
+        b"bulletin",
+        EnqueueOpts {
+            to: all,
+            precedence: 0,
+            now: 200,
+            wire_seq: None,
+            expires_at: Some(1_000),
+        },
+    )
+    .unwrap();
+    s.delivered(id(2), true, "radio", 210).unwrap();
+    assert!(s.holds_for_others(999).unwrap(), "a live bulletin can be pulled");
+    assert_eq!(s.holding_ids(call("M0AAA"), false, 999).unwrap(), vec![id(2)]);
+    assert!(!s.holds_for_others(1_000).unwrap(), "an expired one cannot");
+    assert!(s.holding_ids(call("M0AAA"), false, 1_000).unwrap().is_empty());
+
+    // Stored by an older version without its expiry: a day, as bulletins live.
+    s.enqueue(id(3), b"old bulletin", all, 0, 2_000).unwrap();
+    s.delivered(id(3), true, "radio", 2_010).unwrap();
+    assert!(s.holds_for_others(2_000 + 24 * 3600 - 1).unwrap());
+    assert!(!s.holds_for_others(2_000 + 24 * 3600).unwrap());
+}

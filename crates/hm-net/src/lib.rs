@@ -26,6 +26,13 @@
 //!
 //! The receipt is the same statement as on radio (see `hm-xfer`), with base
 //! callsigns and session 0: the receiver's signature proving it holds the object.
+//!
+//! An open hub cannot tell who a dialer is, only that it holds the key in its
+//! certificate. So a certificate may not claim the callsign of a trusted
+//! station or of a station already linked under another key, and the hub
+//! bounds what strangers can make it hold: at most [`MAX_HUB_LINKS`] links,
+//! [`MAX_STREAMS`] messages at a time on each, each read within
+//! [`READ_TIMEOUT`] and buffered only as its bytes arrive.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -34,6 +41,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use hm_ident::{Identity, PublicKey};
+use hm_wire::stream::{next_message, request_header, StreamLimits, StreamMessage, CONTROL_TAKEN};
 use hm_wire::Callsign;
 use hm_xfer::{object_id, receipt_statement};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -46,8 +54,6 @@ use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 
 /// Application protocol name negotiated in the TLS handshake.
 pub const ALPN: &[u8] = b"hm-net/1";
-const OBJECT_MAGIC: &[u8; 4] = b"HMD0";
-const CONTROL_MAGIC: &[u8; 4] = b"HMC0";
 /// The listener's confirmation that it accepted the dialer.
 const ACCEPTED: &[u8; 4] = b"HMOK";
 /// How long a dialer waits for the listener to confirm it.
@@ -55,8 +61,18 @@ const CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest object accepted over the internet.
 pub const MAX_OBJECT: usize = 1024 * 1024;
 pub const MAX_CONTROL: usize = 4096;
+const LIMITS: StreamLimits = StreamLimits {
+    max_object: MAX_OBJECT,
+    max_control: MAX_CONTROL,
+};
 const REDIAL_EVERY: Duration = Duration::from_secs(3);
 const DELIVER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Links an open hub keeps at once; dialers beyond it are refused.
+pub const MAX_HUB_LINKS: usize = 256;
+/// Messages a peer may have open to us at once on one link.
+pub const MAX_STREAMS: u32 = 16;
+/// Time a peer has to send one whole message once it opened the stream.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What the node did with an object that arrived.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -335,6 +351,12 @@ fn transport() -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
     t.keep_alive_interval(Some(Duration::from_secs(5)));
     t.max_idle_timeout(Some(Duration::from_secs(20).try_into().expect("in range")));
+    // One bidirectional stream per message; the only unidirectional one is the
+    // listener's confirmation. The link's receive window bounds what a peer
+    // can make us buffer, whatever its streams claim.
+    t.max_concurrent_bidi_streams(MAX_STREAMS.into());
+    t.max_concurrent_uni_streams(2u32.into());
+    t.receive_window((4 * (MAX_OBJECT as u32 + 8)).into());
     Arc::new(t)
 }
 
@@ -463,11 +485,7 @@ impl Net {
         let key = self.public_key_of(to).ok_or(NetError::NotConnected)?;
         let exchange = async {
             let (mut send, mut recv) = conn.open_bi().await.map_err(|e| NetError::Io(e.to_string()))?;
-            let mut msg = Vec::with_capacity(8 + object.len());
-            msg.extend_from_slice(OBJECT_MAGIC);
-            msg.extend_from_slice(&(object.len() as u32).to_be_bytes());
-            msg.extend_from_slice(object);
-            send.write_all(&msg)
+            send.write_all(&StreamMessage::Object(object).encode())
                 .await
                 .map_err(|e| NetError::Io(e.to_string()))?;
             send.finish().map_err(|e| NetError::Io(e.to_string()))?;
@@ -475,23 +493,18 @@ impl Net {
                 .read_to_end(4096)
                 .await
                 .map_err(|e| NetError::Io(e.to_string()))?;
-            match reply.split_first() {
-                Some((0, sig)) if sig.len() == 64 => {
-                    let sig: [u8; 64] = sig.try_into().expect("length checked");
+            match next_message(&reply, LIMITS) {
+                Ok(Some((StreamMessage::Stored(sig), used))) if used == reply.len() => {
                     let statement = receipt_statement(to.base(), self.me, 0, &object_id(object));
                     key.verify(&statement, &sig).map_err(|_| NetError::BadReceipt)
                 }
-                Some((1, rest)) if rest.len() >= 2 => {
-                    let n = u16::from_be_bytes([rest[0], rest[1]]) as usize;
-                    let reason = String::from_utf8_lossy(rest.get(2..2 + n).unwrap_or(&[])).into_owned();
-                    Err(NetError::Rejected(reason))
+                Ok(Some((StreamMessage::Rejected(reason), _))) => {
+                    Err(NetError::Rejected(String::from_utf8_lossy(reason).into_owned()))
                 }
-                Some((2, rest)) if rest.len() >= 4 => {
-                    let retry_after = u16::from_be_bytes([rest[0], rest[1]]);
-                    let n = u16::from_be_bytes([rest[2], rest[3]]) as usize;
-                    let reason = String::from_utf8_lossy(rest.get(4..4 + n).unwrap_or(&[])).into_owned();
-                    Err(NetError::Busy { retry_after, reason })
-                }
+                Ok(Some((StreamMessage::Busy { retry_after, reason }, _))) => Err(NetError::Busy {
+                    retry_after,
+                    reason: String::from_utf8_lossy(reason).into_owned(),
+                }),
                 _ => Err(NetError::Io("malformed reply".into())),
             }
         };
@@ -514,24 +527,20 @@ impl Net {
                 .open_bi()
                 .await
                 .map_err(|error| NetError::Io(error.to_string()))?;
-            let mut message = Vec::with_capacity(8 + payload.len());
-            message.extend_from_slice(CONTROL_MAGIC);
-            message.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-            message.extend_from_slice(payload);
-            send.write_all(&message)
+            send.write_all(&StreamMessage::Control(payload).encode())
                 .await
                 .map_err(|error| NetError::Io(error.to_string()))?;
             send.finish().map_err(|error| NetError::Io(error.to_string()))?;
             let reply = recv
-                .read_to_end(512)
+                .read_to_end(1024)
                 .await
                 .map_err(|error| NetError::Io(error.to_string()))?;
-            match reply.as_slice() {
-                [0] => Ok(()),
-                [1, rest @ ..] if rest.len() >= 2 => {
-                    let length = u16::from_be_bytes([rest[0], rest[1]]) as usize;
-                    let reason = String::from_utf8_lossy(rest.get(2..2 + length).unwrap_or(&[])).into_owned();
-                    Err(NetError::Rejected(reason))
+            if reply == CONTROL_TAKEN {
+                return Ok(());
+            }
+            match next_message(&reply, LIMITS) {
+                Ok(Some((StreamMessage::Rejected(reason), _))) => {
+                    Err(NetError::Rejected(String::from_utf8_lossy(reason).into_owned()))
                 }
                 _ => Err(NetError::Io("malformed control reply".into())),
             }
@@ -552,13 +561,35 @@ impl Net {
             .ok()?;
         let cert = certs.first()?;
         let key = ed25519_key_in_cert(cert)?;
-        if let Some(call) = self.trust.read().expect("lock").names.get(&key).copied() {
+        let trust = self.trust.read().expect("lock");
+        if let Some(call) = trust.names.get(&key).copied() {
             return Some(call);
         }
-        if self.open {
-            return callsign_in_cert(cert);
+        if !self.open {
+            return None;
         }
-        None
+        // A stranger's callsign is only what its certificate claims: it may
+        // not be one we know by another key, which would let it speak for
+        // that station and push its link aside...
+        let call = callsign_in_cert(cert)?;
+        if trust.key_for(call).is_some() {
+            return None;
+        }
+        drop(trust);
+        // ...nor one that another stranger holds a live link under.
+        let held_by_other_key = self
+            .session_keys
+            .lock()
+            .expect("lock")
+            .get(&call)
+            .is_some_and(|held| held.0 != key);
+        let linked = self
+            .conns
+            .lock()
+            .expect("lock")
+            .get(&call)
+            .is_some_and(|c| c.close_reason().is_none() && c.stable_id() != conn.stable_id());
+        (!(held_by_other_key && linked)).then_some(call)
     }
 
     /// Replace the stations to keep a link to. Links to stations dropped from
@@ -611,6 +642,10 @@ impl Net {
 
 async fn accept_loop(net: Arc<Net>) {
     while let Some(incoming) = net.endpoint.accept().await {
+        if net.open && net.endpoint.open_connections() >= MAX_HUB_LINKS {
+            incoming.refuse();
+            continue;
+        }
         let net = net.clone();
         tokio::spawn(async move {
             if let Ok(conn) = incoming.await {
@@ -692,7 +727,10 @@ async fn serve_connection(net: Arc<Net>, peer: Callsign, conn: Connection) {
     while let Ok((mut send, mut recv)) = conn.accept_bi().await {
         let net = net.clone();
         tokio::spawn(async move {
-            let reply = match read_message(&mut recv).await {
+            let message = tokio::time::timeout(READ_TIMEOUT, read_message(&mut recv))
+                .await
+                .unwrap_or_else(|_| Err("message not sent in time".into()));
+            let reply = match message {
                 Ok(Incoming::Object(object)) => {
                     let id = object_id(&object);
                     let accept = net.accept.clone();
@@ -702,19 +740,21 @@ async fn serve_connection(net: Arc<Net>, peer: Callsign, conn: Connection) {
                     match verdict {
                         Verdict::Stored | Verdict::Duplicate => {
                             let sig = net.identity.sign(&receipt_statement(net.me, peer.base(), 0, &id));
-                            let mut r = vec![0u8];
-                            r.extend_from_slice(&sig);
-                            r
+                            StreamMessage::Stored(sig).encode()
                         }
-                        Verdict::Busy { retry_after, reason } => busy(retry_after, &reason),
-                        Verdict::Rejected(reason) => rejection(&reason),
+                        Verdict::Busy { retry_after, reason } => StreamMessage::Busy {
+                            retry_after,
+                            reason: reason.as_bytes(),
+                        }
+                        .encode(),
+                        Verdict::Rejected(reason) => StreamMessage::Rejected(reason.as_bytes()).encode(),
                     }
                 }
                 Ok(Incoming::Control(payload)) => {
                     (net.control)(peer, payload);
-                    vec![0]
+                    CONTROL_TAKEN.to_vec()
                 }
-                Err(reason) => rejection(&reason),
+                Err(reason) => StreamMessage::Rejected(reason.as_bytes()).encode(),
             };
             let _ = send.write_all(&reply).await;
             let _ = send.finish();
@@ -729,25 +769,6 @@ async fn serve_connection(net: Arc<Net>, peer: Callsign, conn: Connection) {
     }
 }
 
-fn rejection(reason: &str) -> Vec<u8> {
-    let bytes = reason.as_bytes();
-    let n = bytes.len().min(512);
-    let mut r = vec![1u8];
-    r.extend_from_slice(&(n as u16).to_be_bytes());
-    r.extend_from_slice(&bytes[..n]);
-    r
-}
-
-fn busy(retry_after: u16, reason: &str) -> Vec<u8> {
-    let bytes = reason.as_bytes();
-    let n = bytes.len().min(512);
-    let mut reply = vec![2_u8];
-    reply.extend_from_slice(&retry_after.to_be_bytes());
-    reply.extend_from_slice(&(n as u16).to_be_bytes());
-    reply.extend_from_slice(&bytes[..n]);
-    reply
-}
-
 enum Incoming {
     Object(Vec<u8>),
     Control(Vec<u8>),
@@ -756,17 +777,15 @@ enum Incoming {
 async fn read_message(recv: &mut quinn::RecvStream) -> Result<Incoming, String> {
     let mut head = [0u8; 8];
     recv.read_exact(&mut head).await.map_err(|e| e.to_string())?;
-    let len = u32::from_be_bytes([head[4], head[5], head[6], head[7]]) as usize;
-    let (limit, control) = match &head[..4] {
-        magic if magic == OBJECT_MAGIC => (MAX_OBJECT, false),
-        magic if magic == CONTROL_MAGIC => (MAX_CONTROL, true),
-        _ => return Err("unknown message type".into()),
-    };
-    if len > limit {
-        return Err(format!("message of {len} bytes exceeds {limit}"));
+    let (control, len) = request_header(&head, LIMITS)
+        .map_err(|error| error.to_string())?
+        .expect("eight bytes decide the header");
+    // The sender finishes the stream after the message. Take the bytes as
+    // they come rather than setting aside what the header claims up front.
+    let payload = recv.read_to_end(len).await.map_err(|e| e.to_string())?;
+    if payload.len() != len {
+        return Err(format!("message of {} bytes, header says {len}", payload.len()));
     }
-    let mut payload = vec![0u8; len];
-    recv.read_exact(&mut payload).await.map_err(|e| e.to_string())?;
     Ok(if control {
         Incoming::Control(payload)
     } else {

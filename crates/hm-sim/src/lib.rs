@@ -14,8 +14,9 @@
 //! - **Collisions**: two transmissions overlapping at a receiver destroy each
 //!   other (no capture effect), including hidden-terminal cases.
 //! - **Loss**: per directed link: Bernoulli, Gilbert–Elliott (bursty), a
-//!   per-UTC-hour table for HF band openings (sim time 0 = 00:00 UTC), or a
-//!   real modem's measured loss by SNR and frame length ([`Loss::afsk_1200`]).
+//!   per-UTC-hour table for HF band openings (sim time 0 = 00:00 UTC), a
+//!   real modem's measured loss by SNR and frame length ([`Loss::afsk_1200`]),
+//!   or that modem under flat fading, as on an HF path ([`Loss::Fading`]).
 //! - **Faults**: stations going down and up, links cut and restored
 //!   (partitions), per-station clock offset and drift, and frames delivered
 //!   with undetected bit errors.
@@ -73,6 +74,28 @@ pub enum Loss {
         curve: &'static LossCurve,
         snr_db: f64,
     },
+    /// The same modem on a fading path, as on HF. The signal's complex gain
+    /// fades with a Gaussian Doppler spectrum, as in Watterson's HF channel
+    /// model (CCIR 520, ITU-R F.1487): `doppler_spread_hz` is twice its
+    /// standard deviation, 0.1 Hz on a quiet ionospheric path ("good"), 0.5 Hz
+    /// ("moderate"), 1 Hz ("poor"), 10 Hz with flutter. A steady part is set
+    /// by the Rician factor `rician_k` (0: pure Rayleigh fading). A frame is
+    /// judged at the weakest SNR it meets on air, through the measured curve,
+    /// so a fade anywhere in a long frame loses it. Both directions of a path
+    /// share the fading: over seconds the channel is reciprocal, so an ACK
+    /// tends to fail when the over did.
+    ///
+    /// The gain is a sum of 16 sinusoids with Doppler shifts drawn from the
+    /// spectrum. Not modelled: multipath delay spread, which smears symbols
+    /// and costs a real HF modem more than the white-noise curve says, and
+    /// noise that differs between the two ends.
+    Fading {
+        curve: &'static LossCurve,
+        /// Mean SNR in dB, noise in a 3 kHz bandwidth.
+        mean_snr_db: f64,
+        doppler_spread_hz: f64,
+        rician_k: f64,
+    },
 }
 
 impl Loss {
@@ -112,6 +135,17 @@ impl RadioParams {
         bitrate_bps: 1200,
         txdelay: Millis(300),
         txtail: Millis(14),
+        phy_overhead_bytes: 19,
+        hdlc: true,
+    };
+
+    /// HF packet at 300 bd through an SSB transceiver (Direwolf's `MODEM 300`
+    /// or a hardware HF TNC): AX.25 in HDLC as at 1200 bd, 300 ms TXDELAY and
+    /// two tail flags.
+    pub const HF_300: RadioParams = RadioParams {
+        bitrate_bps: 300,
+        txdelay: Millis(300),
+        txtail: Millis(54),
         phy_overhead_bytes: 19,
         hdlc: true,
     };
@@ -474,6 +508,80 @@ struct Link {
     corrupt: f64,
 }
 
+/// Sinusoids summed to make one path's fading gain in [`Loss::Fading`].
+const FADE_PATHS: usize = 16;
+
+/// The scattered part of one path's complex gain in [`Loss::Fading`]:
+/// `sum(exp(j(2 pi f_n t + phase_n))) / sqrt(N)`, with Doppler shifts `f_n`
+/// drawn from a Gaussian of standard deviation `spread / 2` and uniform
+/// phases. Unit power on average, with the Gaussian autocorrelation of the
+/// Watterson model, `exp(-2 pi^2 sigma^2 dt^2)`. Being a function of time, it
+/// can be evaluated in any order.
+struct Fade {
+    doppler_hz: [f64; FADE_PATHS],
+    phase: [f64; FADE_PATHS],
+}
+
+impl Fade {
+    fn new(rng: &mut DetRng, doppler_spread_hz: f64) -> Fade {
+        let sigma = doppler_spread_hz / 2.0;
+        let mut doppler_hz = [0.0; FADE_PATHS];
+        let mut phase = [0.0; FADE_PATHS];
+        for n in 0..FADE_PATHS {
+            // Unit-power complex Gaussian: each part has variance 1/2.
+            let (z, _) = unit_complex_gaussian(rng);
+            doppler_hz[n] = sigma * z * core::f64::consts::SQRT_2;
+            phase[n] = core::f64::consts::TAU * rng.next_f64();
+        }
+        Fade { doppler_hz, phase }
+    }
+
+    /// Power gain at `t`, mean 1, with Rician factor `k`.
+    fn power(&self, t: Millis, k: f64) -> f64 {
+        let secs = t.0 as f64 / 1000.0;
+        let (mut re, mut im) = (0.0, 0.0);
+        for n in 0..FADE_PATHS {
+            let angle = core::f64::consts::TAU * self.doppler_hz[n] * secs + self.phase[n];
+            re += libm::cos(angle);
+            im += libm::sin(angle);
+        }
+        let scale = libm::sqrt(1.0 / (FADE_PATHS as f64 * (k + 1.0)));
+        let steady = libm::sqrt(k / (k + 1.0));
+        let (re, im) = (steady + scale * re, scale * im);
+        re * re + im * im
+    }
+
+    /// The weakest SNR between `start` and `end`, sampled every eighth of
+    /// `1 / doppler_spread_hz` (the fading is smooth at that scale), at most
+    /// 64 times per frame.
+    fn weakest_snr_db(
+        &self,
+        (start, end): (Millis, Millis),
+        doppler_spread_hz: f64,
+        k: f64,
+        mean_snr_db: f64,
+    ) -> f64 {
+        let fine = (125.0 / doppler_spread_hz.max(1e-3)) as u64;
+        let step = fine.max(1).max(end.0.saturating_sub(start.0).div_ceil(64));
+        let mut weakest = self.power(start, k);
+        let mut t = start.0;
+        while t < end.0 {
+            t = (t + step).min(end.0);
+            weakest = weakest.min(self.power(Millis(t), k));
+        }
+        mean_snr_db + 10.0 * libm::log10(weakest.max(1e-12))
+    }
+}
+
+/// A complex Gaussian of unit power: two independent normals of variance
+/// 1/2, by Box–Muller (with `libm`, so runs match on every platform).
+fn unit_complex_gaussian(rng: &mut DetRng) -> (f64, f64) {
+    let u = rng.next_f64().max(f64::MIN_POSITIVE);
+    let angle = core::f64::consts::TAU * rng.next_f64();
+    let r = libm::sqrt(-libm::log(u));
+    (r * libm::cos(angle), r * libm::sin(angle))
+}
+
 struct Tx {
     id: u64,
     channel: ChannelId,
@@ -586,6 +694,9 @@ where
     channel_stats: Vec<Stats>,
     nodes: Vec<Node<M>>,
     links: BTreeMap<(ChannelId, NodeId, NodeId), Link>,
+    /// Fading state of each path with [`Loss::Fading`], by channel and the
+    /// two stations in ascending order: both directions share it.
+    fades: BTreeMap<(ChannelId, NodeId, NodeId), Fade>,
     queue: BinaryHeap<Reverse<Scheduled<C>>>,
     seq: u64,
     rng: DetRng,
@@ -612,6 +723,7 @@ where
             channel_stats: vec![Stats::default()],
             nodes: Vec::new(),
             links: BTreeMap::new(),
+            fades: BTreeMap::new(),
             queue: BinaryHeap::new(),
             seq: 0,
             rng: root.fork(0),
@@ -1180,7 +1292,29 @@ where
                     .links
                     .get_mut(&(ch, from, r))
                     .expect("receiver comes from link table");
-                if lose(&mut self.rng, link, now, on_air) {
+                let lost = match link.loss {
+                    Loss::Fading {
+                        curve,
+                        mean_snr_db,
+                        doppler_spread_hz,
+                        rician_k,
+                    } => {
+                        let path = (ch, from.min(r), from.max(r));
+                        if !self.fades.contains_key(&path) {
+                            let fade = Fade::new(&mut self.rng, doppler_spread_hz);
+                            self.fades.insert(path, fade);
+                        }
+                        let snr = self.fades[&path].weakest_snr_db(
+                            (start, now),
+                            doppler_spread_hz,
+                            rician_k,
+                            mean_snr_db,
+                        );
+                        self.rng.chance(curve.loss(snr, on_air))
+                    }
+                    _ => lose(&mut self.rng, link, now, on_air),
+                };
+                if lost {
                     Outcome::LostChannel
                 } else if !frame.is_empty() && self.rng.chance(link.corrupt) {
                     Outcome::Corrupted
@@ -1239,9 +1373,25 @@ where
                 self.apply(r, out);
             }
         }
+        self.drained(from, ch, end);
         let horizon = self.max_airtime;
         let now = self.now;
         self.txs.retain(|t| t.end + horizon > now);
+    }
+
+    /// Tell `node` when its radio on `ch` has sent everything it was asked
+    /// to: the frame that just ended was the last of its key-up and nothing
+    /// waits for the channel.
+    fn drained(&mut self, node: NodeId, ch: ChannelId, end: Millis) {
+        let n = &mut self.nodes[node];
+        let Some(port) = n.port_on(ch) else { return };
+        let r = &n.radios[&port];
+        if !n.up || r.free_at > end || !r.waiting.is_empty() {
+            return;
+        }
+        let local = n.clock.local(end);
+        n.machine.transmitted(local, port);
+        self.reschedule_timer(node);
     }
 }
 
@@ -1263,6 +1413,10 @@ fn lose(rng: &mut DetRng, link: &mut Link, now: Millis, on_air: usize) -> bool {
         }
         Loss::Hourly(table) => rng.chance(table[((now.0 / 3_600_000) % 24) as usize]),
         Loss::Measured { curve, snr_db } => rng.chance(curve.loss(snr_db, on_air)),
+        // Judged with the path's fading state, in `Sim::finish_tx`.
+        Loss::Fading {
+            curve, mean_snr_db, ..
+        } => rng.chance(curve.loss(mean_snr_db, on_air)),
     }
 }
 

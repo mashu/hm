@@ -15,6 +15,9 @@ pub const FEATURE_MAILBOX: u32 = 0x0000_0001;
 pub const FEATURE_RELAY: u32 = 0x0000_0002;
 /// Feature: decodes IL2P-framed frames on this link as well as AX.25.
 pub const FEATURE_IL2P: u32 = 0x0000_0004;
+/// Feature: reads the compact form of frames on this link: a UI frame to the
+/// station's own AX.25 address with a 6-byte header (see `hm-bearer`).
+pub const FEATURE_COMPACT: u32 = 0x0000_0008;
 
 /// Flag in [`Open::flags`]: this OPEN answers one from the peer.
 pub const OPEN_REPLY: u8 = 0x01;

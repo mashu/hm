@@ -20,7 +20,7 @@
 mod api;
 pub mod arq;
 pub mod choose;
-mod control;
+pub mod control;
 pub mod heard;
 pub mod live;
 mod rf_policy;

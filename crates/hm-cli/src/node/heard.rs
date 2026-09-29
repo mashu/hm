@@ -127,11 +127,22 @@ impl HeardTable {
         v
     }
 
-    /// For our own beacon: up to 16 stations heard within the hour, most recent first.
-    pub fn for_beacon(&self, now: u64) -> Vec<Heard> {
+    /// Stations heard within `within` seconds: those sharing the channel with us.
+    pub fn active(&self, now: u64, within: u64) -> usize {
+        self.stations
+            .values()
+            .filter(|s| now.saturating_sub(s.last) < within)
+            .count()
+    }
+
+    /// For our own beacon: up to 16 stations heard within the hour (or within
+    /// `window`, if longer: beacons are further apart on a busy channel), most
+    /// recent first.
+    pub fn for_beacon(&self, now: u64, window: u64) -> Vec<Heard> {
+        let window = window.max(BEACON_WINDOW);
         self.list()
             .into_iter()
-            .filter(|s| now.saturating_sub(s.last) < BEACON_WINDOW)
+            .filter(|s| now.saturating_sub(s.last) < window)
             .take(MAX_HEARD)
             .map(|s| Heard {
                 call: s.call,
@@ -214,14 +225,14 @@ mod tests {
         assert!(!t.frame(10, call("SP5AAA")));
         t.frame(3000, call("SO5KM-1"));
         t.frame(3500, call("SA0KAM"));
-        let b = t.for_beacon(3700);
+        let b = t.for_beacon(3700, 0);
         let got: Vec<(Callsign, u8)> = b.iter().map(|h| (h.call, h.minutes)).collect();
         // SP5AAA was last heard at 10 s: over an hour before 3700 s.
         assert_eq!(got, vec![(call("SA0KAM"), 3), (call("SO5KM-1"), 11)]);
         for i in 0..20u32 {
             t.frame(3600, call(&format!("SQ{i}XX")));
         }
-        assert_eq!(t.for_beacon(3700).len(), MAX_HEARD);
+        assert_eq!(t.for_beacon(3700, 0).len(), MAX_HEARD);
         t.expire(10 + FORGET_AFTER);
         assert!(t.list().iter().all(|s| s.call != call("SP5AAA")));
     }

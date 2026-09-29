@@ -48,6 +48,13 @@ The payload follows the header. The modem supplies synchronisation and inner FEC
 (IL2P Reed–Solomon or codec2 LDPC), so the header carries no checksum. The source
 callsign is always in clear.
 
+IL2P as NinoTNC and Direwolf send it has no CRC after the Reed–Solomon blocks,
+so a block with more errors than its parity can correct may be "corrected" into
+wrong bytes and passed up. Nothing above needs to trust a symbol: the receiver
+checks every decoded object against the hash in its OFFER and, on a mismatch,
+drops its symbols and collects them again (section 7). A corrupted frame costs
+airtime, never a wrong object.
+
 | Type | Name | Payload |
 | --- | --- | --- |
 | 0 | DATA | preamble and one RaptorQ symbol (section 7) |
@@ -238,20 +245,59 @@ nothing about who received it.
 
 **Sender behaviour** (recommended; peers do not depend on it):
 
-- Size each over as the smallest n for which P[at least `need` of n frames arrive] ≥ 0.9, at the estimated loss rate.
-- Update the loss estimate from each ACK.
+- Choose T as the smallest multiple of 8 that keeps the object in as few
+  symbols as the largest allowed size would: every symbol is sent whole, so
+  padding is airtime. A 119-byte bundle travels as one 120-byte symbol.
+- On links slower than 1200 bit/s, size symbols so a DATA frame takes about
+  3 s on air (64 bytes at 300 bit/s): a short frame is less likely to meet a
+  fade. Keep overs to 60 s there and 30 s otherwise: long overs spread the
+  key-up and ACK over more symbols, and a fade costs only the frames it hits.
+- Size each over as the smallest n for which P[at least `need` of n frames
+  arrive] ≥ 0.9 at the estimated loss rate, capped by the congestion window
+  and the longest over.
+- Update the loss estimate only from what ACKs report an over delivered. A
+  missing ACK is not loss: the channel may have been busy or colliding, where
+  larger overs make things worse. It halves the congestion window (to no less
+  than 2 symbols); each ACK that arrives grows it by one symbol.
 - Count an ACK as late only after the time the over, a guard, the peer's key-up
   and ACK, and another guard would take. Predict airtime with the link's
   per-frame overhead (19 bytes for AX.25 UI) and an allowance for bit stuffing.
-- The link may hold an over back while the channel is busy. While waiting for
-  an ACK, on hearing any frame other than the peer's to us, wait at least until
-  that traffic could have ended (for DATA, the frames it says remain), followed
-  by our whole over and the peer's answer.
+- The link may hold an over back while the channel is busy. When it can tell
+  when the over actually left the air, start the wait for the ACK there.
+  Otherwise, while waiting for an ACK, on hearing any frame other than the
+  peer's to us, wait at least until that traffic could have ended (for DATA,
+  the frames it says remain), followed by our whole over and the peer's answer.
 - With no ACK in time, wait a random backoff drawn uniformly from
   [0, (last over's airtime + guard) · 2^min(misses, 5)]. Then send an OFFER and
   at most two symbols as a probe.
+- A transfer that is backing off does not hold up the others: transfers to
+  other peers may send their overs meanwhile, one over awaiting an ACK at a
+  time. Never use session 0 (a CLOSE with session 0 covers every transfer).
 - Keep a long-run airtime budget (duty cycle with a burst allowance), and never
   send an over larger than the allowance.
+
+**Broadcast transfers** (bulletins): OFFER and DATA go to the broadcast
+destination and listeners never send completion ACKs. Repair works like
+reliable multicast with request suppression, using the fountain code: any
+fresh symbol helps every listener that is short, whatever it missed.
+
+- A listener still short of symbols when an over ends asks the sender for more:
+  an ACK addressed to the sender, same session, `need` = K minus the symbols
+  held (1 if it holds K but lacks the OFFER). It asks at a random moment in
+  [guard, guard + 3 ACK airtimes] after the over.
+- A listener that hears two other listeners ask for at least as much before its
+  moment stays quiet (one alone may have been lost on its way to the sender). A
+  listener whose request brings no repair asks once more, one repair window later.
+- After its first over (or two) the sender listens for requests for one repair
+  window (guard + 3 ACK airtimes + one ACK airtime + guard). If any came, it
+  sends the OFFER again and fresh symbols for the largest `need`, sized for 30%
+  loss, then listens again. It finishes after two quiet windows in a row (two
+  requests sent at once collide unheard) or after 3 repair overs.
+- Simulated with 10 listeners each losing 25% of frames, a 2 kB bulletin
+  reached 72% of listeners with one publish and 99% with repair, for 37% more
+  airtime and about six requests in all (`cargo test -p hm-xfer --release --test sim bulletin_repair -- --nocapture`).
+
+Stations that do not implement repair ignore these ACKs, and publish once.
 
 **Receiver resources** (recommended): cap concurrent incoming transfers overall
 and per sender (8 and 2 by default). When full, evict the least valuable
@@ -271,7 +317,7 @@ OPEN (CTRL payload, 12 bytes):
 | --- | --- | --- |
 | 0 | 1 | 0x02 |
 | 1 | 1 | flags: 0x01 reply (answers the peer's OPEN); other bits 0 |
-| 2 | 4 | feature bits: 0x01 mailbox (holds mail for others), 0x02 relay (passes bundles on, Phase 2), 0x04 IL2P (decodes IL2P framing on this link); unknown bits are ignored |
+| 2 | 4 | feature bits: 0x01 mailbox (holds mail for others), 0x02 relay (passes bundles on, Phase 2), 0x04 IL2P (decodes IL2P framing on this link), 0x08 compact (reads compact frames on this link, section 9); unknown bits are ignored |
 | 6 | 3 | largest object accepted |
 | 9 | 2 | largest symbol size accepted (a multiple of 8) |
 | 11 | 1 | transfers accepted at once from this peer |
@@ -306,6 +352,14 @@ Rules:
   gives a limit below the object's length; otherwise the CLOSE answered a
   corrupted OFFER, and the sender sends its OPEN and OFFER again.
 
+**CTRL and ACK frames are not signed.** Only the receipt in an ACK is. On an
+open channel anyone can send a frame with another station's callsign, so a
+forged CLOSE refused or too large, or an OPEN with a tiny limit, can end a
+transfer. That is a nuisance, not a loss: custody moves only on a verified
+receipt, and a station SHOULD treat a failed transfer as a failed attempt to
+be retried later (the reference daemon does so for refused and too large),
+never as a verdict on the bundle.
+
 ## 8. Beacons
 
 A station announces itself with a BEACON frame: destination broadcast, session
@@ -313,7 +367,7 @@ and index 0 (receivers ignore both). Payload, 108 + 7n bytes:
 
 | Offset | Size | Field |
 | --- | --- | --- |
-| 0 | 1 | flags: 0x01 mailbox (holds mail for other stations), 0x02 relay (passes mail on, Phase 2), 0x04 internet (has internet links); other bits 0 |
+| 0 | 1 | flags: 0x01 mailbox (holds mail for other stations), 0x02 relay (passes mail on, Phase 2), 0x04 internet (has internet links), 0x08 holding (holds bundles others may pull with holdings SYNC, section 11.3); other bits 0, and ignored by receivers |
 | 1 | 32 | the station's Ed25519 key |
 | 33 | 4 | Unix time in seconds when sent |
 | 37 | 6 | Maidenhead locator: 4 or 6 characters in upper-case ASCII (`JO89` or `JO89XI`), a 4-character one followed by two zero bytes; all zero when the station gives none |
@@ -351,6 +405,28 @@ AX.25 cannot express cannot use a KISS TNC. Receivers accept frames with a
 digipeater path and with the poll bit set, and ignore frames with another
 destination or PID.
 
+**Compact form.** The full hm header repeats what the AX.25 addresses say.
+To a station whose OPEN carries the compact feature (0x08), a frame for that
+station alone may go in compact form instead: the AX.25 destination is that
+station's own address (SSID 0–15), and the information field starts with a
+6-byte header in place of the 18-byte one:
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 1 | version 1 (high nibble) and frame type (low nibble) |
+| 1 | 2 | session |
+| 3 | 3 | index |
+| 6 | … | the payload |
+
+The receiver rebuilds the full header: source from the AX.25 source,
+destination from the AX.25 destination. A frame's source is therefore always
+its AX.25 source. The compact form is used only when both callsigns come back
+exactly from their AX.25 addresses (so not for `-0` or longer callsigns).
+Broadcast frames always go whole to `HMNET`. A station that does not read the
+compact form ignores such frames (another destination). It saves 12 bytes a
+frame: about 11% of a DATA frame's airtime with 64-byte HF symbols, 5% with
+200-byte VHF symbols.
+
 KISS framing is standard: FEND 0xC0, FESC 0xDB, TFEND 0xDC, TFESC 0xDD. The type
 byte holds the TNC port in its high nibble and command 0 (data).
 
@@ -376,6 +452,14 @@ with TLS 1.3, ALPN `hm-net/1`, and mutual authentication by station key:
   dialer that presents a valid station certificate and names the peer from the
   certificate callsign (a public core hub). Issuers and validity periods carry
   no meaning.
+- An open hub knows a stranger only by its key, so the callsign in its
+  certificate is a claim. The hub refuses a certificate that claims a callsign
+  (or the base of one) it trusts under another key, or one another stranger
+  holds a live link under with another key.
+- An open hub bounds what strangers can make it hold. The reference
+  implementation keeps at most 256 links, lets a peer have at most 16 streams
+  open at once within a 4 MiB receive window per link, and expects each message
+  within 30 s of its stream opening.
 - The dialer's TLS 1.3 handshake completes before the listener has checked the
   dialer's certificate. Once the listener has accepted the dialer, it opens a
   unidirectional stream and sends `"HMOK"`. The dialer counts the link as up
@@ -388,7 +472,13 @@ One bundle travels on one bidirectional stream:
 | Direction | Content |
 | --- | --- |
 | sender to receiver | `"HMD0"`, object length (u32, ≤ 1 MiB), object |
-| receiver to sender | `0x00` and a 64-byte receipt if the object is stored or already held; or `0x01`, reason length (u16), UTF-8 reason |
+| receiver to sender | `0x00` and a 64-byte receipt if the object is stored or already held; `0x01`, reason length (u16), UTF-8 reason if refused; or `0x02`, seconds to wait (u16), reason length (u16), reason if busy |
+
+A control message (SYNC between two linked stations) travels the same way as
+`"HMC0"`, length (u32, ≤ 4096), payload, and is answered with `0x00` alone or
+a refusal. Reasons are cut to 512 bytes. A reader checks the announced length
+against its limit before taking the body, and buffers the body only as it
+arrives (`hm_wire::stream`).
 
 The receipt is the transfer receipt of section 7 with base callsigns and
 session 0: the receiver's signature over
@@ -439,6 +529,13 @@ Routine and priority bundles have one active custodian. Immediate and flash
 bundles may have two copies only on edge-disjoint feasible routes and only when
 both fit the airtime budget. There is no neighbourhood payload flood.
 
+When no route to the destination is known, a station without internet links
+routes to a station whose beacon or advert carries both the internet flag and
+the relay or mailbox flag (a gateway), if one is reachable: the default route.
+The gateway plans again with what it knows of the internet core and of radio
+areas behind other gateways. Only when there is no gateway does a station try
+the destination directly on the radio, where it may be in range unheard.
+
 ### 11.2 Custody and end-to-end delivery
 
 The transfer receipt in section 7 means only that the next hop durably accepted
@@ -451,6 +548,20 @@ so the next hop can pull again. It schedules a custody suspect timer (default
 receipt, it reclaims custody (`Queued` again) while the bundle is still valid,
 or marks origin traffic `DeliveredUnconfirmed` / relay traffic `Failed` when
 expired.
+
+A relay that accepts custody of a verified end-to-end receipt (section 11.3)
+for a bundle it holds or handed on, signed by that bundle's destination, closes
+its holding: the bundle arrived, so it is neither sent on nor resent when the
+suspect timer fires. A relay that had given a holding up (`Failed`) and is
+offered custody of the same bundle again takes it back on with the new routing
+metadata, rather than answering it as a duplicate.
+
+Retries are bounded by the bundle's lifetime, not by a count alone. When a
+message has used up its retry budget, the reference daemon keeps an origin
+message, and a holding of a mailbox relay, queued until the bundle expires:
+tried again at the longest retry interval, and at once when its destination is
+heard on the radio or links over the internet. A plain relay gives up and sends
+a custody-fail, so the custodian before it can try another path.
 
 A verified kind-6 custody-fail from the station that accepted custody MUST
 trigger the same reclaim path. End-to-end receipts SHOULD use a longer retry
@@ -558,11 +669,45 @@ SYNC vectors (hex), using station secret `07` repeated 32 times for CONTACT:
 - OFFER: `04000100032a5159a9ca4717`
 - WANT: `0301032a5159a9ca4717`
 
-CONTACT dissemination uses the Trickle
-algorithm (RFC 6206): inconsistency resets the interval, consistent duplicates
-suppress transmission, and a stable network becomes quiet. Control traffic has
-a separate rolling radio budget, 2% by default. A beacon may carry a directory
-digest; peers request details only when state differs.
+CONTACT dissemination uses the Trickle algorithm (RFC 6206): inconsistency
+resets the interval, consistent duplicates suppress transmission, and a stable
+network becomes quiet. For that to hold on a shared channel:
+
+- An advert's identity is `(origin, peer, bearer, start)`. A live contact keeps
+  its `start` while it lasts; its origin refreshes the claim (new sequence
+  number, later `end`) every 30 minutes with a validity of 2 hours. A copy
+  that differs from the one held only in sequence, `end` and signature is
+  consistent: the newer copy replaces the held one, the interval is not reset.
+- Each station picks its moment in an interval with its own randomness. (With
+  moments derived only from the advert and the time it was heard, every
+  station that heard it at once would transmit at once, collide, and never
+  suppress.)
+- Scope: live contacts are advertised over internet links only, since on the
+  radio every station's beacon already lists whom it hears. Scheduled contacts
+  go on the radio too. An advert learned over the internet, and any advert of
+  an internet contact, is never transmitted on the radio.
+- A copy of an advert heard on air removes any copy of it, no newer, still
+  waiting to be sent.
+
+The radio control budget (2% of an hour by default) is the whole channel's:
+each station takes an equal share among the stations it heard within the
+last hour (or the live window, if longer), itself included. A frame longer
+than a station's whole share is sent into an empty window, after which the
+station stays quiet until the share covers it. SYNC frames waiting for the
+budget are replaced by newer ones about the same contact, or to the same
+station with the same filter scope, and dropped when what they say expires.
+
+Beacons follow the same rule: a station beacons at its configured interval,
+or less often while the stations sharing the channel would otherwise spend
+more than 2% of it on beacons. A station counts as in reach for 2.5 beacon
+intervals after its last beacon (at least 20 minutes), and lists in its
+beacons the stations heard within that time (at least an hour).
+
+Holdings are pulled over the radio only from stations whose beacon carries
+the holding flag, and at most every 30 minutes from each. A station holding
+mail for another sends it when it hears that station anyway; pulling covers
+bulletins and missed pushes. (A beacon digest saying whom the mail is for
+would narrow this further.)
 
 ### 11.4 Admission, expiry and cancellation
 
@@ -635,12 +780,13 @@ wire 82585ea90000014600004f8af6fb028282004600000207586b82036f71736c406578616d706
 ## AX.25 UI and KISS (the frame header vector above, from SA0KAM)
 ax25 909a9c8aa840e0a6826096829a6103f00000004f8af6fb001b97cbd86bbeef01234568656c6c6f
 kiss c000909a9c8aa840e0a6826096829a6103f00000004f8af6fb001b97cbd86bbeef01234568656c6c6fc0
+compact a69e6a969a40e2a6826096829a6103f010beef01234568656c6c6f
 
-## Transfer of the chat bundle (SA0KAM -> SO5KM-1, symbol size 200, first over, opening the session)
+## Transfer of the chat bundle (SA0KAM -> SO5KM-1, symbols of up to 200 bytes: one of 120, first over, opening the session)
 object_id 26a90b587084a213a812a105b23553637c1afd5c125fc66381203f4583e09807
 open  0300004f8af6fb001b97cbd86bf2b4000000020000000000040000fff802
-offer 0300004f8af6fb001b97cbd86bf2b40000000126a90b587084a213a812a105b23553637c1afd5c125fc66381203f4583e0980700007700c80001
-data  0000004f8af6fb001b97cbd86bf2b400000000007700825832a70000014600004f8af6fb028182004600000207586b0301051a6ab13b8006190e100882004c3733206465205341304b414d5840ce3c7adc856375a2ce7cbb47011edcbbfa93ff43bf4346232367268be9e35cf86d01b31ab2408b6ba8954f5088b430c211eca59261c6d9805cd446f9773aa602000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+offer 0300004f8af6fb001b97cbd86bf2b40000000126a90b587084a213a812a105b23553637c1afd5c125fc66381203f4583e0980700007700780001
+data  0000004f8af6fb001b97cbd86bf2b400000000007700825832a70000014600004f8af6fb028182004600000207586b0301051a6ab13b8006190e100882004c3733206465205341304b414d5840ce3c7adc856375a2ce7cbb47011edcbbfa93ff43bf4346232367268be9e35cf86d01b31ab2408b6ba8954f5088b430c211eca59261c6d9805cd446f9773aa60200
 
 ## Receipt ACK from SO5KM-1 (secret 0x0c x 32) for that transfer, after its OPEN reply
 public key 0b513ad9b4924015ca0902ed079044d3ac5dbec2306f06948c10da8eb6e39f2d

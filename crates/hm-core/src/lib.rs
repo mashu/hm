@@ -61,6 +61,13 @@ pub trait Machine {
 
     /// The earliest time this machine wants `on_deadline` to be called, if any.
     fn next_deadline(&self) -> Option<Millis>;
+
+    /// The bearer on `port` has put on air everything the machine asked it
+    /// to transmit, the last of it ending at `now`. A bearer may hold frames
+    /// back while the channel is busy, so this can be well after the frames
+    /// were asked for. Drivers whose bearer cannot tell (a KISS TNC does not
+    /// say) never call it.
+    fn transmitted(&mut self, _now: Millis, _port: Port) {}
 }
 
 /// Local radio interface number. A station may have several radios, for

@@ -18,6 +18,13 @@ pub trait Link {
     fn features(&self) -> u32 {
         0
     }
+    /// When the link finished putting on air everything it was given, if that
+    /// happened since the last call. A link that waits for a clear channel
+    /// may send well after it was asked to; a link that cannot tell (a KISS
+    /// TNC does not say) returns `None`.
+    fn drained(&mut self) -> Option<Instant> {
+        None
+    }
 }
 
 /// What the event callback wants next.
@@ -61,6 +68,12 @@ where
         m.handle(now(), Input::Command(c), &mut out);
     }
     loop {
+        if let Some(at) = link.drained() {
+            m.transmitted(
+                Millis(at.saturating_duration_since(start).as_millis() as u64),
+                port,
+            );
+        }
         // Transmissions first, so an ACK queued with an event still goes out.
         let mut stopping = false;
         for o in out.drain(..) {

@@ -792,7 +792,7 @@ fn other_traffic_extends_the_wait_for_an_ack() {
     let later = a.next_deadline().unwrap();
     let cfg = &a.cfg;
     let over_end = heard + cfg.air(10, cfg.data_frame_len(200));
-    let o = a.active.as_ref().unwrap();
+    let o = &a.active[0];
     assert!(later > first);
     assert_eq!(
         later,
@@ -1089,17 +1089,9 @@ fn broadcast_reaches_listeners_without_acks() {
         assert_eq!(h.dst, Dest::Broadcast);
         assert_eq!(h.src, call("SA0KAM"));
     }
-    // Publisher completes locally without any listener ACK.
-    assert_eq!(
-        events(&out),
-        vec![Event::Delivered {
-            to: broadcast_peer(),
-            id: object_id(&object),
-            rounds: 1,
-            receipt: Receipt::Unverified,
-        }]
-    );
-    assert_eq!(a.outgoing_count(), 0);
+    // The publisher listens for repair requests a while, then is done.
+    assert!(events(&out).is_empty());
+    assert_eq!(a.outgoing_count(), 1);
 
     let want = Event::Received {
         from: call("SA0KAM"),
@@ -1108,8 +1100,308 @@ fn broadcast_reaches_listeners_without_acks() {
     };
     let b_out = deliver(&mut b, Millis(20_000), &burst);
     assert_eq!(events(&b_out), vec![want.clone()]);
-    assert!(frames(&b_out).is_empty(), "broadcast listeners must not ACK");
+    assert!(
+        frames(&b_out).is_empty(),
+        "a listener with everything asks for nothing"
+    );
     let c_out = deliver(&mut c, Millis(20_000), &burst);
     assert_eq!(events(&c_out), vec![want]);
     assert!(frames(&c_out).is_empty());
+
+    // Two quiet repair windows (a request may have been lost in a collision).
+    let mut done = Vec::new();
+    for _ in 0..2 {
+        let t = a.next_deadline().unwrap();
+        a.on_deadline(t, &mut done);
+    }
+    assert_eq!(
+        events(&done),
+        vec![Event::Delivered {
+            to: broadcast_peer(),
+            id: object_id(&object),
+            rounds: 1,
+            receipt: Receipt::Unverified,
+        }]
+    );
+    assert!(frames(&done).is_empty(), "nobody asked: no repair");
+    assert_eq!(a.outgoing_count(), 0);
+}
+
+/// A listener that missed symbols asks once the over ends; another listener
+/// missing as much hears that request and keeps quiet; the publisher answers
+/// with fresh symbols, which complete both.
+#[test]
+fn listeners_missing_symbols_get_a_repair_over() {
+    let mut a = engine("SA0KAM");
+    let (mut b, mut c) = (engine("SO5KM-1"), engine("SP5AAA"));
+    let object: Vec<u8> = (0..3_000u32).map(|i| (i * 7) as u8).collect();
+    let mut out = Vec::new();
+    a.handle(
+        Millis(0),
+        Input::Command(Command::Broadcast {
+            object: object.clone(),
+            precedence: 0,
+        }),
+        &mut out,
+    );
+    // One over carries every source symbol and then some; then it listens.
+    let sent = frames(&out);
+    assert!(events(&out).is_empty());
+    // Both listeners lose the same half of the DATA frames.
+    let heard: Vec<Vec<u8>> = sent
+        .iter()
+        .enumerate()
+        .filter(|(i, f)| {
+            let (h, _) = FrameHeader::decode(f).unwrap();
+            h.ftype != FrameType::Data || i % 2 == 0
+        })
+        .map(|(_, f)| f.clone())
+        .collect();
+    let b_out = deliver(&mut b, Millis(60_000), &heard);
+    assert!(events(&b_out).is_empty(), "not enough symbols yet");
+    let nack = frames(&b_out);
+    assert_eq!(nack.len(), 1, "one request");
+    let (h, payload) = FrameHeader::decode(&nack[0]).unwrap();
+    assert_eq!((h.ftype, h.dst), (FrameType::Ack, Dest::Station(call("SA0KAM"))));
+    assert!(Ack::decode(payload).unwrap().need > 0);
+
+    // D heard the same over but not B, so it asks by itself.
+    let mut d = engine("SP5DDD");
+    let d_out = deliver(&mut d, Millis(60_000), &heard);
+    let d_nack = frames(&d_out);
+    assert_eq!(d_nack.len(), 1);
+
+    // C heard the same over, then both requests before its own moment came:
+    // two requests for as much, so C keeps quiet. (One could have been lost
+    // on the way to the publisher, so one alone would not silence it.)
+    let mut c_out = Vec::new();
+    for f in heard.iter().chain(nack.iter()) {
+        c.handle(
+            Millis(60_000),
+            Input::Frame {
+                port: 0,
+                data: f.clone(),
+            },
+            &mut c_out,
+        );
+    }
+    let mut c_alone = engine("SP5AAA");
+    let mut alone_out = Vec::new();
+    for f in heard.iter().chain(nack.iter()) {
+        c_alone.handle(
+            Millis(60_000),
+            Input::Frame {
+                port: 0,
+                data: f.clone(),
+            },
+            &mut alone_out,
+        );
+    }
+    c_alone.on_deadline(Millis(80_000), &mut alone_out);
+    assert_eq!(frames(&alone_out).len(), 1, "one request heard: ask anyway");
+    c.handle(
+        Millis(60_000),
+        Input::Frame {
+            port: 0,
+            data: d_nack[0].clone(),
+        },
+        &mut c_out,
+    );
+    // Past the moment C would have asked (the whole spread after the over).
+    c.on_deadline(Millis(80_000), &mut c_out);
+    assert!(frames(&c_out).is_empty(), "two asked for as much: C keeps quiet");
+
+    // The publisher answers after its repair window with fresh symbols.
+    let mut repair = Vec::new();
+    a.handle(
+        Millis(60_001),
+        Input::Frame {
+            port: 0,
+            data: nack[0].clone(),
+        },
+        &mut repair,
+    );
+    while frames(&repair)
+        .iter()
+        .all(|f| FrameHeader::decode(f).unwrap().0.ftype != FrameType::Data)
+    {
+        let t = a.next_deadline().unwrap();
+        a.on_deadline(t.max(Millis(60_002)), &mut repair);
+    }
+    let fresh = frames(&repair);
+    let b_done = deliver(&mut b, Millis(90_000), &fresh);
+
+    let c_done = deliver(&mut c, Millis(90_000), &fresh);
+    for done in [&b_done, &c_done] {
+        assert!(
+            events(done)
+                .iter()
+                .any(|e| matches!(e, Event::Received { object: got, .. } if *got == object)),
+            "the repair completes the object"
+        );
+    }
+}
+
+#[test]
+fn symbols_are_no_larger_than_the_object_needs() {
+    // One symbol: the object rounded up to the 8-byte alignment.
+    assert_eq!(fit_symbol(119, 200), 120);
+    assert_eq!(fit_symbol(1, 200), 8);
+    // Several: as few as the largest size allows, each as small as that permits.
+    assert_eq!(fit_symbol(1000, 200), 200);
+    assert_eq!(fit_symbol(1010, 200), 176); // 6 x 176 = 1056 bytes on air, not 6 x 200
+    assert_eq!(fit_symbol(1500, 200), 192);
+    for len in 1..3000u32 {
+        for max in [8u16, 64, 200, 256] {
+            let t = fit_symbol(len, max);
+            assert!(t.is_multiple_of(8) && (8..=max).contains(&t), "{len} {max}: {t}");
+            assert_eq!(
+                len.div_ceil(u32::from(t)),
+                len.div_ceil(u32::from(max)),
+                "{len} {max}: no more symbols than the largest size needs"
+            );
+        }
+    }
+}
+
+/// A 119-byte chat bundle goes out as one 120-byte symbol: the 81 bytes of
+/// padding a 200-byte symbol would carry are airtime for nothing.
+#[test]
+fn a_short_message_is_not_padded_to_the_full_symbol_size() {
+    let mut a = engine("SA0KAM");
+    let mut b = engine("SO5KM-1");
+    let object = vec![0x33u8; 119];
+    let burst = frames(&send(&mut a, Millis(0), "SO5KM-1", object.clone()));
+    let data: Vec<&Vec<u8>> = burst
+        .iter()
+        .filter(|f| FrameHeader::decode(f).unwrap().0.ftype == FrameType::Data)
+        .collect();
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0].len(), HEADER_LEN + DATA_PREAMBLE_LEN + 120);
+    let got = events(&deliver(&mut b, Millis(5_000), &burst));
+    assert!(got.contains(&Event::Received {
+        from: call("SA0KAM"),
+        id: object_id(&object),
+        object,
+    }));
+}
+
+/// Run `x`'s deadlines until it transmits; returns what it sent and when.
+fn next_over(x: &mut Xfer) -> (Millis, Vec<Vec<u8>>) {
+    for _ in 0..16 {
+        let t = x.next_deadline().expect("a deadline");
+        let mut out = Vec::new();
+        x.on_deadline(t, &mut out);
+        let fs = frames(&out);
+        if !fs.is_empty() {
+            return (t, fs);
+        }
+    }
+    panic!("nothing sent");
+}
+
+fn ack_from(from: &str, to: &str, session: u16, need: u16) -> Vec<u8> {
+    FrameHeader {
+        ftype: FrameType::Ack,
+        src: call(from),
+        dst: Dest::Station(call(to)),
+        session,
+        index: 0,
+    }
+    .frame(
+        &Ack {
+            need,
+            ..Ack::default()
+        }
+        .to_vec()
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+/// A missed ACK halves the congestion window and backs off, but it is not
+/// counted as frame loss: on a busy channel, larger overs to make up for
+/// "loss" would only collide more. Each ACK that comes grows the window again.
+#[test]
+fn a_missed_ack_shrinks_the_window_not_the_loss_estimate() {
+    let mut a = engine("SA0KAM");
+    let peer = call("SO5KM-1");
+    let first = frames(&send(&mut a, Millis(0), "SO5KM-1", vec![5; 4000]));
+    assert_eq!(first.len(), 1 + 16, "OFFER and a full window of the 20 symbols");
+    assert_eq!(a.window(peer), 16);
+    // Nobody answers: time out, back off, probe.
+    let (at, probe) = next_over(&mut a);
+    assert_eq!(a.loss_estimate(peer), 0, "silence is not loss");
+    assert_eq!(a.window(peer), 8);
+    assert_eq!(probe.len(), 1 + 2, "the probe is an OFFER and two symbols");
+    // The answer asks for 18 more: one ACK, one more symbol per over.
+    let session = FrameHeader::decode(&probe[0]).unwrap().0.session;
+    let mut out = Vec::new();
+    a.handle(
+        at + Millis(5_000),
+        Input::Frame {
+            port: 0,
+            data: ack_from("SO5KM-1", "SA0KAM", session, 18),
+        },
+        &mut out,
+    );
+    assert_eq!(a.window(peer), 9);
+    assert_eq!(frames(&out).len(), 9, "the next over fills the window");
+    assert_eq!(a.loss_estimate(peer), 0, "both probe symbols arrived");
+}
+
+/// A link that holds our over back for a busy channel says when it finally
+/// went out; the wait for the ACK starts then.
+#[test]
+fn the_ack_wait_starts_when_the_over_leaves_the_air() {
+    let mut a = engine("SA0KAM");
+    send(&mut a, Millis(0), "SO5KM-1", vec![7; 1000]);
+    let predicted = a.next_deadline().unwrap();
+    let ack_wait = a.active[0].ack_wait;
+    // The channel was busy for a minute before the over went out.
+    let sent = Millis(60_000) + a.active[0].last_cost;
+    a.transmitted(sent, 0);
+    assert_eq!(a.next_deadline().unwrap(), sent + ack_wait);
+    assert!(sent + ack_wait > predicted);
+    // Another port's radio says nothing about ours.
+    a.transmitted(Millis(90_000), 1);
+    assert_eq!(a.next_deadline().unwrap(), sent + ack_wait);
+}
+
+#[test]
+fn slow_links_get_smaller_symbols_and_shorter_overs() {
+    let me = call("SA0KAM");
+    let vhf = Config::for_link(me, 1200, Millis(300));
+    assert_eq!(vhf, Config::vhf_1200(me));
+    let hf = Config::hf_300(me);
+    // 64-byte symbols: a DATA frame of 105 bytes on air, 2.9 s at 300 bd.
+    assert_eq!(hf.symbol_size, 64);
+    assert_eq!(hf.max_over, SLOW_MAX_OVER);
+    let frame = hf.air(1, hf.data_frame_len(64));
+    assert!(frame >= Millis(2_800) && frame <= Millis(3_000), "{frame:?}");
+    assert_eq!(Config::for_link(me, 600, Millis(300)).symbol_size, 184);
+    assert_eq!(Config::for_link(me, 9600, Millis(100)).symbol_size, 200);
+    for bitrate in [50, 75, 110, 300, 600, 1200, 2400, 9600] {
+        let c = Config::for_link(me, bitrate, Millis(300));
+        assert!(c.validate().is_ok(), "{bitrate}");
+    }
+}
+
+/// On a 300 bd HF link an over stays within `max_over`, however much the
+/// receiver still needs.
+#[test]
+fn an_over_never_lasts_longer_than_max_over() {
+    let mut cfg = Config::hf_300(call("SA0KAM"));
+    cfg.sessions = false;
+    cfg.duty_cycle_permille = 1000;
+    cfg.max_over = Millis::from_secs(20);
+    let mut a = Xfer::new(cfg.clone(), identity("SA0KAM"), DetRng::from_seed(1)).unwrap();
+    let burst = frames(&send(&mut a, Millis(0), "SO5KM-1", vec![3; 4000]));
+    let on_air = cfg.txdelay
+        + burst
+            .iter()
+            .map(|f| cfg.air(1, f.len()))
+            .fold(Millis::ZERO, |sum, t| sum + t);
+    assert!(on_air <= cfg.max_over, "{on_air:?}");
+    assert!(burst.len() > 5, "still a useful over: {} frames", burst.len());
 }

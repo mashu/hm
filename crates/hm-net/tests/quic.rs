@@ -101,6 +101,46 @@ async fn open_hub_accepts_untrusted_dialers() {
     assert_eq!(hub_log.lock().unwrap()[0].0, call("SA0KAM"));
 }
 
+/// A stranger on an open hub may not take a callsign the hub knows by
+/// another key, nor one another stranger holds a live link under.
+#[tokio::test]
+async fn open_hub_strangers_cannot_take_a_known_callsign() {
+    let (hub_accept, hub_log) = recorder(Verdict::Stored);
+    let hub = Net::start(cfg_open("SO5KM", 2, &[("SM0R1", 3)], vec![], true), hub_accept).unwrap();
+    let addr = hub.local_addr().unwrap();
+    let dial = |me: &str, key: u8| {
+        let (accept, _) = recorder(Verdict::Stored);
+        Net::start(cfg(me, key, &[("SO5KM", 2)], vec![(call("SO5KM"), addr)]), accept).unwrap()
+    };
+
+    let impostor = dial("SM0R1", 9);
+    let stranger = dial("SA0KAM", 1);
+    assert!(
+        wait_connected(&stranger, "SO5KM").await,
+        "a stranger with its own call links"
+    );
+    assert!(hub.is_connected(call("SA0KAM")));
+    let copycat = dial("SA0KAM", 5);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !impostor.is_connected(call("SO5KM")),
+        "a trusted station's callsign"
+    );
+    assert!(!hub.is_connected(call("SM0R1")));
+    assert!(
+        !copycat.is_connected(call("SO5KM")),
+        "a linked stranger's callsign"
+    );
+
+    // The first stranger's link is the one the hub kept.
+    stranger.deliver(call("SO5KM"), b"still me").await.unwrap();
+    assert_eq!(
+        hub_log.lock().unwrap().as_slice(),
+        &[(call("SA0KAM"), b"still me".to_vec())]
+    );
+    assert!(copycat.deliver(call("SO5KM"), b"me too").await.is_err());
+}
+
 #[tokio::test]
 async fn delivery_with_verified_receipt() {
     let (b_accept, b_log) = recorder(Verdict::Stored);

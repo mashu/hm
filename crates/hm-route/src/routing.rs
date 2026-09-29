@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
 
 use hm_wire::Callsign;
 
@@ -199,6 +199,32 @@ pub fn release_active(graph: &mut ContactGraph, plan: &RoutePlan, object_bytes: 
     }
 }
 
+/// What a label that was expanded left for later labels to be compared with.
+struct Expanded {
+    risk_cost: f64,
+    arrival: u64,
+    airtime_millis: u64,
+    visited: Vec<Callsign>,
+}
+
+impl Expanded {
+    /// Whatever `label` could still reach, this one reached no later, with no
+    /// more risk or airtime, and with no more stations ruled out on the way:
+    /// every route through `label` has one at least as good through this.
+    fn dominates(&self, label: &Label) -> bool {
+        self.risk_cost <= label.risk_cost
+            && self.arrival <= label.arrival
+            && self.airtime_millis <= label.airtime_millis
+            && self.visited.iter().all(|station| label.visited.contains(station))
+    }
+}
+
+/// Routes to the destination, best first. A best-first search over labels
+/// (partial routes), pruned by dominance: a label is not expanded when an
+/// expanded one at the same station, with the same first hop, dominates it.
+/// Keeping first hops apart keeps alternatives through other neighbours for
+/// failover and urgent copies. When the label budget runs out, the routes
+/// found so far are returned; only a search that found none fails.
 fn find_candidates(
     graph: &ContactGraph,
     request: &RouteRequest<'_>,
@@ -219,11 +245,15 @@ fn find_candidates(
         visited,
     });
     let mut routes = Vec::new();
+    let mut expanded: BTreeMap<(Callsign, Callsign), Vec<Expanded>> = BTreeMap::new();
     let mut examined = 0_usize;
     while let Some(label) = queue.pop() {
         examined += 1;
         if examined > policy.max_labels {
-            return Err(RouteError::SearchLimit);
+            if routes.is_empty() {
+                return Err(RouteError::SearchLimit);
+            }
+            break;
         }
         if label.station == request.destination {
             routes.push(route_from_label(label));
@@ -234,6 +264,18 @@ fn find_candidates(
         }
         if request.visited.len() + label.hops.len() >= usize::from(request.max_hops) {
             continue;
+        }
+        if let Some(first) = label.hops.first() {
+            let seen = expanded.entry((label.station, first.contact.to)).or_default();
+            if seen.iter().any(|e| e.dominates(&label)) {
+                continue;
+            }
+            seen.push(Expanded {
+                risk_cost: label.risk_cost,
+                arrival: label.arrival,
+                airtime_millis: label.airtime_millis,
+                visited: label.visited.clone(),
+            });
         }
         for contact in graph.outgoing(label.station, request.now) {
             if request.excluded_contacts.contains(&contact.key)
@@ -280,14 +322,21 @@ fn find_candidates(
             });
             let mut path = label.visited.clone();
             path.push(contact.key.to);
-            queue.push(Label {
+            let next = Label {
                 station: contact.key.to,
                 arrival: arrive,
                 airtime_millis,
                 risk_cost: label.risk_cost - probability.ln(),
                 hops,
                 visited: path,
-            });
+            };
+            let first = next.hops[0].contact.to;
+            let dominated = expanded
+                .get(&(next.station, first))
+                .is_some_and(|seen| seen.iter().any(|e| e.dominates(&next)));
+            if !dominated {
+                queue.push(next);
+            }
         }
     }
     routes.sort_by(route_order);
@@ -560,5 +609,115 @@ mod tests {
         release_active(&mut graph, &plan, 1_000);
         assert_eq!(graph.contact(first).unwrap().residual_capacity(), 1_000);
         assert_eq!(graph.contact(second).unwrap().residual_capacity(), 1_000);
+    }
+}
+
+#[cfg(test)]
+mod search_limit {
+    use super::*;
+    use crate::{GraphConfig, ScheduledContact};
+
+    fn call(value: &str) -> Callsign {
+        value.parse().unwrap()
+    }
+
+    /// A reliable internet cluster of nine stations, all linked to each
+    /// other, and the destination reachable only by radio from one of them.
+    fn cluster_with_radio_last_hop() -> ContactGraph {
+        let mut graph = ContactGraph::new(GraphConfig::default()).unwrap();
+        let cluster: Vec<Callsign> = (1..=9).map(|i| call(&format!("M0C{i}"))).collect();
+        let mut add = |from: Callsign, to: Callsign, bearer: Bearer, success: u16| {
+            graph
+                .add_schedule(ScheduledContact {
+                    from,
+                    to,
+                    bearer,
+                    start: 0,
+                    end: 10_000,
+                    rate_bps: 1_200,
+                    capacity_bytes: 1_000_000,
+                    success_permyriad: Some(success),
+                    flags: 0,
+                })
+                .unwrap();
+        };
+        for &a in &cluster {
+            add(call("M0SRC"), a, Bearer::Internet, 9_900);
+            for &b in &cluster {
+                if a != b {
+                    add(a, b, Bearer::Internet, 9_900);
+                }
+            }
+        }
+        add(cluster[8], call("M0DST"), Bearer::Radio, 3_000);
+        graph
+    }
+
+    #[test]
+    fn a_dense_cluster_still_yields_the_route_through_it() {
+        let graph = cluster_with_radio_last_hop();
+        let request = RouteRequest {
+            source: call("M0SRC"),
+            destination: call("M0DST"),
+            now: 0,
+            expires_at: 10_000,
+            object_bytes: 1_000,
+            max_hops: 8,
+            airtime_budget_millis: 60_000,
+            visited: &[],
+            excluded_contacts: &[],
+            urgent: false,
+        };
+        let plan = plan_routes(&graph, &request, RoutingPolicy::default()).expect("a route exists");
+        let best = &plan.active[0];
+        assert_eq!(best.hops.len(), 2, "straight to the gateway, then radio");
+        assert_eq!(best.hops[1].contact.to, call("M0DST"));
+    }
+
+    /// A label budget that runs out before the search is done leaves the
+    /// routes found by then as the answer, best first; only a search that
+    /// found none fails.
+    #[test]
+    fn a_search_cut_short_returns_what_it_found() {
+        let mut graph = cluster_with_radio_last_hop();
+        graph
+            .add_schedule(ScheduledContact {
+                from: call("M0SRC"),
+                to: call("M0DST"),
+                bearer: Bearer::Internet,
+                start: 0,
+                end: 10_000,
+                rate_bps: 1_200,
+                capacity_bytes: 1_000_000,
+                success_permyriad: Some(9_900),
+                flags: 0,
+            })
+            .unwrap();
+        let request = RouteRequest {
+            source: call("M0SRC"),
+            destination: call("M0DST"),
+            now: 0,
+            expires_at: 10_000,
+            object_bytes: 1_000,
+            max_hops: 8,
+            airtime_budget_millis: 60_000,
+            visited: &[],
+            excluded_contacts: &[],
+            urgent: false,
+        };
+        let tight = RoutingPolicy {
+            max_labels: 20,
+            ..RoutingPolicy::default()
+        };
+        let plan = plan_routes(&graph, &request, tight).expect("the direct route was found in time");
+        assert_eq!(plan.active[0].hops.len(), 1);
+        let starved = RoutingPolicy {
+            max_labels: 1,
+            ..RoutingPolicy::default()
+        };
+        assert_eq!(
+            plan_routes(&graph, &request, starved),
+            Err(RouteError::SearchLimit)
+        );
     }
 }

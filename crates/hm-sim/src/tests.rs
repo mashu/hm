@@ -610,3 +610,111 @@ fn transmitting_on_a_missing_port_is_a_setup_error() {
     sim.command_at(Millis(0), a, BeaconCmd::SendRaw(7, vec![1, 2, 3]));
     sim.run_until(Millis(1));
 }
+
+#[test]
+fn the_fading_gain_has_unit_power_and_a_gaussian_autocorrelation() {
+    let mut rng = DetRng::from_seed(3);
+    let spread = 0.5; // CCIR 520 "moderate"
+    let paths: Vec<Fade> = (0..5_000).map(|_| Fade::new(&mut rng, spread)).collect();
+    let at = |lag_ms: u64| -> Vec<f64> {
+        paths
+            .iter()
+            .enumerate()
+            .map(|(i, f)| f.power(Millis(i as u64 * 7_919 + lag_ms), 0.0))
+            .collect()
+    };
+    // Unit mean power, and Rayleigh's deep fades: P[power < 0.1] = 1 - e^-0.1.
+    let p0 = at(0);
+    let mean = p0.iter().sum::<f64>() / p0.len() as f64;
+    assert!((mean - 1.0).abs() < 0.05, "mean power {mean}");
+    let deep = p0.iter().filter(|&&p| p < 0.1).count() as f64 / p0.len() as f64;
+    assert!((deep - (1.0 - (-0.1f64).exp())).abs() < 0.02, "deep fades {deep}");
+    // Power correlation across a lag: exp(-4 pi^2 sigma^2 lag^2) for Rayleigh
+    // fading with a Gaussian Doppler spectrum of standard deviation sigma.
+    let corr = |lag_ms: u64| {
+        let q = at(lag_ms);
+        let mq = q.iter().sum::<f64>() / q.len() as f64;
+        let cov: f64 = p0.iter().zip(&q).map(|(a, b)| (a - mean) * (b - mq)).sum();
+        let va: f64 = p0.iter().map(|a| (a - mean).powi(2)).sum();
+        let vb: f64 = q.iter().map(|b| (b - mq).powi(2)).sum();
+        cov / (va * vb).sqrt()
+    };
+    let theory = |lag_ms: u64| {
+        let (sigma, lag) = (spread / 2.0, lag_ms as f64 / 1000.0);
+        (-4.0 * std::f64::consts::PI.powi(2) * sigma * sigma * lag * lag).exp()
+    };
+    for lag in [50, 500, 1_000, 2_000, 5_000] {
+        let (got, want) = (corr(lag), theory(lag));
+        assert!((got - want).abs() < 0.08, "lag {lag} ms: {got:.3} vs {want:.3}");
+    }
+    // A strong steady part (large Rician factor) holds the power near 1.
+    for (i, f) in paths.iter().enumerate().take(500) {
+        assert!((f.power(Millis(i as u64 * 1_000), 1_000.0) - 1.0).abs() < 0.3);
+    }
+}
+
+fn fading(mean_snr_db: f64, doppler_spread_hz: f64) -> Loss {
+    Loss::Fading {
+        curve: &afsk_1200::CURVE,
+        mean_snr_db,
+        doppler_spread_hz,
+        rician_k: 0.0,
+    }
+}
+
+/// Frames lost on a fading path, by counter.
+fn lost_frames(sim: &BeaconSim, tx: NodeId, rx: NodeId, from: u8) -> Vec<bool> {
+    let sent = sim.report().nodes[tx].frames_sent as usize;
+    let mut lost = vec![true; sent];
+    for (_, _, f, c) in heard_by(sim, rx) {
+        if f == from {
+            lost[c as usize] = false;
+        }
+    }
+    lost
+}
+
+/// On a Rayleigh-fading path the loss is well above what the mean SNR alone
+/// gives, and it comes in bursts as long as a fade.
+#[test]
+fn fading_loses_frames_in_bursts() {
+    let mut sim = BeaconSim::new(11, RadioParams::VHF_1200);
+    let a = sim.add_node(Beacon::periodic(1, 60, Millis(1_000), 0, DetRng::from_seed(1)));
+    let b = sim.add_node(Beacon::silent(2, 10));
+    sim.link_one_way(a, b, fading(14.0, 0.2));
+    sim.run_until(Millis::from_secs(20_000));
+    let lost = lost_frames(&sim, a, b, 1);
+    let rate = lost.iter().filter(|&&l| l).count() as f64 / lost.len() as f64;
+    let steady = afsk_1200::CURVE.loss(14.0, 60 + 19);
+    assert!(
+        rate > steady + 0.05 && rate < 0.5,
+        "loss {rate:.3}, steady {steady:.3}"
+    );
+    let after_loss: Vec<bool> = lost.windows(2).filter(|w| w[0]).map(|w| w[1]).collect();
+    let p = after_loss.iter().filter(|&&l| l).count() as f64 / after_loss.len() as f64;
+    assert!(p > 2.0 * rate, "not bursty: {p:.3} after a loss vs {rate:.3}");
+}
+
+/// Both directions share the fade: a frame lost one way means the answer a
+/// second later is likely lost too.
+#[test]
+fn fading_is_shared_by_both_directions() {
+    let mut sim = BeaconSim::new(12, RadioParams::VHF_1200);
+    let a = sim.add_node(Beacon::periodic(1, 60, Millis(2_000), 0, DetRng::from_seed(1)));
+    let b = sim.add_node(Beacon::silent(2, 60));
+    sim.link(a, b, fading(12.0, 0.05));
+    let rounds = 5_000u64;
+    for i in 0..rounds {
+        sim.command_at(Millis(3_000 + 2_000 * i), b, BeaconCmd::SendNow);
+    }
+    sim.run_until(Millis(2_000 * rounds + 1_000));
+    let (ab, ba) = (lost_frames(&sim, a, b, 1), lost_frames(&sim, b, a, 2));
+    let n = ab.len().min(ba.len());
+    let p_ba = ba[..n].iter().filter(|&&l| l).count() as f64 / n as f64;
+    let both = (0..n).filter(|&i| ab[i] && ba[i]).count() as f64;
+    let p_ba_given_ab = both / (0..n).filter(|&i| ab[i]).count() as f64;
+    assert!(
+        p_ba_given_ab > 2.0 * p_ba,
+        "{p_ba_given_ab:.3} after a loss the other way vs {p_ba:.3}"
+    );
+}
