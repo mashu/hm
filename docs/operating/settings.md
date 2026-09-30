@@ -17,6 +17,7 @@ locator = "JO89xi"          # sent in beacons
 kiss = "serial:/dev/ttyUSB0:57600"
 beacon_minutes = 10         # 0 turns the beacon off
 max_keyup_secs = 20         # longest the transmitter stays keyed at a time
+duty_cycle_percent = 50     # long-run share of the time on the air
 
 [internet]
 listen = "0.0.0.0:4433"
@@ -102,7 +103,8 @@ The node applies these at once, without a restart:
 - **relay and mailbox**;
 - **internet peers**: which stations the node dials;
 - **radio**: everything under `[radio]` (TNC or sound card, PTT, key-up
-  delay, channel access, `max_rounds`, `max_keyup_secs`, radio on or off);
+  delay, channel access, `max_rounds`, `max_keyup_secs`, `duty_cycle_percent`,
+  radio on or off);
   the node closes the
   old link and opens the new one, and mail on its way over the old link is
   retried on the new one;

@@ -37,6 +37,7 @@ struct RadioView {
     guard_ms: Option<u64>,
     max_rounds: Option<u32>,
     max_keyup_secs: Option<u64>,
+    duty_cycle_percent: Option<u8>,
 }
 
 impl RadioView {
@@ -55,6 +56,7 @@ impl RadioView {
             guard_ms: Some(r.guard_ms),
             max_rounds: Some(r.max_rounds),
             max_keyup_secs: Some(r.max_keyup_secs),
+            duty_cycle_percent: Some(r.duty_cycle_percent),
         }
     }
 
@@ -79,7 +81,8 @@ impl RadioView {
             txdelay_ms,
             guard_ms,
             max_rounds,
-            max_keyup_secs
+            max_keyup_secs,
+            duty_cycle_percent
         );
         if let Some(a) = audio {
             r.audio = a;

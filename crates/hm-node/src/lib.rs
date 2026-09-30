@@ -25,13 +25,16 @@
 //! - [`heard`]: stations heard on the radio and their beacons;
 //! - [`rf_policy`]: who may use this station's airtime;
 //! - [`adverts`]: our signed contact adverts;
-//! - [`message`]: received objects, opened and checked against trusted keys.
+//! - [`message`]: received objects, opened and checked against trusted keys;
+//! - [`insight`]: what the station knows, as a snapshot for people
+//!   ([`Node::insight`]).
 
 pub mod accept;
 pub mod adverts;
 mod bearer;
 pub mod control;
 pub mod heard;
+pub mod insight;
 mod log;
 pub mod message;
 mod node;
@@ -42,7 +45,7 @@ mod station;
 mod trust;
 
 pub use accept::{accept, Acceptance, AcceptanceGate};
-pub use bearer::{RadioCmd, RadioEvt, Transfer};
+pub use bearer::{ChannelSeen, RadioCmd, RadioEvt, Transfer};
 pub use log::{addressed_to_us, as_station, log, set_log, short, utc_clock, Notify};
 pub use node::{Command, Input, ModemSpec, Node, NodeIdentity, NodeStatus};
 pub use radio::{LinkTiming, Radio, RadioSpec};

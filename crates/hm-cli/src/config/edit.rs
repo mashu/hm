@@ -193,6 +193,9 @@ pub fn set_radio(path: &Path, old: &RadioSettings, new: &RadioSettings) -> io::R
     if old.persist != new.persist {
         put("persist", i64::from(new.persist).into());
     }
+    if old.duty_cycle_percent != new.duty_cycle_percent {
+        put("duty_cycle_percent", i64::from(new.duty_cycle_percent).into());
+    }
     for (key, o, n) in [
         ("slottime_ms", old.slottime_ms, new.slottime_ms),
         ("bitrate", u64::from(old.bitrate), u64::from(new.bitrate)),

@@ -52,8 +52,11 @@ mod link;
 pub mod math;
 mod openness;
 
-pub use beliefs::{Beliefs, Estimate, Mean, RestoreError, Thompson, FORGET_AFTER, MISS_HORIZON};
-pub use calibration::Forecast;
+pub use beliefs::{
+    Beliefs, Estimate, Mean, Observed, RestoreError, Subject, Thompson, Update, FORGET_AFTER, JOURNAL_LEN,
+    MISS_HORIZON,
+};
+pub use calibration::{BandRecord, Calibration, Forecast};
 pub use channel::{access_wait, ChannelModel, ChannelObservation, CHANNEL_HALF_LIFE, QUIET_BUSY};
 pub use custodian::{CustodianModel, CustodianObservation, CustodianPrior, HandedOver, CUSTODIAN_HALF_LIFE};
 pub use erasure::{broadcast_burst, burst_size, plan_overs, Erasure, OverCost};

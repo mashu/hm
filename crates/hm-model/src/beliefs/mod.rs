@@ -8,6 +8,7 @@
 //! recalibrated ([`Calibration`]).
 
 mod estimate;
+mod journal;
 mod records;
 #[cfg(test)]
 mod tests;
@@ -26,6 +27,7 @@ use crate::openness::Openness;
 use crate::{Bearer, LinkKey};
 
 pub use estimate::{Estimate, Mean, Thompson};
+pub use journal::{Observed, Subject, Update, JOURNAL_LEN};
 pub use records::RestoreError;
 
 const DAY: u64 = 86_400;
@@ -42,15 +44,6 @@ pub const MISS_HORIZON: u64 = 14 * DAY;
 /// peer's advert) is worth against this station's own evidence.
 pub const STATED_STRENGTH: f64 = 2.0;
 
-/// What the station's beliefs are about.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Subject {
-    Link(LinkKey),
-    Custodian(Callsign),
-    /// A bearer's calibration, for paths seen open (`true`) or not.
-    Calibration(Bearer, bool),
-}
-
 pub struct Beliefs {
     /// By [path](LinkKey::path).
     links: BTreeMap<LinkKey, LinkModel>,
@@ -62,6 +55,7 @@ pub struct Beliefs {
     calibration: [[Calibration; 2]; 3],
     changed: BTreeSet<Subject>,
     removed: BTreeSet<Subject>,
+    journal: journal::Journal,
 }
 
 impl Default for Beliefs {
@@ -80,6 +74,7 @@ impl Beliefs {
             calibration: Default::default(),
             changed: BTreeSet::new(),
             removed: BTreeSet::new(),
+            journal: journal::Journal::default(),
         }
     }
 
@@ -106,8 +101,25 @@ impl Beliefs {
         self.custodians.get(&station)
     }
 
+    /// Every custodian believed in.
+    pub fn custodians(&self) -> impl Iterator<Item = (&Callsign, &CustodianModel)> {
+        self.custodians.iter()
+    }
+
+    /// How the handoff chances given for `bearer` over paths seen open
+    /// (`seen`) or not come true.
+    pub fn calibration(&self, bearer: Bearer, seen: bool) -> &Calibration {
+        &self.calibration[bearer.index()][usize::from(seen)]
+    }
+
+    /// The latest observations and what each did, oldest first.
+    pub fn journal(&self) -> impl DoubleEndedIterator<Item = &Update> {
+        self.journal.updates()
+    }
+
     pub fn observe_link(&mut self, key: LinkKey, at: u64, observation: LinkObservation) {
         let key = key.path();
+        let before = self.link_success(key, at, at);
         let prior = self.link_priors[key.bearer.index()];
         self.links
             .entry(key)
@@ -115,6 +127,13 @@ impl Beliefs {
             .observe(&prior, at, observation);
         self.changed.insert(Subject::Link(key));
         self.refit_link_prior(key.bearer, at);
+        self.journal.record(Update {
+            at,
+            subject: Subject::Link(key),
+            observed: Observed::Link(observation),
+            before,
+            after: self.link_success(key, at, at),
+        });
     }
 
     /// Account for beacons due over `key` that have not arrived by `now`,
@@ -138,6 +157,8 @@ impl Beliefs {
     }
 
     pub fn observe_custodian(&mut self, station: Callsign, at: u64, observation: CustodianObservation) {
+        let hands_on = |b: &Beliefs| b.p_accept(station, at, at) * b.p_delivers(station, at);
+        let before = hands_on(self);
         let prior = self.custodian_prior;
         self.custodians
             .entry(station)
@@ -145,6 +166,13 @@ impl Beliefs {
             .observe(&prior, at, observation);
         self.changed.insert(Subject::Custodian(station));
         self.refit_custodian_prior(at);
+        self.journal.record(Update {
+            at,
+            subject: Subject::Custodian(station),
+            observed: Observed::Custodian(observation),
+            before,
+            after: hands_on(self),
+        });
     }
 
     /// The model of a link never observed: its bearer's population prior.
@@ -165,8 +193,9 @@ impl Beliefs {
         self.calibrated(key, self.model_success(key, t, now))
     }
 
-    /// The link model's own chance, before calibration.
-    fn model_success(&self, key: LinkKey, t: u64, now: u64) -> f64 {
+    /// Chance a handoff over the link completes, started at `t`, as the link
+    /// model gives it, before calibration.
+    pub fn model_success(&self, key: LinkKey, t: u64, now: u64) -> f64 {
         let prior = self.link_prior(key.bearer);
         match self.links.get(&key.path()) {
             Some(link) => link.success(prior, t, now),
@@ -199,13 +228,22 @@ impl Beliefs {
     /// A handoff started with `forecast` ended at `at`: `carried` when the
     /// link carried it, whatever the custodian said (a refusal is an answer).
     pub fn observe_forecast(&mut self, forecast: Forecast, carried: bool, at: u64) {
-        self.calibration[forecast.bearer.index()][usize::from(forecast.seen)].observe(
-            forecast.chance,
-            carried,
+        let record = &mut self.calibration[forecast.bearer.index()][usize::from(forecast.seen)];
+        let before = record.apply(forecast.chance);
+        record.observe(forecast.chance, carried, at);
+        let after = record.apply(forecast.chance);
+        let subject = Subject::Calibration(forecast.bearer, forecast.seen);
+        self.changed.insert(subject);
+        self.journal.record(Update {
             at,
-        );
-        self.changed
-            .insert(Subject::Calibration(forecast.bearer, forecast.seen));
+            subject,
+            observed: Observed::Outcome {
+                chance: forecast.chance,
+                carried,
+            },
+            before,
+            after,
+        });
     }
 
     /// Weight of this station's own handoff evidence on the link.

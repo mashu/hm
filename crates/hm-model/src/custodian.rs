@@ -241,6 +241,14 @@ impl CustodianModel {
         math::student_t_cdf((log(late_secs.max(1) as f64) - m) / s, nu)
     }
 
+    /// How late its receipts come back past the time they were due, in
+    /// seconds: the median and the 90th percentile of the posterior
+    /// predictive (a Student t in log time).
+    pub fn lateness(&self, prior: &CustodianPrior, now: u64) -> (f64, f64) {
+        let (nu, m, s) = self.delays.predictive(prior, now);
+        (exp(m), exp(m + s * math::student_t_quantile(0.9, nu)))
+    }
+
     pub fn observe(&mut self, prior: &CustodianPrior, at: u64, observation: CustodianObservation) {
         let h = CUSTODIAN_HALF_LIFE;
         match observation {

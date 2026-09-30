@@ -27,6 +27,7 @@ fits what you want to do.
 | [Transfer](transfer.md) | moving one object over the radio: fountain-coded overs, burst sizing, probing, silence |
 | [Custody](custody.md) | who is responsible for a message, how that passes, how delivery is known |
 | [Control plane](control-plane.md) | beacons, the channel budget, contact adverts, holdings reconciliation |
+| [Design decisions](design.md) | what is new beside Winlink, APRS, Meshtastic and DTN; how far the models can be trusted; why the web interface is built as it is |
 
 ## Check the claims
 

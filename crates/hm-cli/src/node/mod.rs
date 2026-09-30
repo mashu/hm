@@ -46,7 +46,7 @@ use hm_ident::Identity;
 use hm_node::{accept, AcceptanceGate};
 use hm_store::Store;
 
-use coordinator::coordinator;
+use coordinator::{coordinator, Channels, QUERIES};
 use internet::start_net;
 use live::LiveConfig;
 use radio::radio_thread;
@@ -69,6 +69,7 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
     let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
     let (radio_evt_tx, radio_evt_rx) = tokio::sync::mpsc::unbounded_channel();
     let (radio_cmd_tx, radio_cmd_rx) = mpsc::channel();
+    let (query_tx, query_rx) = tokio::sync::mpsc::channel(QUERIES);
     let status = Arc::new(Mutex::new(Status::default()));
     let notify = Notify::new();
     let live = Arc::new(
@@ -158,6 +159,7 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                     status: status.clone(),
                     live: live.clone(),
                     notify: notify.clone(),
+                    node: query_tx,
                     bulletin_publishes: std::sync::Arc::new(std::sync::Mutex::new(
                         std::collections::VecDeque::new(),
                     )),
@@ -171,21 +173,15 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                         })
                         .await;
                 });
-                coordinator(
-                    &cfg,
-                    &store,
-                    &mut net,
-                    modem,
-                    radio_cmd_tx,
-                    radio_evt_rx,
+                let channels = Channels {
+                    radio_cmd: radio_cmd_tx,
+                    radio_evt: radio_evt_rx,
                     net_control_tx,
-                    net_control_rx,
-                    &status,
-                    &live,
-                    &notify,
-                    shutdown_rx,
-                )
-                .await;
+                    net_control: net_control_rx,
+                    queries: query_rx,
+                    shutdown: shutdown_rx,
+                };
+                coordinator(&cfg, &store, &mut net, modem, channels, &status, &live, &notify).await;
                 if let Some(n) = net {
                     n.close();
                 }

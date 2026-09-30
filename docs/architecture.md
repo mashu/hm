@@ -74,6 +74,9 @@ simulated HF in seconds. The daemon (`hm-cli node`) is a set of shells
 around the same two machines: a radio thread feeds `Radio` from the TNC or
 the built-in modem and carries out its frames; the coordinator feeds `Node`
 and carries out its commands over the internet, the modem and the web page.
+The web page asks the coordinator what the node knows (`Node::insight`, a
+read-only projection) over a request/reply channel: the node has one owner
+and is never shared behind a lock ([design](design.md#how-it-is-built)).
 
 ```text
   TNC / sound card ──frames──▶ Radio ──events──▶ Node ◀── internet, modem, API

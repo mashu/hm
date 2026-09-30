@@ -798,6 +798,7 @@ dependencies = [
  "hm-wire",
  "hm-xfer",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

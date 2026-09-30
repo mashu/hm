@@ -34,17 +34,24 @@ fn radio_nodes_exchange_mail_and_survive_a_restart() {
         trust_file: None,
     });
 
-    // The page is public; the API wants the token.
+    // The web interface is public; the API wants the token.
     let (status, page) = http(a.http_addr, "GET", "/", None, None);
-    assert!(status == 200 && page.contains("Queue message"));
+    assert!(status == 200 && page.contains(r#"<script type="module" src="/js/main.js">"#));
+    let (status, chat) = http(a.http_addr, "GET", "/js/views/chat.js", None, None);
+    assert!(status == 200 && chat.contains("Clear history"));
+    let (status, messages) = http(a.http_addr, "GET", "/js/messages.js", None, None);
     assert!(
-        page.contains("Archive")
-            && page.contains("Clear history")
-            && page.contains("View message details and raw signed object")
-            && page.contains("Drop this queued message")
+        status == 200
+            && messages.contains("View message details and raw signed object")
+            && messages.contains("Drop this queued message")
     );
+    let module = raw_http(a.http_addr, "GET", "/js/main.js", None, None).to_ascii_lowercase();
+    assert!(module.contains("content-type: text/javascript"));
     let headers = raw_http(a.http_addr, "GET", "/", None, None).to_ascii_lowercase();
-    assert!(headers.contains("content-security-policy:"));
+    // Nothing inline and nothing from elsewhere runs: the map is built in.
+    assert!(headers.contains(
+        "content-security-policy: default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'"
+    ));
     assert!(headers.contains("permissions-policy:"));
     assert!(headers.contains("x-frame-options: deny"));
     assert!(headers.contains("cache-control: no-store"));

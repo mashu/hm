@@ -100,6 +100,21 @@ pub fn student_t_cdf(t: f64, nu: f64) -> f64 {
     }
 }
 
+/// The `p` quantile of Student's t with `nu` degrees of freedom: the
+/// [`student_t_cdf`] inverted by bisection.
+pub fn student_t_quantile(p: f64, nu: f64) -> f64 {
+    let (mut lo, mut hi) = (-1.0e3, 1.0e3);
+    for _ in 0..80 {
+        let mid = 0.5 * (lo + hi);
+        if student_t_cdf(mid, nu) < p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
 /// A standard normal draw (Box–Muller).
 pub fn normal(rng: &mut DetRng) -> f64 {
     let u1 = rng.next_f64().max(f64::MIN_POSITIVE);
@@ -149,6 +164,14 @@ pub fn fade(elapsed: u64, half_life: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn t_quantiles_invert_the_cdf() {
+        // The 90th percentile: 3.078 with one degree of freedom, 1.282 with many.
+        assert!((student_t_quantile(0.9, 1.0) - 3.078).abs() < 1.0e-3);
+        assert!((student_t_quantile(0.9, 1.0e6) - 1.2816).abs() < 1.0e-3);
+        assert!(student_t_quantile(0.5, 4.0).abs() < 1.0e-6);
+    }
 
     #[test]
     fn logistic_round_trips() {

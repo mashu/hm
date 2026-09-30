@@ -64,6 +64,17 @@ pub struct Forecast {
     pub(crate) chance: f64,
 }
 
+/// One band of a calibration record, as a person reads it.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct BandRecord {
+    /// The mean chance given in the band.
+    pub given: f64,
+    /// The share of its handoffs the link carried.
+    pub carried: f64,
+    /// Its handoffs, faded with age.
+    pub outcomes: f64,
+}
+
 /// One band's record, faded to the calibration's `at`.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Encode, Decode)]
 struct Band {
@@ -125,6 +136,28 @@ impl Calibration {
 
     pub(crate) fn record(&self) -> &Record {
         &self.record
+    }
+
+    /// The bands that hold a record, lowest chance first.
+    pub fn bands(&self) -> impl Iterator<Item = BandRecord> + '_ {
+        self.record
+            .bands
+            .iter()
+            .filter(|band| band.outcomes > 1.0e-9)
+            .map(|band| BandRecord {
+                given: band.given / band.outcomes,
+                carried: band.carried / band.outcomes,
+                outcomes: band.outcomes,
+            })
+    }
+
+    /// The correction as chances: `(given, comes true)` where each band with
+    /// a record sits, lowest first; [`Calibration::apply`] interpolates
+    /// between them.
+    pub fn curve(&self) -> impl Iterator<Item = (f64, f64)> + '_ {
+        self.corrected[..self.points]
+            .iter()
+            .map(|&(given, comes)| (sigmoid(given), sigmoid(comes)))
     }
 
     /// The chance that comes true when `p` is given.

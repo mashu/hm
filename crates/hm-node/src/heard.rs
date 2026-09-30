@@ -54,16 +54,21 @@ pub struct BeaconSeen {
 
 impl BeaconSeen {
     pub fn offers(&self) -> Vec<&'static str> {
-        [
-            (FLAG_MAILBOX, "mailbox"),
-            (FLAG_RELAY, "relay"),
-            (FLAG_INTERNET, "internet"),
-        ]
-        .into_iter()
-        .filter(|(f, _)| self.flags & f != 0)
-        .map(|(_, n)| n)
-        .collect()
+        offers(self.flags)
     }
+}
+
+/// What a station's beacon or advert `flags` say it offers.
+pub fn offers(flags: u8) -> Vec<&'static str> {
+    [
+        (FLAG_MAILBOX, "mailbox"),
+        (FLAG_RELAY, "relay"),
+        (FLAG_INTERNET, "internet"),
+    ]
+    .into_iter()
+    .filter(|(f, _)| flags & f != 0)
+    .map(|(_, n)| n)
+    .collect()
 }
 
 /// Stations heard lately, by callsign (SSIDs apart: they are different stations on air).

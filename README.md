@@ -66,7 +66,8 @@ Everything is in [`docs/`](docs/README.md):
 - **Design**: [overview](docs/overview.md),
   [architecture](docs/architecture.md), [models](docs/models.md),
   [routing](docs/routing.md), [transfer](docs/transfer.md),
-  [custody](docs/custody.md), [control plane](docs/control-plane.md).
+  [custody](docs/custody.md), [control plane](docs/control-plane.md),
+  and [what is new, and why](docs/design.md).
 - **Evidence**: [simulation](docs/simulation.md),
   [results](docs/results.md), [testing](docs/testing.md).
 - **Reference**: the [specification](docs/spec.md), with test vectors.

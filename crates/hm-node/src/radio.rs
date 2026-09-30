@@ -25,7 +25,7 @@ use crate::control::{
     beacon_interval_ms, control_share_permyriad, live_window_secs, ControlBudget, SyncQueue,
     CONTROL_BUDGET_WINDOW_MS, SYNC_QUEUE_FRAMES,
 };
-use crate::{heard, log, RadioCmd, RadioEvt, RelaySettings, Settings, Trust};
+use crate::{heard, log, ChannelSeen, RadioCmd, RadioEvt, RelaySettings, Settings, Trust};
 
 /// The first beacon goes out at a random moment in this window after the
 /// radio comes up (or between half and one beacon interval, if that is
@@ -53,6 +53,9 @@ pub struct LinkTiming {
     /// over is longer, and one that would follow others straight into a
     /// longer key-up waits for the duty cycle's bucket to refill.
     pub max_keyup_ms: u64,
+    /// Long-run share of the time the transmitter may be keyed, per mille
+    /// (1000: no limit).
+    pub duty_cycle_permille: u32,
 }
 
 impl LinkTiming {
@@ -70,6 +73,7 @@ impl LinkTiming {
         let mut cfg = Config::for_link(me, self.bitrate_bps, Millis(self.txdelay_ms));
         cfg.ack_guard = Millis(self.guard_ms);
         cfg.max_rounds = self.max_rounds;
+        cfg.duty_cycle_permille = self.duty_cycle_permille.clamp(1, 1_000);
         if self.max_keyup_ms > 0 {
             let keyup = Millis(self.max_keyup_ms);
             cfg.max_over = cfg.max_over.min(keyup);
@@ -401,10 +405,9 @@ impl Radio {
             );
             self.busy_ms = 0;
             self.channel_seen = unix;
-            let busy = self.channel.busy(unix);
-            self.x
-                .set_channel(busy, self.channel.contenders(unix).ceil() as u32);
-            out.push(Output::Event(RadioEvt::Channel { busy }));
+            let seen = ChannelSeen::of(&self.channel, unix);
+            self.x.set_channel(seen.busy, seen.contenders.ceil() as u32);
+            out.push(Output::Event(RadioEvt::Channel(seen)));
         }
         let sharing = self.channel.sharing(unix);
         if sharing != self.sharing {

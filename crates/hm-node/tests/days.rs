@@ -4,6 +4,7 @@
 
 mod support;
 
+use hm_node::insight::Verdict;
 use support::world::{baltic, line, run};
 
 /// The ends of a line never hear each other. Each learns from its
@@ -33,6 +34,63 @@ fn a_station_reaches_one_it_never_hears_through_a_neighbour() {
             .expect("the far end is known");
         assert!(*p < 0.1, "{me} believes the path to {} open: {p}", far(&me));
     }
+}
+
+/// What a station knows is shown as it is: every station it has heard of
+/// and where, what it believes of each path, what moved its beliefs last,
+/// and where each message went.
+#[test]
+fn a_station_shows_what_it_knows() {
+    let outcome = run(&line(24, 1));
+    let (_, insight) = outcome
+        .insights
+        .iter()
+        .find(|(me, _)| me.to_string() == "SM0AAA")
+        .expect("SM0AAA ran");
+    let station = |call: &str| {
+        insight
+            .stations
+            .iter()
+            .find(|s| s.call == call)
+            .unwrap_or_else(|| panic!("{call} is known"))
+    };
+    let me = station("SM0AAA");
+    assert!(me.me && me.place.as_ref().is_some_and(|p| p.locator == "JO99ah"));
+    let neighbour = station("OH2BBB");
+    assert!(neighbour.trusted && neighbour.beacon.is_some());
+    assert_eq!(
+        neighbour.place.as_ref().map(|p| p.locator.as_str()),
+        Some("KP20le")
+    );
+    // The far end is known from the neighbour's beacons, and never heard.
+    assert!(station("LA1CCC").heard_at.is_none());
+
+    let path = |to: &str| {
+        insight
+            .links
+            .iter()
+            .find(|l| l.mine && (l.a == to || l.b == to))
+            .unwrap_or_else(|| panic!("a path to {to}"))
+    };
+    let near = path("OH2BBB");
+    assert!(near.seen && near.open_now > 0.5, "{near:?}");
+    assert_eq!((near.forecast.len(), near.daily.len()), (24, 24));
+    let loss = near.frame_loss;
+    assert!(loss.low <= loss.mean && loss.mean <= loss.high, "{loss:?}");
+    let far = path("LA1CCC");
+    assert!(!far.seen && far.reach < 0.5, "{far:?}");
+
+    assert!((1..=3 * hm_model::JOURNAL_LEN).contains(&insight.journal.len()));
+    assert!(
+        insight.decisions.iter().any(|d| matches!(
+            &d.verdict,
+            Verdict::Send { route } if route.hops[0].to == "OH2BBB"
+        )),
+        "{:?}",
+        insight.decisions
+    );
+    let json = serde_json::to_value(insight).expect("serialises");
+    assert_eq!(json["decisions"][0]["verdict"], "send");
 }
 
 #[test]
