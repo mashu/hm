@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use hm_cli::config::RadioSettings;
 use hm_cli::driver::Link;
 use hm_cli::files::{KeyFile, Trust};
-use hm_cli::node::choose::Costs;
+use hm_cli::node::live::Costs;
 use hm_cli::node::live::Live;
 use hm_cli::node::{self, NodeConfig, RadioConfig, RadioLink};
 use hm_cli::sound_link::{AudioFactory, Csma, Framing, PttFactory, SoundLink};
@@ -190,7 +190,6 @@ fn start(ether: &Ether, key: &KeyFile, me: &str, peer: &KeyFile, db: &Tmp) -> no
             },
             custody_grace_secs: 6 * 3600,
             custody_suspect_secs: 24 * 3600,
-            evidence_half_life_secs: 3600,
             relay: Default::default(),
             beacon_secs: 0,
             peers: vec![],
@@ -213,6 +212,7 @@ fn start(ether: &Ether, key: &KeyFile, me: &str, peer: &KeyFile, db: &Tmp) -> no
                 txdelay_ms: 300,
                 guard_ms: 1500,
                 max_rounds: 12,
+                max_keyup_ms: 20_000,
             },
         }),
         radio_builder: None,
@@ -327,10 +327,13 @@ fn auto_framing_follows_what_the_peer_decodes() {
     let mut a = framed_link(&ether, "SA0KAM", Framing::Auto);
     let mut tap = ether.port();
     let mut demod = hm_modem_afsk::Demodulator::new(hm_modem_afsk::DemodulatorConfig::new(FS));
-    let mut listen = |until: Duration| {
-        let end = Instant::now() + until;
+    // Frames decoded so far and how many of them were IL2P, once `n` have
+    // been heard: the audio runs in real time, so a slow machine gets a
+    // generous deadline rather than a fixed window.
+    let mut heard = |n: u64| {
+        let end = Instant::now() + Duration::from_secs(20);
         let (mut audio, mut frames) = (Vec::new(), Vec::new());
-        while Instant::now() < end {
+        while demod.frames() < n && Instant::now() < end {
             audio.clear();
             tap.capture(&mut audio, Duration::from_millis(20)).unwrap();
             demod.process(&audio, &mut frames);
@@ -338,15 +341,11 @@ fn auto_framing_follows_what_the_peer_decodes() {
         (demod.frames(), demod.il2p_frames())
     };
     a.send(&hm_frame(1)).unwrap();
-    assert_eq!(listen(Duration::from_secs(3)), (1, 0), "not told: AX.25");
+    assert_eq!(heard(1), (1, 0), "not told: AX.25");
     a.peer_features(call("SO5KM"), a.features());
     a.send(&hm_frame(2)).unwrap();
-    assert_eq!(listen(Duration::from_secs(3)), (2, 1), "told: IL2P");
+    assert_eq!(heard(2), (2, 1), "told: IL2P");
     a.peer_features(call("SO5KM"), 0);
     a.send(&hm_frame(3)).unwrap();
-    assert_eq!(
-        listen(Duration::from_secs(3)),
-        (3, 1),
-        "told otherwise: AX.25 again"
-    );
+    assert_eq!(heard(3), (3, 1), "told otherwise: AX.25 again");
 }

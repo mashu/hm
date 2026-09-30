@@ -207,6 +207,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hm-model"
+version = "0.1.0"
+dependencies = [
+ "hm-core",
+ "hm-wire",
+ "libm",
+ "minicbor",
+]
+
+[[package]]
 name = "hm-modem-afsk"
 version = "0.1.0"
 dependencies = [
@@ -228,6 +238,7 @@ dependencies = [
  "blake3",
  "hm-core",
  "hm-ident",
+ "hm-model",
  "hm-wire",
  "raptorq",
 ]

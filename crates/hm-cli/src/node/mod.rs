@@ -8,29 +8,28 @@
 //! - **internet** (optional): QUIC links to other stations (`hm-net`);
 //! - **ARQ modem** (optional): VARA, Mercury or ARDOP host interfaces.
 //!
-//! A coordinator routes every due message over a probabilistic contact graph,
-//! reserves capacity along the selected path, and transfers custody to its
-//! next hop only after a verified receipt. RF and ARQ transmissions are gated
-//! by [`rf_policy`]: the end-to-end origin must be this station or a trusted
-//! station. Everything that arrives over any bearer goes through one
-//! acceptance gate for destination delivery or relay custody.
+//! What the station decides is [`hm_node::Node`], a state machine without
+//! I/O: it routes every due message by expected utility over the contact
+//! plan and transfers custody to its next hop only after a verified receipt.
+//! RF and ARQ transmissions are gated by [`hm_node::rf_policy`]: the
+//! end-to-end origin must be this station or a trusted station. Everything
+//! that arrives over any bearer goes through one acceptance gate
+//! ([`hm_node::accept()`]) for destination delivery or relay custody. The
+//! coordinator here is the shell that feeds the node and carries out what it
+//! asks for.
 //!
 //! The HTTP thread serves the JSON API and web page behind an access token.
 
 mod api;
 pub mod arq;
-pub mod choose;
-pub mod control;
-pub mod heard;
 pub mod live;
-mod rf_policy;
 
-mod accept;
 mod coordinator;
 mod internet;
 mod radio;
-mod sync;
 mod types;
+
+pub use hm_node::{control, heard};
 
 pub use types::{
     addressed_to_us, log, radio_config, InternetConfig, NodeConfig, NodeHandle, Notify, RadioBuilder,
@@ -44,13 +43,16 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use hm_ident::Identity;
+use hm_node::{accept, AcceptanceGate};
 use hm_store::Store;
 
-use accept::{accept, AcceptanceGate};
 use coordinator::coordinator;
 use internet::start_net;
 use live::LiveConfig;
 use radio::radio_thread;
+use types::verdict;
+
+use crate::station::unix_now;
 
 /// Open the store, bind HTTP, start the bearers and the coordinator.
 pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
@@ -123,11 +125,11 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                         cfg.me,
                         cfg.key.call,
                         Identity::from_secret(cfg.key.identity.secret()),
-                        notify.clone(),
+                        notify.observer(),
                     );
                     let gate: hm_net::Accept = Arc::new(move |via, obj| {
                         let current = gate_live.get();
-                        accept(
+                        verdict(accept(
                             AcceptanceGate {
                                 store: &store,
                                 notify: &gate_notify,
@@ -136,12 +138,12 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
                                 key_call,
                                 identity: &gate_identity,
                                 relay: &current.relay,
+                                now: unix_now(),
                             },
                             via,
                             &obj,
                             None,
-                        )
-                        .verdict()
+                        ))
                     });
                     let id = hm_ident::Identity::from_secret(cfg.key.identity.secret());
                     Arc::new(arq::Arq::start(mc, cfg.me, id, live.clone(), gate))
@@ -212,12 +214,13 @@ pub fn start(cfg: NodeConfig) -> io::Result<NodeHandle> {
 
 #[cfg(test)]
 mod tests {
-    use super::accept::{accept, Acceptance, AcceptanceGate};
-    use super::{addressed_to_us, Notify};
+    use super::addressed_to_us;
     use crate::config::RelaySettings;
     use crate::files::{KeyFile, Trust};
     use crate::station::build_bundle;
+    use crate::station::unix_now;
     use hm_bundle::Precedence;
+    use hm_node::{accept, Acceptance, AcceptanceGate, Notify};
     use hm_store::{Direction, Store};
     use hm_wire::Callsign;
 
@@ -248,7 +251,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("hm-relay-trust-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = Store::open(&path).unwrap();
-        let notify = Notify::new();
+        let notify = Notify::none();
         let settings = RelaySettings {
             enabled: true,
             ..RelaySettings::default()
@@ -275,6 +278,7 @@ mod tests {
                 key_call: relay.call,
                 identity: &relay.identity,
                 relay: &settings,
+                now: unix_now(),
             },
             sender.call,
             &bundle,
@@ -296,6 +300,7 @@ mod tests {
                 key_call: relay.call,
                 identity: &relay.identity,
                 relay: &settings,
+                now: unix_now(),
             },
             sender.call,
             &bundle,
@@ -315,7 +320,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("hm-unverified-receipt-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = Store::open(&path).unwrap();
-        let notify = Notify::new();
+        let notify = Notify::none();
         let bundle = build_bundle(
             &sender,
             sender.call,
@@ -337,6 +342,7 @@ mod tests {
                 key_call: me.call,
                 identity: &me.identity,
                 relay: &RelaySettings::default(),
+                now: unix_now(),
             },
             sender.call,
             &bundle,
@@ -356,7 +362,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("hm-bulletin-accept-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = Store::open(&path).unwrap();
-        let notify = Notify::new();
+        let notify = Notify::none();
         let bundle =
             crate::station::build_bulletin(&sender, sender.call, "SK-EMCOMM", "net open", Some("check-in"))
                 .unwrap()
@@ -372,6 +378,7 @@ mod tests {
                 key_call: me.call,
                 identity: &me.identity,
                 relay: &RelaySettings::default(),
+                now: unix_now(),
             },
             sender.call,
             &bundle,

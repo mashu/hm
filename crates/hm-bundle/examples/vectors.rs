@@ -1,4 +1,4 @@
-//! Prints the test vectors published in SPEC.md.
+//! Prints the test vectors published in docs/spec.md.
 //!
 //! `cargo run -p hm-bundle --example vectors`
 //!

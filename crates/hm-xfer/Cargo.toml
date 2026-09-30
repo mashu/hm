@@ -10,6 +10,7 @@ license.workspace = true
 hm-core = { path = "../hm-core" }
 hm-wire = { path = "../hm-wire" }
 hm-ident = { path = "../hm-ident" }
+hm-model = { path = "../hm-model" }
 blake3.workspace = true
 raptorq = { version = "2", default-features = false }
 

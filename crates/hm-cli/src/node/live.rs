@@ -12,9 +12,10 @@ use hm_ident::PublicKey;
 use hm_store::RetryPolicy;
 use hm_wire::{Callsign, Locator};
 
-use super::choose::Costs;
 use crate::config::{self, Config, RadioSettings, RelaySettings};
 use crate::files::Trust;
+
+pub use hm_node::Costs;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Live {
@@ -26,7 +27,6 @@ pub struct Live {
     pub receipt_retry: RetryPolicy,
     pub custody_grace_secs: u64,
     pub custody_suspect_secs: u64,
-    pub evidence_half_life_secs: u64,
     pub relay: RelaySettings,
     /// Seconds between beacons; 0 sends none. (Minutes in station.toml.)
     pub beacon_secs: u64,
@@ -38,6 +38,22 @@ pub struct Live {
 }
 
 impl Live {
+    /// What the node decides with.
+    pub fn node_settings(&self) -> hm_node::Settings {
+        hm_node::Settings {
+            trust: self.trust.clone(),
+            costs: self.costs,
+            retry: self.retry,
+            receipt_retry: self.receipt_retry,
+            custody_grace_secs: self.custody_grace_secs,
+            custody_suspect_secs: self.custody_suspect_secs,
+            relay: self.relay.clone(),
+            beacon_secs: self.beacon_secs,
+            radio_bitrate: self.radio.bitrate,
+            locator: self.locator,
+        }
+    }
+
     pub fn from_config(c: &Config) -> Result<Live, String> {
         let notes = c
             .trust
@@ -64,7 +80,6 @@ impl Live {
             },
             custody_grace_secs: c.delivery.custody_grace_secs,
             custody_suspect_secs: c.delivery.custody_suspect_secs,
-            evidence_half_life_secs: c.delivery.evidence_half_life_secs,
             relay: c.relay.clone(),
             beacon_secs: c.radio.beacon_minutes.saturating_mul(60),
             peers: c.peers()?,
@@ -94,7 +109,6 @@ pub struct Change {
     pub custody_grace_secs: Option<u64>,
     pub custody_suspect_secs: Option<u64>,
     pub receipt_retry_attempts: Option<u32>,
-    pub evidence_half_life_secs: Option<u64>,
     pub relay: Option<RelaySettings>,
     pub peers: Option<Vec<(Callsign, String)>>,
     /// `Some(None)` removes the locator.
@@ -266,9 +280,6 @@ impl LiveConfig {
         if c.custody_grace_secs == Some(0) || c.custody_suspect_secs == Some(0) {
             return bad("custody_grace_secs and custody_suspect_secs must be positive");
         }
-        if c.evidence_half_life_secs == Some(0) {
-            return bad("evidence_half_life_secs must be positive");
-        }
         if let Some(r) = &c.radio {
             if let Err(e) = r.check() {
                 return bad(&e);
@@ -301,7 +312,6 @@ impl LiveConfig {
                 ("custody_grace_secs", c.custody_grace_secs),
                 ("custody_suspect_secs", c.custody_suspect_secs),
                 ("receipt_retry_attempts", c.receipt_retry_attempts.map(u64::from)),
-                ("evidence_half_life_secs", c.evidence_half_life_secs),
             ] {
                 if let Some(v) = v {
                     config::set_value(p, "delivery", k, v as i64)?;
@@ -356,9 +366,6 @@ impl LiveConfig {
             }
             if let Some(v) = c2.custody_suspect_secs {
                 l.custody_suspect_secs = v;
-            }
-            if let Some(v) = c2.evidence_half_life_secs {
-                l.evidence_half_life_secs = v;
             }
             if let Some(r) = c2.relay {
                 l.relay = r;

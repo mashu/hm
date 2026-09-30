@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use hm_cli::config::RadioSettings;
 use hm_cli::files::{KeyFile, Trust};
 use hm_cli::node::arq::{ArqConfig, Kind};
-use hm_cli::node::choose::Costs;
+use hm_cli::node::live::Costs;
 use hm_cli::node::live::Live;
 use hm_cli::node::{self, NodeConfig, NodeHandle};
 use hm_cli::sound_link::PttFactory;
@@ -275,7 +275,6 @@ fn start(
             },
             custody_grace_secs: 6 * 3600,
             custody_suspect_secs: 24 * 3600,
-            evidence_half_life_secs: 3600,
             relay: Default::default(),
             beacon_secs: 0,
             peers: vec![],

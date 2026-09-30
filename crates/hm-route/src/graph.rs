@@ -1,165 +1,44 @@
-use std::collections::{BTreeMap, BTreeSet};
+//! The contact plan: which links exist, and the windows in which some are
+//! stated or seen to carry bytes.
+//!
+//! The graph holds what is known as facts and claims. Contacts are windows:
+//! schedules configured by operators, sessions up now (an internet link),
+//! links that could be tried now (a modem can call anyone), and contacts
+//! other stations advertise. Known links are the topology the station has
+//! seen for itself, in beacons and sessions: when one of them will next be
+//! open is not a window but a forecast, which the planner asks of the
+//! station's beliefs (`hm_model::Beliefs`, through [`hm_model::Estimate`]),
+//! as it asks how likely every contact is to work.
 
-use hm_wire::{Callsign, ContactAdvert, ContactBearer, Heard};
+use std::collections::BTreeMap;
 
-use crate::beta;
+use hm_wire::{Callsign, ContactAdvert};
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Bearer {
-    Radio,
-    Internet,
-    Modem,
-}
-
-impl From<ContactBearer> for Bearer {
-    fn from(value: ContactBearer) -> Self {
-        match value {
-            ContactBearer::Radio => Self::Radio,
-            ContactBearer::Internet => Self::Internet,
-            ContactBearer::Modem => Self::Modem,
-        }
-    }
-}
-
-impl From<Bearer> for ContactBearer {
-    fn from(value: Bearer) -> Self {
-        match value {
-            Bearer::Radio => Self::Radio,
-            Bearer::Internet => Self::Internet,
-            Bearer::Modem => Self::Modem,
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ContactKey {
-    pub from: Callsign,
-    pub to: Callsign,
-    pub bearer: Bearer,
-    /// Planned start, or zero for a rolling live contact.
-    pub epoch: u64,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum ContactSource {
-    Schedule,
-    Beacon,
-    LiveLink,
-    Advert,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Contact {
-    pub key: ContactKey,
-    pub start: u64,
-    pub end: u64,
-    pub rate_bps: u32,
-    pub capacity_bytes: u64,
-    pub reserved_bytes: u64,
-    pub queue_delay_secs: u32,
-    pub success_permyriad: Option<u16>,
-    pub flags: u8,
-    pub fresh_until: u64,
-    pub sequence: Option<u32>,
-    pub source: ContactSource,
-}
-
-impl Contact {
-    pub fn residual_capacity(&self) -> u64 {
-        self.capacity_bytes.saturating_sub(self.reserved_bytes)
-    }
-
-    pub fn is_usable_at(&self, now: u64) -> bool {
-        self.end > now && self.fresh_until > now && self.residual_capacity() > 0
-    }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EdgeKey {
-    pub from: Callsign,
-    pub to: Callsign,
-    pub bearer: Bearer,
-    pub utc_hour: Option<u8>,
-}
-
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
-pub struct Evidence {
-    pub successes: f64,
-    pub failures: f64,
-    pub at: u64,
-}
+use crate::contact::validate_fields;
+use crate::{
+    BeaconObservation, Bearer, Contact, ContactKey, ContactSource, KnownLink, LiveContact, ScheduledContact,
+};
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct GraphConfig {
-    pub evidence_half_life_secs: u64,
-    pub conservative_percentile: f64,
+    /// How long a session seen up (or a link that could be tried) stays in
+    /// the plan after it was last seen, and how long a station's flags are
+    /// believed after its last beacon.
     pub live_contact_secs: u64,
+    /// Longest an advertised contact is kept after it was received.
     pub advert_max_age_secs: u64,
-    pub prior_success: f64,
-    pub prior_failure: f64,
-    pub advertised_strength: f64,
-    /// Weight of one beacon heard, directly or in another station's list of
-    /// stations it heard, as evidence that a link works, where a transfer
-    /// that succeeded or failed on it counts 1. A short beacon getting
-    /// through says less about a transfer of many frames and an answer.
-    pub beacon_weight: f64,
-    /// For a radio or modem link, how much evidence from other times of day
-    /// counts, where evidence from the same UTC hour counts 1. HF propagation
-    /// follows the sun: a path open every afternoon may be dead every night.
-    /// 1 pools all hours alike.
-    pub other_hours_weight: f64,
+    /// A link not seen for this long is forgotten.
+    pub link_memory_secs: u64,
 }
 
 impl Default for GraphConfig {
     fn default() -> Self {
         Self {
-            evidence_half_life_secs: 7 * 24 * 3600,
-            conservative_percentile: 0.1,
             live_contact_secs: 20 * 60,
             advert_max_age_secs: 24 * 3600,
-            prior_success: 2.0,
-            prior_failure: 1.0,
-            advertised_strength: 2.0,
-            beacon_weight: 0.25,
-            other_hours_weight: 0.25,
+            link_memory_secs: 14 * 24 * 3600,
         }
     }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct ScheduledContact {
-    pub from: Callsign,
-    pub to: Callsign,
-    pub bearer: Bearer,
-    pub start: u64,
-    pub end: u64,
-    pub rate_bps: u32,
-    pub capacity_bytes: u64,
-    pub success_permyriad: Option<u16>,
-    pub flags: u8,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct LiveContact {
-    pub from: Callsign,
-    pub to: Callsign,
-    pub bearer: Bearer,
-    pub rate_bps: u32,
-    pub capacity_bytes: u64,
-    pub success_permyriad: Option<u16>,
-    pub flags: u8,
-    pub observed_at: u64,
-}
-
-#[derive(Copy, Clone, Debug)]
-pub struct BeaconObservation<'a> {
-    pub origin: Callsign,
-    pub receiver: Callsign,
-    pub heard: &'a [Heard],
-    pub rate_bps: u32,
-    pub capacity_bytes: u64,
-    pub flags: u8,
-    pub observed_at: u64,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -191,51 +70,25 @@ impl std::error::Error for GraphError {}
 
 pub struct ContactGraph {
     config: GraphConfig,
-    contacts: BTreeMap<ContactKey, Contact>,
-    /// Link evidence, for all hours (`utc_hour` none) and, on radio and modem
-    /// links, for each UTC hour too.
-    evidence: BTreeMap<EdgeKey, Evidence>,
+    /// Contacts by the station they leave from.
+    contacts: BTreeMap<Callsign, BTreeMap<ContactKey, Contact>>,
+    /// Known links by the station they leave from, then by where they go.
+    links: BTreeMap<Callsign, BTreeMap<(Callsign, Bearer), KnownLink>>,
     latest_sequence: BTreeMap<ContactKey, u32>,
     node_flags: BTreeMap<Callsign, (u8, u64)>,
-    /// When each station's report of hearing another was last counted, by
-    /// (reporter, heard): every beacon lists the whole last hour again.
-    heard_counted: BTreeMap<(Callsign, Callsign), u64>,
-    /// Evidence changed since [`ContactGraph::take_changed_evidence`].
-    changed: BTreeSet<EdgeKey>,
-}
-
-/// Radio and modem links keep evidence by hour of day as well.
-fn hourly(bearer: Bearer) -> bool {
-    matches!(bearer, Bearer::Radio | Bearer::Modem)
-}
-
-fn utc_hour(unix: u64) -> u8 {
-    ((unix / 3600) % 24) as u8
 }
 
 impl ContactGraph {
     pub fn new(config: GraphConfig) -> Result<Self, GraphError> {
-        if config.evidence_half_life_secs == 0
-            || config.live_contact_secs == 0
-            || config.advert_max_age_secs == 0
-            || !(0.0..1.0).contains(&config.conservative_percentile)
-            || config.prior_success <= 0.0
-            || config.prior_failure <= 0.0
-            || config.advertised_strength < 0.0
-            || config.beacon_weight.is_nan()
-            || config.beacon_weight < 0.0
-            || !(0.0..=1.0).contains(&config.other_hours_weight)
-        {
+        if config.live_contact_secs == 0 || config.advert_max_age_secs == 0 || config.link_memory_secs == 0 {
             return Err(GraphError::InvalidContact("invalid graph configuration"));
         }
         Ok(Self {
             config,
             contacts: BTreeMap::new(),
-            evidence: BTreeMap::new(),
+            links: BTreeMap::new(),
             latest_sequence: BTreeMap::new(),
             node_flags: BTreeMap::new(),
-            heard_counted: BTreeMap::new(),
-            changed: BTreeSet::new(),
         })
     }
 
@@ -255,63 +108,65 @@ impl ContactGraph {
             bearer: scheduled.bearer,
             epoch: scheduled.start,
         };
-        self.contacts.insert(
+        self.insert(Contact {
             key,
-            Contact {
-                key,
-                start: scheduled.start,
-                end: scheduled.end,
-                rate_bps: scheduled.rate_bps,
-                capacity_bytes: scheduled.capacity_bytes,
-                reserved_bytes: 0,
-                queue_delay_secs: 0,
-                success_permyriad: scheduled.success_permyriad,
-                flags: scheduled.flags,
-                fresh_until: scheduled.end,
-                sequence: None,
-                source: ContactSource::Schedule,
-            },
-        );
+            start: scheduled.start,
+            end: scheduled.end,
+            rate_bps: scheduled.rate_bps,
+            capacity_bytes: scheduled.capacity_bytes,
+            reserved_bytes: 0,
+            success_permyriad: scheduled.success_permyriad,
+            flags: scheduled.flags,
+            fresh_until: scheduled.end,
+            sequence: None,
+            source: ContactSource::Schedule,
+        });
         Ok(key)
     }
 
+    /// A session up now (an internet link): a contact while it lasts, and a
+    /// link known to exist.
     pub fn observe_live_link(&mut self, live: LiveContact) -> Result<ContactKey, GraphError> {
-        self.put_live(live, ContactSource::LiveLink)?;
-        Ok(ContactKey {
-            from: live.from,
-            to: live.to,
-            bearer: live.bearer,
-            epoch: 0,
-        })
+        let key = self.put_live(live, ContactSource::LiveLink)?;
+        self.know(live.from, live.to, live.bearer, live);
+        Ok(key)
     }
 
-    /// Merge a verified beacon and its signed "heard" observations. Give each
-    /// beacon once, at the time it was heard: every beacon counts as
-    /// evidence, weighted by [`GraphConfig::beacon_weight`]. A station lists
-    /// the stations it heard in the last hour in every beacon it sends, so a
-    /// hearing it reports again counts only once.
+    /// A link that could be tried now though it was never seen open.
+    pub fn add_potential(&mut self, live: LiveContact) -> Result<ContactKey, GraphError> {
+        self.put_live(live, ContactSource::Potential)
+    }
+
+    /// A beacon shows radio paths open: from its origin to us when it was
+    /// heard, and from each station it lists to its origin when that station
+    /// was last heard there. A radio path open one way is open both ways
+    /// (propagation is reciprocal; how likely a handoff over it is to
+    /// complete is the beliefs' business), so each is known as a link in
+    /// both directions: without them, a station could not route through a
+    /// neighbour to the stations only the neighbour hears.
     pub fn observe_beacon(&mut self, beacon: BeaconObservation<'_>) -> Result<(), GraphError> {
-        self.put_live(
-            LiveContact {
-                from: beacon.origin,
-                to: beacon.receiver,
-                bearer: Bearer::Radio,
-                rate_bps: beacon.rate_bps,
-                capacity_bytes: beacon.capacity_bytes,
-                success_permyriad: Some(8_000),
-                flags: beacon.flags,
-                observed_at: beacon.observed_at,
-            },
-            ContactSource::Beacon,
-        )?;
-        let weight = self.config.beacon_weight;
-        self.record_evidence(
+        let seen = |at| LiveContact {
+            from: beacon.origin,
+            to: beacon.receiver,
+            bearer: Bearer::Radio,
+            rate_bps: beacon.rate_bps,
+            capacity_bytes: beacon.capacity_bytes,
+            flags: 0,
+            observed_at: at,
+        };
+        validate_fields(
             beacon.origin,
             beacon.receiver,
-            Bearer::Radio,
-            (weight, 0.0),
-            beacon.observed_at,
-        );
+            0,
+            1,
+            beacon.rate_bps,
+            beacon.capacity_bytes,
+            None,
+        )?;
+        self.know_path(beacon.origin, beacon.receiver, seen(beacon.observed_at));
+        for (station, at) in beacon.hearings() {
+            self.know_path(beacon.origin, station, seen(at));
+        }
         self.node_flags.insert(
             beacon.origin,
             (
@@ -319,44 +174,6 @@ impl ContactGraph {
                 beacon.observed_at.saturating_add(self.config.live_contact_secs),
             ),
         );
-        for observation in beacon.heard {
-            if observation.call == beacon.origin {
-                continue;
-            }
-            let age = u64::from(observation.minutes) * 60;
-            let observed_at = beacon.observed_at.saturating_sub(age);
-            let freshness = 0.5_f64.powf(age as f64 / self.config.live_contact_secs as f64);
-            let success_permyriad = (7_000.0 * freshness).round().clamp(1_000.0, 7_000.0) as u16;
-            self.put_live(
-                LiveContact {
-                    from: observation.call,
-                    to: beacon.origin,
-                    bearer: Bearer::Radio,
-                    rate_bps: beacon.rate_bps,
-                    capacity_bytes: beacon.capacity_bytes,
-                    success_permyriad: Some(success_permyriad),
-                    flags: 0,
-                    observed_at,
-                },
-                ContactSource::Beacon,
-            )?;
-            // Minutes are whole, so the same hearing can come back a minute earlier.
-            let reported = (beacon.origin, observation.call);
-            let new = self
-                .heard_counted
-                .get(&reported)
-                .is_none_or(|&counted| observed_at > counted.saturating_add(60));
-            if new {
-                self.heard_counted.insert(reported, observed_at);
-                self.record_evidence(
-                    observation.call,
-                    beacon.origin,
-                    Bearer::Radio,
-                    (weight, 0.0),
-                    observed_at,
-                );
-            }
-        }
         Ok(())
     }
 
@@ -386,27 +203,24 @@ impl ContactGraph {
                 return Ok(Merge::Stale);
             }
         }
-        let reserved_bytes = self.contacts.get(&key).map_or(0, |contact| {
+        let reserved_bytes = self.contact(key).map_or(0, |contact| {
             contact.reserved_bytes.min(u64::from(advert.capacity_bytes))
         });
-        let contact = Contact {
+        let merge = match self.insert(Contact {
             key,
             start,
             end,
             rate_bps: advert.rate_bps,
             capacity_bytes: u64::from(advert.capacity_bytes),
             reserved_bytes,
-            queue_delay_secs: 0,
             success_permyriad: Some(advert.success_permyriad),
             flags: advert.flags,
             fresh_until: end.min(received_at.saturating_add(self.config.advert_max_age_secs)),
             sequence: Some(advert.sequence),
             source: ContactSource::Advert,
-        };
-        let merge = if self.contacts.insert(key, contact).is_some() {
-            Merge::Updated
-        } else {
-            Merge::Inserted
+        }) {
+            Some(_) => Merge::Updated,
+            None => Merge::Inserted,
         };
         self.latest_sequence.insert(key, advert.sequence);
         self.node_flags.insert(
@@ -419,151 +233,51 @@ impl ContactGraph {
         Ok(merge)
     }
 
-    /// A transfer on the link succeeded or failed at `now`. Returns the link's
-    /// evidence over all hours.
-    pub fn record_delivery(
-        &mut self,
-        from: Callsign,
-        to: Callsign,
-        bearer: Bearer,
-        success: bool,
-        now: u64,
-    ) -> (EdgeKey, Evidence) {
-        let outcome = if success { (1.0, 0.0) } else { (0.0, 1.0) };
-        self.record_evidence(from, to, bearer, outcome, now)
-    }
-
-    /// Add `(successes, failures)` observed at `at`: to the link's evidence
-    /// over all hours and, on a radio or modem link, to that UTC hour's.
-    fn record_evidence(
-        &mut self,
-        from: Callsign,
-        to: Callsign,
-        bearer: Bearer,
-        outcome: (f64, f64),
-        at: u64,
-    ) -> (EdgeKey, Evidence) {
-        let pooled = EdgeKey {
-            from,
-            to,
-            bearer,
-            utc_hour: None,
-        };
-        let evidence = self.add_evidence(pooled, outcome, at);
-        if hourly(bearer) {
-            let hour = EdgeKey {
-                utc_hour: Some(utc_hour(at)),
-                ..pooled
-            };
-            self.add_evidence(hour, outcome, at);
-        }
-        (pooled, evidence)
-    }
-
-    fn add_evidence(&mut self, key: EdgeKey, (successes, failures): (f64, f64), at: u64) -> Evidence {
-        let half_life = self.config.evidence_half_life_secs as f64;
-        let evidence = match self.evidence.get(&key).copied() {
-            None => Evidence {
-                successes,
-                failures,
-                at,
-            },
-            Some(held) if at >= held.at => {
-                let factor = 0.5_f64.powf((at - held.at) as f64 / half_life);
-                Evidence {
-                    successes: held.successes * factor + successes,
-                    failures: held.failures * factor + failures,
-                    at,
-                }
-            }
-            // Older than what is held: fade the new part, and keep the time.
-            Some(held) => {
-                let factor = 0.5_f64.powf((held.at - at) as f64 / half_life);
-                Evidence {
-                    successes: held.successes + successes * factor,
-                    failures: held.failures + failures * factor,
-                    at: held.at,
-                }
-            }
-        };
-        self.evidence.insert(key, evidence);
-        self.changed.insert(key);
-        evidence
-    }
-
-    /// Evidence for the link at time `at`, faded to `now`: for a radio or
-    /// modem link, that hour's in full and other hours' at
-    /// [`GraphConfig::other_hours_weight`].
-    fn weighted_evidence(
-        &self,
-        from: Callsign,
-        to: Callsign,
-        bearer: Bearer,
-        at: u64,
-        now: u64,
-    ) -> (f64, f64) {
-        let pooled_key = EdgeKey {
-            from,
-            to,
-            bearer,
-            utc_hour: None,
-        };
-        let pooled = self.faded_evidence(pooled_key, now);
-        if !hourly(bearer) {
-            return (pooled.successes, pooled.failures);
-        }
-        let hour = self.faded_evidence(
-            EdgeKey {
-                utc_hour: Some(utc_hour(at)),
-                ..pooled_key
-            },
-            now,
-        );
-        let other = |all: f64, this: f64| (all - this).max(0.0) * self.config.other_hours_weight;
-        (
-            hour.successes + other(pooled.successes, hour.successes),
-            hour.failures + other(pooled.failures, hour.failures),
-        )
-    }
-
-    pub fn conservative_probability(&self, contact: &Contact, now: u64) -> f64 {
-        let at = contact.start.max(now);
-        let (successes, failures) =
-            self.weighted_evidence(contact.key.from, contact.key.to, contact.key.bearer, at, now);
-        let mut alpha = self.config.prior_success + successes;
-        let mut beta_parameter = self.config.prior_failure + failures;
-        if let Some(permyriad) = contact.success_permyriad {
-            let probability = f64::from(permyriad) / 10_000.0;
-            alpha += probability * self.config.advertised_strength;
-            beta_parameter += (1.0 - probability) * self.config.advertised_strength;
-        }
-        beta::quantile(alpha, beta_parameter, self.config.conservative_percentile).clamp(1.0e-6, 1.0 - 1.0e-6)
-    }
-
+    /// Every contact usable at `now`.
     pub fn contacts(&self, now: u64) -> impl Iterator<Item = &Contact> {
         self.contacts
             .values()
+            .flat_map(BTreeMap::values)
             .filter(move |contact| contact.is_usable_at(now))
     }
 
+    /// The contacts leaving `station` usable at `now`.
     pub fn outgoing(&self, station: Callsign, now: u64) -> impl Iterator<Item = &Contact> {
-        self.contacts(now)
-            .filter(move |contact| contact.key.from == station)
+        self.contacts
+            .get(&station)
+            .into_iter()
+            .flat_map(BTreeMap::values)
+            .filter(move |contact| contact.is_usable_at(now))
+    }
+
+    /// The links known to leave `station`: `(to, bearer, link)`.
+    pub fn links_from(&self, station: Callsign) -> impl Iterator<Item = (Callsign, Bearer, &KnownLink)> {
+        self.links
+            .get(&station)
+            .into_iter()
+            .flat_map(BTreeMap::iter)
+            .map(|((to, bearer), link)| (*to, *bearer, link))
+    }
+
+    /// Every known link: `(from, to, bearer, link)`.
+    pub fn links(&self) -> impl Iterator<Item = (Callsign, Callsign, Bearer, &KnownLink)> {
+        self.links.iter().flat_map(|(from, links)| {
+            links
+                .iter()
+                .map(move |((to, bearer), link)| (*from, *to, *bearer, link))
+        })
     }
 
     pub fn contact(&self, key: ContactKey) -> Option<&Contact> {
-        self.contacts.get(&key)
+        self.contacts.get(&key.from)?.get(&key)
     }
 
-    pub fn reserve(&mut self, key: ContactKey, bytes: u64) -> Result<(), GraphError> {
-        let contact = self.contacts.get_mut(&key).ok_or(GraphError::UnknownContact)?;
-        if contact.residual_capacity() < bytes {
-            return Err(GraphError::Capacity);
-        }
-        contact.reserved_bytes += bytes;
-        Ok(())
+    fn contact_mut(&mut self, key: ContactKey) -> Option<&mut Contact> {
+        self.contacts.get_mut(&key.from)?.get_mut(&key)
     }
 
+    /// Hold `bytes` on every contact of `keys` (a contact named twice holds
+    /// twice), or on none if any lacks the room.
     pub fn reserve_many(&mut self, keys: &[ContactKey], bytes: u64) -> Result<(), GraphError> {
         let mut totals = BTreeMap::<ContactKey, u64>::new();
         for key in keys {
@@ -571,36 +285,32 @@ impl ContactGraph {
             *total = total.saturating_add(bytes);
         }
         for (key, total) in &totals {
-            let contact = self.contacts.get(key).ok_or(GraphError::UnknownContact)?;
+            let contact = self.contact(*key).ok_or(GraphError::UnknownContact)?;
             if contact.residual_capacity() < *total {
                 return Err(GraphError::Capacity);
             }
         }
         for (key, total) in totals {
-            self.contacts
-                .get_mut(&key)
-                .expect("validated contact")
-                .reserved_bytes += total;
+            self.contact_mut(key).expect("validated contact").reserved_bytes += total;
         }
         Ok(())
     }
 
     pub fn release(&mut self, key: ContactKey, bytes: u64) -> Result<(), GraphError> {
-        let contact = self.contacts.get_mut(&key).ok_or(GraphError::UnknownContact)?;
+        let contact = self.contact_mut(key).ok_or(GraphError::UnknownContact)?;
         contact.reserved_bytes = contact.reserved_bytes.saturating_sub(bytes);
         Ok(())
     }
 
     pub fn release_many(&mut self, keys: &[ContactKey], bytes: u64) {
         for key in keys {
-            if let Some(contact) = self.contacts.get_mut(key) {
-                contact.reserved_bytes = contact.reserved_bytes.saturating_sub(bytes);
-            }
+            let _ = self.release(*key, bytes);
         }
     }
 
+    /// `bytes` held on the contact went over it.
     pub fn consume(&mut self, key: ContactKey, bytes: u64) -> Result<(), GraphError> {
-        let contact = self.contacts.get_mut(&key).ok_or(GraphError::UnknownContact)?;
+        let contact = self.contact_mut(key).ok_or(GraphError::UnknownContact)?;
         if contact.reserved_bytes < bytes || contact.capacity_bytes < bytes {
             return Err(GraphError::Capacity);
         }
@@ -609,20 +319,11 @@ impl ContactGraph {
         Ok(())
     }
 
-    pub fn set_queue_delay(&mut self, key: ContactKey, seconds: u32) -> Result<(), GraphError> {
-        let contact = self.contacts.get_mut(&key).ok_or(GraphError::UnknownContact)?;
-        contact.queue_delay_secs = seconds;
-        Ok(())
-    }
-
-    /// How long a live contact seen in a beacon or on a link stays usable.
-    /// Follows the beacon interval, which grows on a busy channel.
+    /// How long a session seen up stays in the plan, and a station's flags
+    /// are believed. Follows the beacon interval, which grows on a busy
+    /// channel.
     pub fn set_live_contact_secs(&mut self, secs: u64) {
         self.config.live_contact_secs = secs.max(1);
-    }
-
-    pub fn live_contact_secs(&self) -> u64 {
-        self.config.live_contact_secs
     }
 
     /// Stations whose latest beacon or advert carried every bit of `mask`.
@@ -640,40 +341,59 @@ impl ContactGraph {
             .map(|(flags, _)| *flags)
     }
 
-    pub fn evidence(&self) -> impl Iterator<Item = (EdgeKey, Evidence)> + '_ {
-        self.evidence.iter().map(|(key, evidence)| (*key, *evidence))
+    /// Drop contacts that are over, flags no longer believed, and links not
+    /// seen for [`GraphConfig::link_memory_secs`].
+    pub fn prune(&mut self, now: u64) {
+        for contacts in self.contacts.values_mut() {
+            contacts.retain(|_, contact| contact.end > now && contact.fresh_until > now);
+        }
+        self.contacts.retain(|_, contacts| !contacts.is_empty());
+        let forget = self.config.link_memory_secs;
+        for links in self.links.values_mut() {
+            links.retain(|_, link| link.seen_at.saturating_add(forget) > now);
+        }
+        self.links.retain(|_, links| !links.is_empty());
+        self.node_flags.retain(|_, (_, fresh_until)| *fresh_until > now);
     }
 
-    /// Evidence changed since the last call, for saving.
-    pub fn take_changed_evidence(&mut self) -> Vec<(EdgeKey, Evidence)> {
-        core::mem::take(&mut self.changed)
-            .into_iter()
-            .filter_map(|key| self.evidence.get(&key).map(|evidence| (key, *evidence)))
-            .collect()
+    /// Put `contact` in the plan; returns the one it replaced.
+    fn insert(&mut self, contact: Contact) -> Option<Contact> {
+        self.contacts
+            .entry(contact.key.from)
+            .or_default()
+            .insert(contact.key, contact)
     }
 
-    pub fn restore_evidence(&mut self, key: EdgeKey, evidence: Evidence) {
-        if evidence.successes >= 0.0 && evidence.failures >= 0.0 {
-            self.evidence.insert(key, evidence);
+    /// `a` and `b` seen to hear each other over the radio.
+    fn know_path(&mut self, a: Callsign, b: Callsign, seen: LiveContact) {
+        self.know(a, b, Bearer::Radio, seen);
+        self.know(b, a, Bearer::Radio, seen);
+    }
+
+    fn know(&mut self, from: Callsign, to: Callsign, bearer: Bearer, seen: LiveContact) {
+        if from == to {
+            return;
+        }
+        let link = self
+            .links
+            .entry(from)
+            .or_default()
+            .entry((to, bearer))
+            .or_insert(KnownLink {
+                rate_bps: seen.rate_bps,
+                capacity_bytes: seen.capacity_bytes,
+                seen_at: seen.observed_at,
+            });
+        if seen.observed_at >= link.seen_at {
+            *link = KnownLink {
+                rate_bps: seen.rate_bps,
+                capacity_bytes: seen.capacity_bytes,
+                seen_at: seen.observed_at,
+            };
         }
     }
 
-    pub fn prune(&mut self, now: u64) {
-        self.contacts
-            .retain(|_, contact| contact.end > now && contact.fresh_until > now);
-        let half_life = self.config.evidence_half_life_secs as f64;
-        self.evidence.retain(|_, evidence| {
-            let factor = 0.5_f64.powf(now.saturating_sub(evidence.at) as f64 / half_life);
-            (evidence.successes + evidence.failures) * factor > 1.0e-6
-        });
-        self.node_flags.retain(|_, (_, fresh_until)| *fresh_until > now);
-        // A report older than any beacon's heard list can repeat it.
-        let window = 2 * 3600;
-        self.heard_counted
-            .retain(|_, counted| counted.saturating_add(window) > now);
-    }
-
-    fn put_live(&mut self, live: LiveContact, source: ContactSource) -> Result<(), GraphError> {
+    fn put_live(&mut self, live: LiveContact, source: ContactSource) -> Result<ContactKey, GraphError> {
         let end = live.observed_at.saturating_add(self.config.live_contact_secs);
         validate_fields(
             live.from,
@@ -682,7 +402,7 @@ impl ContactGraph {
             end,
             live.rate_bps,
             live.capacity_bytes,
-            live.success_permyriad,
+            None,
         )?;
         let key = ContactKey {
             from: live.from,
@@ -690,77 +410,32 @@ impl ContactGraph {
             bearer: live.bearer,
             epoch: 0,
         };
-        // An older observation never replaces a newer one.
-        if self
-            .contacts
-            .get(&key)
-            .is_some_and(|contact| contact.start > live.observed_at)
-        {
-            return Ok(());
+        if let Some(held) = self.contact(key) {
+            // An older observation never replaces a newer one, and a link
+            // that could be tried never replaces one seen open.
+            let weaker = source == ContactSource::Potential && held.source != ContactSource::Potential;
+            if held.start > live.observed_at || (weaker && held.end > live.observed_at) {
+                return Ok(key);
+            }
         }
         let reserved_bytes = self
-            .contacts
-            .get(&key)
+            .contact(key)
             .map_or(0, |contact| contact.reserved_bytes.min(live.capacity_bytes));
-        self.contacts.insert(
+        self.insert(Contact {
             key,
-            Contact {
-                key,
-                start: live.observed_at,
-                end,
-                rate_bps: live.rate_bps,
-                capacity_bytes: live.capacity_bytes,
-                reserved_bytes,
-                queue_delay_secs: 0,
-                success_permyriad: live.success_permyriad,
-                flags: live.flags,
-                fresh_until: end,
-                sequence: None,
-                source,
-            },
-        );
-        Ok(())
+            start: live.observed_at,
+            end,
+            rate_bps: live.rate_bps,
+            capacity_bytes: live.capacity_bytes,
+            reserved_bytes,
+            success_permyriad: None,
+            flags: live.flags,
+            fresh_until: end,
+            sequence: None,
+            source,
+        });
+        Ok(key)
     }
-
-    fn faded_evidence(&self, key: EdgeKey, now: u64) -> Evidence {
-        let Some(evidence) = self.evidence.get(&key).copied() else {
-            return Evidence {
-                at: now,
-                ..Evidence::default()
-            };
-        };
-        let factor =
-            0.5_f64.powf(now.saturating_sub(evidence.at) as f64 / self.config.evidence_half_life_secs as f64);
-        Evidence {
-            successes: evidence.successes * factor,
-            failures: evidence.failures * factor,
-            at: now,
-        }
-    }
-}
-
-fn validate_fields(
-    from: Callsign,
-    to: Callsign,
-    start: u64,
-    end: u64,
-    rate_bps: u32,
-    capacity_bytes: u64,
-    success_permyriad: Option<u16>,
-) -> Result<(), GraphError> {
-    if from == to {
-        return Err(GraphError::InvalidContact("self edge"));
-    }
-    if start >= end {
-        return Err(GraphError::InvalidContact("empty time window"));
-    }
-    if rate_bps == 0 || capacity_bytes == 0 {
-        return Err(GraphError::InvalidContact("zero rate or capacity"));
-    }
-    if success_permyriad.is_some_and(|probability| probability > 10_000) {
-        return Err(GraphError::InvalidContact("success probability above one"));
-    }
-    Ok(())
 }
 
 fn newer_serial(candidate: u32, current: u32) -> bool {
@@ -771,7 +446,7 @@ fn newer_serial(candidate: u32, current: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hm_wire::ContactBearer;
+    use hm_wire::{ContactBearer, Heard};
 
     fn call(value: &str) -> Callsign {
         value.parse().unwrap()
@@ -779,170 +454,66 @@ mod tests {
 
     fn graph() -> ContactGraph {
         ContactGraph::new(GraphConfig {
-            evidence_half_life_secs: 100,
             live_contact_secs: 60,
             advert_max_age_secs: 300,
-            ..GraphConfig::default()
+            link_memory_secs: 3_600,
         })
         .unwrap()
     }
 
     #[test]
-    fn delivery_evidence_is_directed_and_decays() {
-        let (a, b) = (call("M0AAA"), call("M0BBB"));
-        let mut graph = graph();
-        let key = graph
-            .observe_live_link(LiveContact {
-                from: a,
-                to: b,
-                bearer: Bearer::Radio,
-                rate_bps: 1_200,
-                capacity_bytes: 10_000,
-                success_permyriad: Some(9_000),
-                flags: 0,
-                observed_at: 0,
-            })
-            .unwrap();
-        let before = graph.conservative_probability(graph.contact(key).unwrap(), 0);
-        for now in 1..=10 {
-            graph.record_delivery(a, b, Bearer::Radio, true, now);
-        }
-        let learned = graph.conservative_probability(graph.contact(key).unwrap(), 10);
-        assert!(learned > before);
-        let faded = graph.conservative_probability(graph.contact(key).unwrap(), 1_010);
-        assert!(faded < learned);
-        graph.record_delivery(b, a, Bearer::Radio, false, 10);
-        let hours: Vec<Option<u8>> = graph
-            .evidence()
-            .filter(|(edge, _)| edge.from == b && edge.to == a)
-            .map(|(edge, _)| edge.utc_hour)
-            .collect();
-        assert_eq!(hours, vec![None, Some(0)], "all hours, and the hour it happened");
-    }
-
-    #[test]
-    fn beacon_builds_observed_directed_edges() {
+    fn a_beacon_makes_each_path_it_attests_known_both_ways() {
         let (a, b, c) = (call("M0AAA"), call("M0BBB"), call("M0CCC"));
         let mut graph = graph();
-        graph
-            .observe_beacon(BeaconObservation {
-                origin: b,
-                receiver: a,
-                heard: &[Heard { call: a, minutes: 0 }, Heard { call: c, minutes: 2 }],
-                rate_bps: 1_200,
-                capacity_bytes: 4_096,
-                flags: 3,
-                observed_at: 1_000,
-            })
-            .unwrap();
-        let edges = |at: u64| -> Vec<(Callsign, Callsign)> {
-            graph
-                .contacts(at)
-                .map(|contact| (contact.key.from, contact.key.to))
-                .collect()
-        };
-        assert!(edges(1_000).contains(&(b, a)));
-        assert!(edges(1_000).contains(&(a, b)));
-        // B heard C two minutes before its beacon: a live contact from then,
-        // over by now with this graph's one-minute window.
-        assert!(edges(900).contains(&(c, b)));
-        assert!(!edges(1_000).contains(&(c, b)));
-        assert_eq!(graph.flags(b, 1_000), Some(3));
-    }
-
-    fn beacon_at(origin: Callsign, heard: &[Heard], at: u64) -> BeaconObservation<'_> {
-        BeaconObservation {
-            origin,
-            receiver: call("M0AAA"),
-            heard,
+        let beacon = BeaconObservation {
+            origin: b,
+            receiver: a,
+            heard: &[Heard { call: a, minutes: 0 }, Heard { call: c, minutes: 2 }],
             rate_bps: 1_200,
             capacity_bytes: 4_096,
+            flags: 3,
+            observed_at: 1_000,
+        };
+        graph.observe_beacon(beacon).unwrap();
+        fn known(graph: &ContactGraph, from: Callsign) -> Vec<(Callsign, u64)> {
+            graph
+                .links_from(from)
+                .map(|(to, _, link)| (to, link.seen_at))
+                .collect()
+        }
+        assert_eq!(known(&graph, a), vec![(b, 1_000)]);
+        assert_eq!(known(&graph, b), vec![(a, 1_000), (c, 880)]);
+        assert_eq!(known(&graph, c), vec![(b, 880)]);
+        assert_eq!(graph.flags(b, 1_000), Some(3));
+        assert_eq!(beacon.hearings().collect::<Vec<_>>(), vec![(a, 1_000), (c, 880)]);
+        // A beacon is not a window: when the links open is the beliefs' forecast.
+        assert_eq!(graph.contacts(1_000).count(), 0);
+        // Links not seen for the link memory are forgotten.
+        graph.prune(880 + 3_600);
+        assert_eq!(known(&graph, b), vec![(a, 1_000)]);
+    }
+
+    /// A link that could be tried never hides one seen open.
+    #[test]
+    fn a_potential_link_does_not_replace_a_live_one() {
+        let (a, b) = (call("M0AAA"), call("M0BBB"));
+        let mut graph = graph();
+        let live = |at| LiveContact {
+            from: a,
+            to: b,
+            bearer: Bearer::Radio,
+            rate_bps: 1_200,
+            capacity_bytes: 1_000,
             flags: 0,
             observed_at: at,
-        }
-    }
-
-    fn successes(graph: &ContactGraph, from: Callsign, to: Callsign) -> f64 {
-        graph
-            .evidence()
-            .find(|(edge, _)| edge.from == from && edge.to == to && edge.utc_hour.is_none())
-            .map_or(0.0, |(_, evidence)| evidence.successes)
-    }
-
-    /// Every beacon lists the stations heard in the last hour: a hearing
-    /// counts once, however many beacons repeat it, and a beacon counts less
-    /// than a transfer.
-    #[test]
-    fn a_hearing_repeated_in_later_beacons_counts_once() {
-        let (b, c) = (call("M0BBB"), call("M0CCC"));
-        let mut graph = ContactGraph::new(GraphConfig::default()).unwrap();
-        let weight = GraphConfig::default().beacon_weight;
-        // B heard C at 1_000; its beacons at 1_300 and 1_900 both say so.
-        let heard_5 = [Heard { call: c, minutes: 5 }];
-        let heard_15 = [Heard { call: c, minutes: 15 }];
-        graph.observe_beacon(beacon_at(b, &heard_5, 1_300)).unwrap();
-        graph.observe_beacon(beacon_at(b, &heard_15, 1_900)).unwrap();
-        assert!((successes(&graph, c, b) - weight).abs() < 1e-3);
-        // A new hearing counts again.
-        let heard_1 = [Heard { call: c, minutes: 1 }];
-        graph.observe_beacon(beacon_at(b, &heard_1, 2_500)).unwrap();
-        assert!((successes(&graph, c, b) - 2.0 * weight).abs() < 1e-3);
-        // Each beacon heard from B is a hearing of its own.
-        assert!((successes(&graph, b, call("M0AAA")) - 3.0 * weight).abs() < 1e-3);
-    }
-
-    /// Evidence from the same UTC hour counts in full for a radio link, from
-    /// other hours only in part; internet links are the same at any hour.
-    #[test]
-    fn radio_evidence_is_kept_by_hour_of_day() {
-        let (a, b) = (call("M0AAA"), call("M0BBB"));
-        let mut graph = ContactGraph::new(GraphConfig::default()).unwrap();
-        let day = 86_400 * 100;
-        for bearer in [Bearer::Radio, Bearer::Internet] {
-            for n in 0..20 {
-                graph.record_delivery(a, b, bearer, true, day + 14 * 3600 + n);
-                graph.record_delivery(a, b, bearer, false, day + 2 * 3600 + n);
-            }
-        }
-        let mut at_hour = |bearer: Bearer, hour: u64| {
-            let start = day + 86_400 + hour * 3600;
-            let key = graph
-                .add_schedule(ScheduledContact {
-                    from: a,
-                    to: b,
-                    bearer,
-                    start,
-                    end: start + 600,
-                    rate_bps: 1_200,
-                    capacity_bytes: 10_000,
-                    success_permyriad: None,
-                    flags: 0,
-                })
-                .unwrap();
-            graph.conservative_probability(graph.contact(key).unwrap(), day + 86_400)
         };
-        let (afternoon, night) = (at_hour(Bearer::Radio, 14), at_hour(Bearer::Radio, 2));
-        assert!(
-            afternoon > 0.6 && night < 0.3,
-            "afternoon {afternoon:.2}, night {night:.2}"
-        );
-        let (afternoon, night) = (at_hour(Bearer::Internet, 14), at_hour(Bearer::Internet, 2));
-        assert!((afternoon - night).abs() < 1e-9);
-    }
-
-    /// An observation older than the evidence held is faded, and does not
-    /// move the evidence back in time.
-    #[test]
-    fn late_evidence_does_not_turn_back_the_clock() {
-        let (a, b) = (call("M0AAA"), call("M0BBB"));
-        let mut graph = ContactGraph::new(GraphConfig::default()).unwrap();
-        let half_life = GraphConfig::default().evidence_half_life_secs;
-        graph.record_delivery(a, b, Bearer::Internet, true, 2 * half_life);
-        let (_, evidence) = graph.record_delivery(a, b, Bearer::Internet, true, half_life);
-        assert_eq!(evidence.at, 2 * half_life);
-        assert!((evidence.successes - 1.5).abs() < 1e-9, "{}", evidence.successes);
-        assert_eq!(graph.take_changed_evidence().len(), 1);
-        assert!(graph.take_changed_evidence().is_empty());
+        let key = graph.observe_live_link(live(100)).unwrap();
+        graph.add_potential(live(120)).unwrap();
+        assert_eq!(graph.contact(key).unwrap().source, ContactSource::LiveLink);
+        graph.add_potential(live(200)).unwrap();
+        assert_eq!(graph.contact(key).unwrap().source, ContactSource::Potential);
+        // Only the session is a known link.
+        assert_eq!(graph.links_from(a).count(), 1);
     }
 
     #[test]
@@ -995,9 +566,10 @@ mod tests {
                 flags: 0,
             })
             .unwrap();
-        graph.reserve(key, 80).unwrap();
+        graph.reserve_many(&[key], 80).unwrap();
         assert_eq!(graph.contact(key).unwrap().residual_capacity(), 20);
-        assert_eq!(graph.reserve(key, 21), Err(GraphError::Capacity));
+        assert_eq!(graph.reserve_many(&[key], 21), Err(GraphError::Capacity));
+        assert_eq!(graph.reserve_many(&[key, key], 11), Err(GraphError::Capacity));
         graph.consume(key, 50).unwrap();
         assert_eq!(
             (

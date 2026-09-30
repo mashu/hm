@@ -11,7 +11,23 @@ use crate::IdentError;
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PublicKey(pub [u8; 32]);
 
+/// Domain of a key id.
+pub const KEY_ID_DOMAIN: &[u8] = b"hm/key-id/v0";
+
 impl PublicKey {
+    /// A short name for the key: the first 8 bytes of
+    /// BLAKE3("hm/key-id/v0" || key). Enough to tell one station's keys
+    /// apart and to find the key to check a signature with; not enough to
+    /// learn the key, which comes only from the trusted keys.
+    pub fn id(&self) -> [u8; hm_wire::KEY_ID_LEN] {
+        let mut h = blake3::Hasher::new();
+        h.update(KEY_ID_DOMAIN);
+        h.update(&self.0);
+        let mut id = [0; hm_wire::KEY_ID_LEN];
+        id.copy_from_slice(&h.finalize().as_bytes()[..hm_wire::KEY_ID_LEN]);
+        id
+    }
+
     /// Verify `sig` over `msg` with strict Ed25519 rules (no malleable or
     /// small-order signatures and keys).
     pub fn verify(&self, msg: &[u8], sig: &[u8; 64]) -> Result<(), IdentError> {

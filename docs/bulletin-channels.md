@@ -41,6 +41,6 @@ storm.
 
 ## References
 
-- Address and kind tags: [`SPEC.md`](../SPEC.md) § bundles  
+- Address and kind tags: [the specification](spec.md) § bundles  
 - `Address::Group`, `Kind::Bulletin`: `crates/hm-bundle/src/types.rs`  
 - Broadcast xfer: `Command::Broadcast` in `crates/hm-xfer`  

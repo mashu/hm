@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent check of the SPEC.md test vectors.
+"""Independent check of the docs/spec.md test vectors.
 
 Re-implements base-40 packing and verifies ids and signatures with the
 reference BLAKE3 and libsodium (PyNaCl) implementations, sharing no code with
@@ -186,18 +186,20 @@ def check(text: str) -> None:
     assert c[13:15] == b"\xbe\xef" and c[18:] == bytes([0x03, 1, 0, 90])
     print("ok  CLOSE (busy, retry after)")
 
-    # Beacon: broadcast, session and index 0, flags, key, time, locator, heard list,
-    # and a signature over "hm/beacon-sig/v0" || source callsign || body.
+    # Beacon: broadcast, session and index 0, flags, key id, time, locator, heard
+    # list, and a signature over "hm/beacon-sig/v0" || source callsign || body. The key id is the first 8 bytes of
+    # BLAKE3("hm/key-id/v0" || key).
     s_b = section(text, "## Beacon")
     b = bytes.fromhex(re.search(r"beacon ([0-9a-f]+)", s_b).group(1))
     assert b[0] == 0x04 and unpack(b[1:7]) == "SA0KAM-10" and b[7:13] == b"\xff" * 6
     assert b[13:18] == bytes(5), "session and index 0"
     p = b[18:]
-    assert p[0] == 0x01 and p[1:33] == me.encode(), "flags and key"
-    assert int.from_bytes(p[33:37], "big") == 1_790_000_000
-    assert p[37:43] == b"JO89XI" and p[43] == 1, "locator and heard count"
-    assert unpack(p[44:50]) == "SO5KM-1" and p[50] == 3 and len(p) == 44 + 7 + 64
-    me.verify(b"hm/beacon-sig/v0" + b[1:7] + p[:51], p[51:])
+    key_id = blake3.blake3(b"hm/key-id/v0" + me.encode()).digest()[:8]
+    assert p[0] == 0x01 and p[1:9] == key_id, "flags and key id"
+    assert int.from_bytes(p[9:13], "big") == 1_790_000_000
+    assert p[13:19] == b"JO89XI" and p[19] == 1, "locator and heard count"
+    assert unpack(p[20:26]) == "SO5KM-1" and p[26] == 3 and len(p) == 20 + 7 + 64, "heard"
+    me.verify(b"hm/beacon-sig/v0" + b[1:7] + p[:27], p[27:])
     print("ok  beacon (layout, signature)")
 
 

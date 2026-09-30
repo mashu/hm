@@ -1,0 +1,16 @@
+[package]
+name = "hm-model"
+description = "Generative models of links, custodians and channels, with the decisions they drive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hm-core = { path = "../hm-core" }
+hm-wire = { path = "../hm-wire" }
+minicbor.workspace = true
+libm = "0.2"
+
+[dev-dependencies]
+proptest.workspace = true

@@ -10,7 +10,7 @@
 //! - [`ObjectId`]: 32-byte content hash naming bundles, records and attachments.
 //! - [`stream`]: messages on reliable byte streams (internet links, ARQ modems).
 //!
-//! Layouts are specified in `SPEC.md` at the repository root.
+//! Layouts are specified in `docs/spec.md`.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -30,7 +30,8 @@ mod sync;
 
 pub use ack::{Ack, MAX_ACK_COMPLETED, NEED_OFFER, RECEIPT_LEN};
 pub use beacon::{
-    Beacon, Heard, BEACON_SIG_PREFIX, FLAG_HOLDING, FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY, MAX_HEARD,
+    Beacon, Heard, BEACON_SIG_PREFIX, FLAG_HOLDING, FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY, KEY_ID_LEN,
+    MAX_HEARD,
 };
 pub use callsign::{Callsign, CALLSIGN_MAX_LEN};
 pub use data::{DataPreamble, Offer, CTRL_OFFER, DATA_PREAMBLE_LEN, MAX_OBJECT_LEN, OFFER_LEN};

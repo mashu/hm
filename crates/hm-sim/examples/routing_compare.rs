@@ -63,6 +63,7 @@ fn scenario(seed: u64) -> RoutingScenario {
 fn name(algorithm: RoutingAlgorithm) -> &'static str {
     match algorithm {
         RoutingAlgorithm::BayesianCgr => "Bayesian CGR",
+        RoutingAlgorithm::BayesianCgrLive => "CGR (live)",
         RoutingAlgorithm::Epidemic => "Epidemic",
         RoutingAlgorithm::SprayAndWait { .. } => "Spray L=2",
         RoutingAlgorithm::Prophet => "PRoPHET-like",

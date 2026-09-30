@@ -1,5 +1,5 @@
 //! Framing on reliable byte streams: an internet link's QUIC streams and an
-//! ARQ modem's connection (SPEC section 10).
+//! ARQ modem's connection (`docs/spec.md`, section 10).
 //!
 //! ```text
 //! object    "HMD0" | length u32 BE | object bytes

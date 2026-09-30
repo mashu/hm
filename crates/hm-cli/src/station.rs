@@ -1,44 +1,28 @@
-//! Build, send and receive bundles over a radio [`Link`](crate::driver::Link).
+//! Build, send and receive bundles over a radio [`crate::driver::Link`].
 //!
 //! Used by `hm send` / `hm listen` and by the node. The transfer engine is the
 //! same sans-IO machine the simulator drives; this module only supplies the clock,
 //! the station key and the trusted stations.
 
-use std::borrow::Cow;
 use std::io;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use hm_bundle::{Address, Bundle, BundleError, Kind, Opened, Precedence, SignedBundle};
+use hm_bundle::{Address, Bundle, BundleError, Kind, Precedence, SignedBundle};
 use hm_core::{DetRng, Millis};
-use hm_ident::{Identity, PublicKey};
-use hm_wire::{Callsign, ObjectId};
-use hm_xfer::{object_id, Command, Config, Event, Failure, Receipt, Xfer};
+use hm_ident::Identity;
+use hm_wire::Callsign;
+use hm_xfer::{Command, Event, Failure, Receipt, Xfer};
 
 use crate::driver::{run, End, Flow, Link};
 use crate::files::{KeyFile, Trust};
 
-/// Chat expires after an hour; mail after a week. Relays use this; the local
-/// queue retries on its own schedule.
-const CHAT_TTL: u32 = 3600;
-const MAIL_TTL: u32 = 7 * 86_400;
 /// Bulletins stay useful for a day on a shared channel.
 pub const BULLETIN_TTL: u32 = 86_400;
-/// Sealed bulletin object size cap (smaller than routine mail on air).
-pub const MAX_BULLETIN_BYTES: usize = 4096;
 /// Local publishes allowed in a rolling hour.
 pub const MAX_BULLETINS_PER_HOUR: usize = 4;
-/// Inbound bulletins kept per origin in a rolling hour (flood guard).
-pub const MAX_INBOUND_BULLETINS_PER_ORIGIN_HOUR: usize = 12;
 
-/// Link parameters the transfer engine uses to time overs.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct LinkTiming {
-    pub bitrate_bps: u32,
-    pub txdelay_ms: u64,
-    pub guard_ms: u64,
-    pub max_rounds: u8,
-}
+pub use hm_node::LinkTiming;
 
 /// One station's key, trust and link timing, borrowed for a send or a listen.
 pub struct Station<'a> {
@@ -60,42 +44,17 @@ pub enum SendOutcome {
     TimedOut,
 }
 
-/// What the trusted keys could say about a received bundle's signature.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Verification {
-    /// Signed by the key listed for the sender.
-    Verified,
-    /// No key for the sender, so the signature was not checked.
-    Unverified,
-    /// A key is listed and the signature does not match it.
-    BadSignature,
-}
-
-/// One object pulled off the air, decoded as far as it will go.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Message {
-    pub id: ObjectId,
-    pub via: Callsign,
-    pub verification: Verification,
-    pub bundle: Option<Bundle>,
-    pub error: Option<String>,
-}
-
-impl Message {
-    /// UTF-8 body, when the bundle has one this build understands.
-    pub fn text(&self) -> Option<Cow<'_, str>> {
-        self.bundle.as_ref()?.body.as_ref()?.as_text().ok()
-    }
-}
+pub use hm_node::message::{
+    open_message, Draft, Message, Verification, MAX_BULLETIN_BYTES, MAX_INBOUND_BULLETINS_PER_ORIGIN_HOUR,
+};
+pub use hm_node::utc_clock;
 
 impl Station<'_> {
     /// Transfer engine for this station, trusting every trusted key.
     pub fn engine(&self) -> io::Result<Xfer> {
-        // Symbols and overs sized for the link's rate: an HF link at 300 bd
-        // gets small symbols and short overs, not the VHF 1200 ones.
-        let mut cfg = Config::for_link(self.me, self.timing.bitrate_bps, Millis(self.timing.txdelay_ms));
-        cfg.ack_guard = Millis(self.timing.guard_ms);
-        cfg.max_rounds = self.timing.max_rounds;
+        // Symbols and overs sized for the link's rate (an HF link at 300 bd
+        // gets small symbols and short overs), key-ups no longer than allowed.
+        let cfg = self.timing.engine_config(self.me);
         let mut xfer = Xfer::new(cfg, Identity::from_secret(self.key.identity.secret()), rng())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         for (call, key) in self.trust.iter() {
@@ -140,7 +99,7 @@ impl Station<'_> {
                     outcome = Some(SendOutcome::Failed(reason));
                     Flow::Stop
                 }
-                Event::Received { .. } => Flow::Continue,
+                Event::Received { .. } | Event::Over { .. } => Flow::Continue,
             },
         )?;
         Ok(match end {
@@ -169,7 +128,7 @@ impl Station<'_> {
             stop,
             |_now, event| match event {
                 Event::Received { from, object, .. } => on_message(open_message(from, &object, trust, None)),
-                Event::Delivered { .. } | Event::Failed { .. } => Flow::Continue,
+                Event::Delivered { .. } | Event::Failed { .. } | Event::Over { .. } => Flow::Continue,
             },
         )?;
         Ok(())
@@ -187,23 +146,14 @@ pub fn build_bundle(
     prec: Precedence,
     seq: Option<u64>,
 ) -> Result<SignedBundle, BundleError> {
-    let (kind, ttl) = match subject {
-        Some(_) => (Kind::Mail, MAIL_TTL),
-        None => (Kind::Chat, CHAT_TTL),
-    };
-    let mut bundle = Bundle::new(me, kind, unix_now(), ttl)
-        .to(Address::Station(to))
-        .with_text(text)
-        .with_precedence(prec);
-    if let Some(subject) = subject {
-        bundle = bundle.with_subject(subject);
+    Draft {
+        to,
+        text,
+        subject,
+        precedence: prec,
+        seq,
     }
-    if kind == Kind::Chat {
-        if let Some(seq) = seq {
-            bundle = bundle.with_seq(seq);
-        }
-    }
-    bundle.seal(&key.identity)
+    .seal(&key.identity, me, unix_now())
 }
 
 /// Seal an RF bulletin to a named group. Always routine precedence; no station
@@ -228,74 +178,12 @@ pub fn build_bulletin(
     bundle.seal(&key.identity)
 }
 
-/// Decode `object` and check its signature against `trust`. `via` is who sent the frame.
-/// When the sender is not in `trust`, `peer_key` (from an open-hub TLS session) may
-/// still verify messages that claim to be from `via`.
-pub fn open_message(via: Callsign, object: &[u8], trust: &Trust, peer_key: Option<&PublicKey>) -> Message {
-    let opened = match Opened::decode(object) {
-        Ok(opened) => opened,
-        Err(e) => {
-            return Message {
-                id: object_id(object),
-                via,
-                verification: Verification::Unverified,
-                bundle: None,
-                error: Some(e.to_string()),
-            };
-        }
-    };
-    let from = opened.bundle.from;
-    let verification = match trust.key_for(from) {
-        Some(key) => match opened.clone().verify(&key) {
-            Ok(_) => Verification::Verified,
-            Err(_) => Verification::BadSignature,
-        },
-        None => match peer_key {
-            Some(key) if from == via || from.base() == via.base() => match opened.clone().verify(key) {
-                Ok(_) => Verification::Verified,
-                Err(_) => Verification::BadSignature,
-            },
-            _ => Verification::Unverified,
-        },
-    };
-    Message {
-        id: opened.id,
-        via,
-        verification,
-        bundle: Some(opened.bundle),
-        error: None,
-    }
-}
-
 /// Unix seconds, or 0 if the clock is before the epoch.
 pub fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// `YYYY-MM-DD HH:MM:SSZ` for a Unix timestamp.
-pub fn utc_clock(unix: u64) -> String {
-    let secs = unix % 86_400;
-    let (hh, mm, ss) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    let (y, m, d) = civil_from_days((unix / 86_400) as i64);
-    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}Z")
-}
-
-/// Days since 1970-01-01 to a civil date. Howard Hinnant's `civil_from_days`.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m as u32, d as u32)
 }
 
 fn rng() -> DetRng {
