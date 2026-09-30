@@ -142,6 +142,41 @@ custodians. So a new neighbour is expected to behave like the ones already
 known, not like a number written into the code; and on a network where
 most pairs never hear each other, a new pair starts out doubtful.
 
+## Checking the chances
+
+The models are approximations: the path filter factorises reach, the daily
+pattern and the state now, and the population prior is one bump where paths
+are mostly either usable or not. Approximations like these err the same way
+for long stretches, and a station can see it for itself: for every handoff
+it starts it knows the chance it gave, and later whether the path carried
+it (a refusal counts as carried: the answer came back). So every handoff
+chance the beliefs give out passes through the station's own record of how
+such chances came true (`hm_model::Calibration`):
+
+```text
+bands of the chance given, by log-odds, each with its record (faded, a week's half-life):
+    n handoffs, c carried, Σp the chances given
+overall correction   δ̄ = logit((Σc + s·p̄) / (Σn + s)) − logit(p̄)           the whole record, shrunk toward none
+band's rate          r_k = (c_k + s·σ(logit p̄_k + δ̄)) / (n_k + s)           shrunk toward the overall correction
+chance out           σ(logit p + δ(logit p)),  δ interpolated between bands, never decreasing
+```
+
+with `s` = 10 handoffs. It is Bayesian binning with the bands shrunk toward
+each other (hierarchical), not one curve through the whole record: a single
+logistic map (Platt scaling) stretched the chances at both ends when the
+model erred one way on some paths and the other way on others. Bands out of
+order are pooled (isotonic regression), so a higher chance given is never a
+lower chance out. With no record, or with chances that come true, nothing
+changes.
+
+Chances about a path the station has seen open, and about one it has only
+inferred, err differently, so each kind has its own record, per bearer. In
+the simulated sparse twenty stations the first kind came true somewhat less
+often than given (46 % given, 37 % carried), and the second seventy times
+less often (5 % given, 2 carried in 2 847): a station never heard is mostly
+one that cannot be heard, and every such try was a transmission someone else
+had to wait for ([results](results.md#checking-the-chances)).
+
 ## Draws and means
 
 Decisions read the beliefs in one of two ways:

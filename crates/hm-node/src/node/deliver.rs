@@ -529,6 +529,12 @@ impl Node {
             r.attempts + 1
         ));
         let downstream = route.downstream_probability();
+        let link = LinkKey {
+            from: self.id.me,
+            to: peer,
+            bearer,
+        };
+        let forecast = self.beliefs.forecast(link, now);
         self.in_flight.insert(
             (r.id, peer),
             InFlight {
@@ -539,17 +545,13 @@ impl Node {
                 downstream,
                 alternative,
                 expires_at,
+                forecast: Some(forecast),
             },
         );
         match bearer {
             Bearer::Radio => {
                 self.radio_ids
                     .insert((hm_xfer::object_id(&wire_object), peer), r.id);
-                let link = LinkKey {
-                    from: self.id.me,
-                    to: peer,
-                    bearer: Bearer::Radio,
-                };
                 let price = self.settings.costs.airtime(self.channel_busy)[Bearer::Radio];
                 out.push(Command::Radio(RadioCmd::Send {
                     object: wire_object,

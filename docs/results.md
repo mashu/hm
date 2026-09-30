@@ -29,6 +29,7 @@ openings. `cargo run --release -p hm-node --example hf_days -- 7 4 10`
 | the open state followed through a transfer, stopping to wait for the peer | 240 / 240 | 1.8 h / 15.2 h | 6.4 % |
 | the receipt due after the trip there and back | 240 / 240 | 1.7 h / 16.0 h | 6.2 % |
 | beacons naming the key by an 8-byte id, key-ups of at most 20 s | 240 / 240 | 1.3 h / 15.9 h | 6.2 % |
+| handoff chances checked against how handoffs ended | 240 / 240 | 1.4 h / 15.4 h | 6.2 % |
 
 Where the airtime went in the first run: data 27 %, session opens 19 %,
 mostly attempts into closed paths. Now: beacons 3.4 %, data about 2 %,
@@ -47,28 +48,39 @@ air per station per hour.
 
 | Stations | Delivered | Latency p50 / p90 | Busy, mean / worst | Beacon | Control | Data |
 | --- | --- | --- | --- | --- | --- | --- |
-| 5 | 40 / 40 | 2.8 h / 13.1 h | 6.8 % / 6.8 % | 22.1 s | 13.6 s | 13.0 s |
-| 10 | 80 / 80 | 5.1 h / 16.3 h | 23.7 % / 23.7 % | 15.8 s | 35.8 s | 33.7 s |
-| 20 | 157 / 160 | 11.1 h / 32.8 h | 94.3 % / 94.3 % | 8.0 s | 78.9 s | 82.8 s |
+| 5 | 40 / 40 | 2.3 h / 11.6 h | 7.6 % / 7.6 % | 22.2 s | 16.6 s | 16.0 s |
+| 10 | 80 / 80 | 5.6 h / 19.5 h | 23.9 % / 23.9 % | 15.6 s | 35.7 s | 34.7 s |
+| 20 | 158 / 160 | 8.9 h / 34.3 h | 77.6 % / 77.6 % | 8.2 s | 64.3 s | 67.1 s |
 
 `... -- 5,10,20 4 0 4 1` (the square grows with the network, 360 km × √n)
 
 | Stations | Delivered | Latency p50 / p90 | Busy, mean / worst | Beacon | Control | Data |
 | --- | --- | --- | --- | --- | --- | --- |
-| 5 | 40 / 40 | 2.9 h / 22.9 h | 9.6 % / 9.6 % | 22.2 s | 23.5 s | 23.5 s |
-| 10 | 80 / 80 | 5.7 h / 34.9 h | 29.7 % / 32.4 % | 16.4 s | 50.3 s | 49.8 s |
-| 20 | 127 / 160 | 19.6 h / 50.7 h | 65.2 % / 99.3 % | 13.3 s | 86.5 s | 89.8 s |
+| 5 | 40 / 40 | 3.4 h / 17.8 h | 7.6 % / 7.6 % | 22.4 s | 16.3 s | 16.3 s |
+| 10 | 80 / 80 | 7.7 h / 29.6 h | 27.0 % / 29.4 % | 16.7 s | 45.1 s | 44.1 s |
+| 20 | 119 / 160 | 12.9 h / 49.8 h | 45.2 % / 68.4 % | 14.1 s | 55.8 s | 57.3 s |
 
-Over this round the ten-station networks went from 27.6 % busy (dense)
-and 46.3 % (sparse) to about 24 % and 30 %, and the sparse twenty from 104
-delivered to 127: planning that scales (a four-day run of twenty stations
-took more than twenty minutes, now four to eight), senders that stop
-probing a path gone quiet, and origins that no longer resend what is only
-slow. Capping key-ups at 20 s costs airtime where transfers are long and
-paths poor (the twenties: more, shorter overs, each with its own key-up and
-answer). One seed of twenty stations varies a lot: three seeds of the
-sparse twenty, before the cap, delivered 121, 139 and 136. Beacons take
-less airtime per station as the network grows.
+Checking the handoff chances against how handoffs ended (see below) took
+the dense twenty from 94.3 % busy to 77.6 % and the sparse twenty from
+65.2 % to 45.2 %, with the worst neighbourhood from 99.3 % to 68.4 %; the
+smaller networks, which had little to correct, stayed where they were. One
+seed of twenty stations varies a lot, so the sparse twenty was run on three:
+
+| Sparse twenty, seeds 1 to 5 | Delivered | Busy, mean | Latency p50 |
+| --- | --- | --- | --- |
+| before | 127, 134, 141, 124, 124 (650 / 800) | 65.2, 69.5, 66.9, 67.5, 55.0 % (64.8) | 19.6, 11.7, 12.6, 11.9, 14.0 h |
+| handoff chances checked | 119, 141, 142, 136, 130 (668 / 800) | 45.2, 60.5, 57.8, 58.4, 48.9 % (54.2) | 12.9, 9.2, 12.3, 14.6, 13.1 h |
+
+A few more messages delivered, mostly sooner, with a sixth less of the
+channel.
+Earlier in this round the ten-station networks went from 27.6 % busy
+(dense) and 46.3 % (sparse) to about 24 % and 30 %, and the sparse twenty
+from 104 delivered to 127: planning that scales (a four-day run of twenty
+stations took more than twenty minutes, now four to eight), senders that
+stop probing a path gone quiet, and origins that no longer resend what is
+only slow. Capping key-ups at 20 s costs airtime where transfers are long
+and paths poor (the twenties: more, shorter overs, each with its own key-up
+and answer). Beacons take less airtime per station as the network grows.
 
 **How long the transmitter is keyed.** A station's transmitter is on
 about 1 % of the time in the Baltic week (some 45 s an hour) and 3 % in the
@@ -80,39 +92,118 @@ seconds-per-hour columns above are sums over an hour, not single
 transmissions; "busy" counts every station a station hears, not its own
 transmitter.
 
+### Checking the chances
+
+A station's handoff chances were overconfident, and at the low end badly.
+Logging, in the sparse twenty (seed 1), the chance the beliefs gave each
+radio handoff against whether the path carried it, and marking the pairs
+the simulated world has no path between at all:
+
+| Radio handoffs | Before: chance given | carried | After: chance given | carried |
+| --- | --- | --- | --- | --- |
+| to a station heard before | 45.8 % | 36.7 % | 40.7 % | 38.7 % |
+| to a station never heard, with a path | 6.0 % | 0.2 % | 3.7 % | 1.4 % |
+| to a station never heard, no path | 4.9 % | 0 | 2.7 % | 0 |
+
+Of 10 360 radio handoffs over the four days, 3 390 went to stations that
+could not be reached at all, a few dozen tries each over days; after, 1 049
+of 5 415. The path model explained each failure as the path being closed
+just then, and between tries the chance crept back up toward the daily
+pattern; an exact model with the same one-bump prior would have done much
+the same. Most such tries came after ten failures or more on the same pair,
+a fifth of them from Thompson draws made afresh every quarter of an hour.
+A station makes only a few dozen handoffs a day to stations it has never
+heard, so its record of them is still short after four days: the chances it
+gives them are still above what comes true, but by a factor of seven rather
+than seventy.
+
+So chances are now checked against the station's own record, separately for
+paths seen open and paths only inferred ([models](models.md#checking-the-chances)).
+What was tried on the way there:
+
+| Sparse twenty, seed 1 | Delivered | Busy |
+| --- | --- | --- |
+| before | 127 / 160 | 65.2 % |
+| one logistic map (Platt scaling) for all handoffs | 89 / 160 | 30.7 % |
+| a logistic map per kind, seen and not | 118 / 160 | 40.8 % |
+| bins per kind | 139 / 160 | 54.1 % |
+| bins per kind, shrunk toward each other (kept) | 119 / 160 | 45.2 % |
+| the same, custodians' retries counted in a route's chance | 107 / 160 | 62.1 % |
+
+One map for all handoffs could not tell a dead pair from a weak live one and
+cut both; a logistic map per kind stretched the seen paths' chances to 99.9 %
+(68 % carried) at the top. Bins correct each band of chances by its own
+record; shrinking them toward each other lets the few dozen handoffs a day a
+station makes to paths never heard teach every band at once (without it,
+a band given 3.6 % came down only to 1.7 %, where 0.2 % came true). Over
+five seeds the bins without the shrinking delivered 680 of 800 at 57.9 %
+busy, the kept version 668 at 54.2 %: per seed the two differ by −10 to
++20 messages either way, and the shrunk bins used less of the channel on
+four seeds of five.
+
+**Custodians' retries in a route's chance.** A route counts each hop past
+the first as one try, though each custodian tries again until the message
+expires. Counting the tries (the chance a custodian has handed the message
+on by each departure, tries less than an hour apart counted as correlated)
+made nearly every link over a day and a half likely, so the bound on what a
+route through a station can be worth stopped pruning: planning took three
+times as long and ran into the search limit, and fewer messages moved. Not
+kept.
+
 ### What is still wrong
 
-- **Relays that hold for good.** In the sparse twenty, most messages not
-  delivered sit at a relay that finds, every quarter of an hour for days,
-  no route worth its airtime. It plans on the posterior mean, and counts
-  each hop beyond the next as a single attempt: over three to five hops the
-  chance multiplies down below what the airtime costs on a busy channel,
-  though each custodian on the way would try again. The chance a route
-  should carry past the first hop is the chance with retries.
-- **Two-hop horizon, and what telling more did.** Beacons tell each
-  station of its two-hop neighbourhood only; beyond, it guesses. We tried
-  sampled reach entries: each beacon carrying up to three "I reach D with
-  chance p in about t" statements from the station's own models, weighted
-  by chance and by how long since it last told them, within the bytes the
-  key id freed, taken by listeners as stated probabilities. Over three
-  seeds of the sparse twenty it delivered 372 of 480 against 396 without,
-  at 54 % busy against 58 %: messages moved toward the stations that
-  claimed a way and then stalled at them, for the reason above. Knowing
-  more was not what was missing, so it was not kept; it is worth trying
-  again once relays value what custodians further on will do.
+- **Where the sparse twenty loses messages.** Every message not delivered
+  had a path, of one or two hops, within the two-hop neighbourhood each
+  station learns from beacons: knowing the topology is not what is missing.
+  The paths are long (600 to 1 000 km, open a fifth of the day and three
+  fifths of the night) and 300 bd frames seldom survive them: one station
+  decoded about 5 % of its neighbours' beacons over two days, and none of one
+  neighbour's. Such a path is little better than none at 300 bd.
+- **What telling more did.** Beacons tell each station of its two-hop
+  neighbourhood only. We tried sampled reach entries: each beacon carrying
+  up to three "I reach D with chance p in about t" statements from the
+  station's own models, weighted by chance and by how long since it last
+  told them, within the bytes the key id freed, taken by listeners as
+  stated probabilities. Over three seeds of the sparse twenty it delivered
+  372 of 480 against 396 without, at 54 % busy against 58 %: messages moved
+  toward the stations that claimed a way and then stalled at them. Knowing
+  more was not what was missing, so it was not kept.
 - **A dense channel of twenty.** Twenty stations sharing one 300 bd channel
-  keep it busy 90 % of the time: about as much data airtime is lost to
-  fades and collisions as gets through. Carrier sense persistence is fixed
-  (p = 0.25), where the number of stations contending is known and could
-  set it.
+  keep it busy 78 % of the time, a fifth of it in frames lost to collisions.
+  They are not the collisions carrier sense can prevent: with the
+  persistence of every station set to 1/16, 1/8, 1/4 (the default), 1/2 and
+  1, the dense twenty ran 85.2, 83.1, 77.6, 84.2 and 82.7 % busy with
+  21.9, 21.1, 18.4, 22.1 and 21.2 % of the time in collisions (seed 1), and
+  the sparse twenty much the same at 1/16 and 1/2. Most are between stations
+  that cannot hear each other at that hour (their path is closed) sending
+  to one that hears both. Setting persistence from the number of stations
+  contending, as planned, would not help. Nor did virtual carrier sense:
+  receivers giving their sender's next over its airtime in the ACK's
+  credit field, and stations that heard an ACK or an over between two others
+  holding their own overs, beacons and control frames until the next turn
+  was done. The dense twenty stayed at 158 delivered with 20.1 % of the time
+  in collisions (83.1 % busy), the sparse twenty went to 130 at 9.3 %
+  (46.4 %): within what one seed varies. A frame spoils reception at a
+  station that it reaches at all, and on these paths a third station
+  decodes only a small share of the ACKs it could spoil, so it seldom knows
+  to keep quiet. Not kept.
 - **300 bd AFSK is a poor HF mode.** It has no forward error correction of
   its own and its symbols are short against multipath. The simulated
   numbers are for it because it can be simulated; on the air, HF traffic
   belongs on an ARQ modem (VARA HF, ARDOP), which hm-net supports as a
   bearer ([modems](operating/modems.md)).
 - **One symbol size for every path.** 32-byte symbols suit fading paths and
-  are slower on good ones (see below); the size should follow each path's
-  loss belief ([transfer](transfer.md#frame-and-symbol-sizes)).
+  are slower on good ones (see below). Choosing the size per transfer from
+  the path's loss belief ([transfer](transfer.md#frame-and-symbol-sizes))
+  helped the Baltic week a little (behind the oracle p90 12.2 h against
+  15.4 h, the same 6.2 % busy) and cost the crowded networks: the sparse
+  twenty delivered 412 of 480 over three seeds against 402 at 57.1 % busy
+  against 54.5 %, the dense twenty 160 against 158 at 88.4 % against
+  77.6 %, and the sparse five and ten each lost one message. Longer frames
+  meet more fades and more collisions, and a path's loss belief starts from
+  a prior (15 % per frame) more hopeful than these paths, so frames were
+  chosen long before the stations had learned better. Not kept; it wants
+  loss beliefs that start calibrated, as handoff chances now are.
 - **Receipts are messages.** An end-to-end receipt is routed like any
   message, and on a busy HF network can take hours to reach the origin.
 

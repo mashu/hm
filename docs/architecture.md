@@ -34,7 +34,7 @@ on simulated channels (see [simulation](simulation.md)).
 | `hm-wire` | base-40 callsigns, the frame header, ACK, OFFER, OPEN, CLOSE, beacons, SYNC messages, object ids |
 | `hm-ident` | Ed25519 identities, signed envelopes, callsign binding records |
 | `hm-bundle` | messages: build, seal, open, verify; end-to-end receipts; compressed bodies |
-| `hm-model` | what a station believes: link paths, custodians, the channel; population priors; Thompson draws; burst sizing (`no_std`) |
+| `hm-model` | what a station believes: link paths, custodians, the channel; population priors; its chances checked against outcomes; Thompson draws; burst sizing (`no_std`) |
 | `hm-route` | the contact graph (contacts, known links, potential links) and route choice by expected utility |
 | `hm-xfer` | the RaptorQ transfer engine: sessions, overs, ACKs, signed transfer receipts, broadcast with repair |
 | `hm-store` | the persistent store on `redb`: inbox, outbox, relay holdings, custody records, beliefs |
@@ -85,6 +85,7 @@ and carries out its commands over the internet, the modem and the web page.
 | Decision | Where | Page |
 | --- | --- | --- |
 | is this path within reach, open now, open later | `hm-model::link` | [models](models.md) |
+| how far to trust the chances the models give | `hm-model::calibration` | [models](models.md#checking-the-chances) |
 | send now, wait, or go through a relay; which bearer | `hm-route::routing` | [routing](routing.md) |
 | how many symbols in the next over; stop a silent transfer | `hm-model::erasure`, `hm-xfer` | [transfer](transfer.md) |
 | how long the origin waits for the end-to-end receipt | `hm-model::custodian` | [custody](custody.md) |

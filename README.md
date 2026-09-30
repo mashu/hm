@@ -22,7 +22,9 @@ the time. hm-net treats airtime as the resource that matters:
 - **Beliefs, not snapshots.** Each station learns, by Bayes' rule, whether
   each path is within reach, when in the day it opens, how many frames it
   loses, and how well each custodian delivers, from beacons heard and
-  missed, acknowledgements, and receipts that came back or did not.
+  missed, acknowledgements, and receipts that came back or did not; and it
+  checks the chances it gives against how its handoffs ended, correcting
+  them where its models err.
 - **Decisions by expected utility.** Send now, wait for an opening, or go
   through a relay, over whichever bearer: the route whose chance times the
   value of arriving then, less its expected airtime, is best, and holding the
@@ -34,7 +36,7 @@ the time. hm-net treats airtime as the resource that matters:
   share of the channel however many stations share it.
 
 In simulation, five real stations on a week of fading, diurnal HF deliver
-240 of 240 messages at 6 % channel occupancy, half within 1.3 hours of the
+240 of 240 messages at 6 % channel occupancy, half within 1.4 hours of the
 earliest possible, each transmitter keyed about 1 % of the time and never
 for much more than 20 s at once; see [results](docs/results.md).
 

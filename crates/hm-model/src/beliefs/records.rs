@@ -1,11 +1,12 @@
-//! Beliefs saved as records, one per link and custodian, and restored at
-//! start.
+//! Beliefs saved as records, one per link and custodian and one per
+//! calibration, and restored at start.
 
 use alloc::vec::Vec;
 
 use hm_wire::Callsign;
 
 use super::{Beliefs, Subject};
+use crate::calibration::{Calibration, Record};
 use crate::custodian::CustodianModel;
 use crate::link::LinkModel;
 use crate::{Bearer, LinkKey};
@@ -14,6 +15,7 @@ use crate::{Bearer, LinkKey};
 const RECORD_VERSION: u8 = 1;
 const LINK_RECORD: u8 = 1;
 const CUSTODIAN_RECORD: u8 = 2;
+const CALIBRATION_RECORD: u8 = 3;
 
 /// A record that could not be restored.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +36,9 @@ impl Beliefs {
             let value = match subject {
                 Subject::Link(key) => self.links.get(&key).map(encode_value),
                 Subject::Custodian(station) => self.custodians.get(&station).map(encode_value),
+                Subject::Calibration(bearer, seen) => Some(encode_value(
+                    self.calibration[bearer.index()][usize::from(seen)].record(),
+                )),
             };
             if let Some(value) = value {
                 out.push((record_key(subject), Some(value)));
@@ -74,6 +79,11 @@ impl Beliefs {
                 self.custodians.insert(station, model);
                 self.refit_custodian_prior(at);
             }
+            Subject::Calibration(bearer, seen) => {
+                let record: Record =
+                    minicbor::decode(body).map_err(|_| RestoreError("calibration record"))?;
+                self.calibration[bearer.index()][usize::from(seen)] = Calibration::from_record(record);
+            }
         }
         Ok(())
     }
@@ -99,6 +109,9 @@ fn record_key(subject: Subject) -> Vec<u8> {
             out.extend_from_slice(&station.to_bytes());
             out
         }
+        Subject::Calibration(bearer, seen) => {
+            alloc::vec![CALIBRATION_RECORD, bearer.index() as u8, u8::from(seen)]
+        }
     }
 }
 
@@ -114,6 +127,10 @@ fn parse_key(key: &[u8]) -> Result<Subject, RestoreError> {
             bearer: Bearer::from_index(rest[12]).ok_or(RestoreError("bearer"))?,
         })),
         [CUSTODIAN_RECORD, rest @ ..] if rest.len() == 6 => Ok(Subject::Custodian(call(rest)?)),
+        [CALIBRATION_RECORD, bearer, seen @ (0 | 1)] => Ok(Subject::Calibration(
+            Bearer::from_index(*bearer).ok_or(RestoreError("bearer"))?,
+            *seen == 1,
+        )),
         _ => Err(RestoreError("record key")),
     }
 }
