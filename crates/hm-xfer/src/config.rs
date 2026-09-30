@@ -105,9 +105,11 @@ impl Config {
     /// `Loss::Fading`), 64 bytes did better than 128 or 200 on one path at
     /// 20 dB and 0.5 Hz Doppler spread; over a week of five stations on
     /// paths down to 13 dB and 1 Hz, 32 bytes (2 s frames) lost a third less
-    /// airtime to fades than 64 (3 s), and are the default. (Choosing the
-    /// size per path from its loss belief would do better on both.) Overs of up to 60 s did better
-    /// than 20 s: fewer key-ups and ACK round trips for the same symbols.
+    /// airtime to fades than 64 (3 s), and are the default. Choosing the
+    /// size per transfer from the path's loss belief cost more airtime than
+    /// it saved in the crowded simulated networks (`docs/results.md`). Overs
+    /// of up to 60 s did better than 20 s: fewer key-ups and ACK round trips
+    /// for the same symbols.
     pub fn for_link(me: Callsign, bitrate_bps: u32, txdelay: Millis) -> Config {
         let mut cfg = Config::vhf_1200(me);
         cfg.bitrate_bps = bitrate_bps.max(1);

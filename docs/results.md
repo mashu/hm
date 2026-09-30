@@ -193,8 +193,17 @@ kept.
   belongs on an ARQ modem (VARA HF, ARDOP), which hm-net supports as a
   bearer ([modems](operating/modems.md)).
 - **One symbol size for every path.** 32-byte symbols suit fading paths and
-  are slower on good ones (see below); the size should follow each path's
-  loss belief ([transfer](transfer.md#frame-and-symbol-sizes)).
+  are slower on good ones (see below). Choosing the size per transfer from
+  the path's loss belief ([transfer](transfer.md#frame-and-symbol-sizes))
+  helped the Baltic week a little (behind the oracle p90 12.2 h against
+  15.4 h, the same 6.2 % busy) and cost the crowded networks: the sparse
+  twenty delivered 412 of 480 over three seeds against 402 at 57.1 % busy
+  against 54.5 %, the dense twenty 160 against 158 at 88.4 % against
+  77.6 %, and the sparse five and ten each lost one message. Longer frames
+  meet more fades and more collisions, and a path's loss belief starts from
+  a prior (15 % per frame) more hopeful than these paths, so frames were
+  chosen long before the stations had learned better. Not kept; it wants
+  loss beliefs that start calibrated, as handoff chances now are.
 - **Receipts are messages.** An end-to-end receipt is routed like any
   message, and on a busy HF network can take hours to reach the origin.
 

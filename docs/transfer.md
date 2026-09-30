@@ -118,10 +118,14 @@ on one simulated path at 20 dB and 0.5 Hz, 64-byte symbols move 2 kB sooner
 13 dB and 1 Hz, 32-byte symbols lose a third less airtime to fades. If fades
 come as a Poisson process in time, a frame of duration `d` survives with
 `e^{−λd}`, and the symbol that minimises airtime per byte grows as the loss
-falls (about 140 bytes at 10 % frame loss, 70 at 30 %, 40 at 60 %); choosing
-it per path from the loss belief is the next step. Overs on slow links may
-last up to 60 seconds: fewer key-ups and ACK round trips for the same
-symbols.
+falls (about 140 bytes at 10 % frame loss, 70 at 30 %, 40 at 60 %).
+Choosing it per transfer from the path's loss belief was tried (the belief
+kept per 2-second frame, overs of other lengths counted by their airtime,
+and the size with the least expected airtime per byte chosen, turnaround
+included: 200 bytes at 5 % loss, 128 at 15 %, 96 at 30 %, 48 at 60 %). It
+cost more airtime than it saved ([results](results.md#what-is-still-wrong)),
+so symbols stay at 32 bytes on 300 bd. Overs on slow links may last up to
+60 seconds: fewer key-ups and ACK round trips for the same symbols.
 
 ## Bulletins
 
