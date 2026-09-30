@@ -9,6 +9,7 @@ use hm_wire::{wrap_routed, Callsign, ObjectId, FLAG_INTERNET, FLAG_MAILBOX, FLAG
 use hm_xfer::PeerBelief;
 
 use super::custody::enqueue_custody_fail;
+use super::decisions::{Choice, Decision};
 use super::handoff::InFlight;
 use super::{Command, Node};
 use crate::{log, rf_policy, short, RadioCmd};
@@ -336,7 +337,7 @@ impl Node {
         };
         let policy = RoutingPolicy {
             attempt_cost: self.settings.costs.attempt(),
-            airtime_price: self.settings.costs.airtime(self.channel_busy),
+            airtime_price: self.settings.costs.airtime(self.channel.busy),
             ..RoutingPolicy::default()
         };
         // The origin plans with one draw from the beliefs: links and
@@ -364,6 +365,14 @@ impl Node {
         let plan = match planned {
             Ok(plan) => plan,
             Err(error) => {
+                self.decisions.record(
+                    r.id,
+                    Decision {
+                        at: now,
+                        to: route_destination,
+                        choice: Choice::Hold(error),
+                    },
+                );
                 // Nothing known leads there yet: look again after a while,
                 // or when the destination is heard.
                 let again = now + REPLAN_SECS;
@@ -382,6 +391,7 @@ impl Node {
             .iter()
             .map(|route| route.success_probability)
             .fold(0.0_f64, f64::max);
+        let mut first = None;
         for route in plan.active {
             // What getting past the first hop is worth: the rest of the
             // route's chance, and the value of arriving when it would.
@@ -398,7 +408,18 @@ impl Node {
                 worth,
                 wait_cost,
             };
-            self.send_on(now, r, route, hop, out);
+            let choice = self.send_on(now, r, route, hop, out);
+            first = first.or(choice);
+        }
+        if let Some(choice) = first {
+            self.decisions.record(
+                r.id,
+                Decision {
+                    at: now,
+                    to: route_destination,
+                    choice,
+                },
+            );
         }
     }
 
@@ -447,11 +468,17 @@ impl Node {
     /// Hand `r` to the first hop of `route` if it leaves now; if it leaves
     /// later, hold `r` until then, or until the first hop is heard. A plan
     /// for later is a forecast: it is made again at least every
-    /// [`REPLAN_SECS`] with what has been learned meanwhile.
-    fn send_on(&mut self, now: u64, r: &Record, route: Route, hop: Handoff<'_>, out: &mut Vec<Command>) {
-        let Some(first) = route.hops.first() else {
-            return;
-        };
+    /// [`REPLAN_SECS`] with what has been learned meanwhile. Returns what was
+    /// done, if anything was.
+    fn send_on(
+        &mut self,
+        now: u64,
+        r: &Record,
+        route: Route,
+        hop: Handoff<'_>,
+        out: &mut Vec<Command>,
+    ) -> Option<Choice> {
+        let first = route.hops.first()?;
         let (bearer, peer) = (first.contact.bearer, first.contact.to);
         if first.on_hearing {
             // Waits to hear the next hop: woken when it is, planned again
@@ -465,7 +492,7 @@ impl Node {
                     f64::from(first.probability_permillion) / 10_000.0,
                 ));
             }
-            return;
+            return Some(Choice::Hear(route));
         }
         if first.depart > now {
             let again = first.depart.min(now + REPLAN_SECS);
@@ -479,7 +506,7 @@ impl Node {
                     route.first_hop_probability * 100.0
                 ));
             }
-            return;
+            return Some(Choice::Wait(route));
         }
         let available = match bearer {
             Bearer::Radio => self.radio_up,
@@ -487,7 +514,7 @@ impl Node {
             Bearer::Modem => self.modem_up(),
         };
         if !available || self.in_flight.contains_key(&(r.id, peer)) {
-            return;
+            return None;
         }
         let Handoff {
             visited,
@@ -500,11 +527,11 @@ impl Node {
         } = hop;
         let held = route.contacts();
         if self.graph.reserve_many(&held, routed_len).is_err() {
-            return;
+            return None;
         }
         if !self.store.set_next_hop(r.id, peer).unwrap_or(false) {
             self.graph.release_many(&held, routed_len);
-            return;
+            return None;
         }
         let wire_object = if r.direction == Direction::Relay {
             let mut path = visited.to_vec();
@@ -515,7 +542,7 @@ impl Node {
                     self.graph.release_many(&held, routed_len);
                     let _ = self.store.clear_next_hop(r.id, peer);
                     log(format!("cannot route {}: {error}", short(&r.id)));
-                    return;
+                    return None;
                 }
             }
         } else {
@@ -535,6 +562,7 @@ impl Node {
             bearer,
         };
         let forecast = self.beliefs.forecast(link, now);
+        let choice = Choice::Send(route.clone());
         self.in_flight.insert(
             (r.id, peer),
             InFlight {
@@ -552,7 +580,7 @@ impl Node {
             Bearer::Radio => {
                 self.radio_ids
                     .insert((hm_xfer::object_id(&wire_object), peer), r.id);
-                let price = self.settings.costs.airtime(self.channel_busy)[Bearer::Radio];
+                let price = self.settings.costs.airtime(self.channel.busy)[Bearer::Radio];
                 out.push(Command::Radio(RadioCmd::Send {
                     object: wire_object,
                     to: peer,
@@ -576,5 +604,6 @@ impl Node {
                 object: wire_object,
             }),
         }
+        Some(choice)
     }
 }

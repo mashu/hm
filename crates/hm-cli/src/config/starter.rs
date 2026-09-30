@@ -27,6 +27,7 @@ key = {key:?}
 # framing = "ax25"          built-in modem: or "il2p" (far more robust in noise), "auto"
 # max_rounds = 12           radio handoff attempts before giving up
 # max_keyup_secs = 20       longest the transmitter stays keyed at a time (0: no limit)
+# duty_cycle_percent = 50   long-run share of the time on the air (100: no limit)
 [radio]
 beacon_minutes = 10         # 0 turns the beacon off
 

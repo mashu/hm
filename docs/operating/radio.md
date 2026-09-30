@@ -90,8 +90,9 @@ Data modes keep a transmitter at full output for as long as it is keyed, and
 long key-ups heat the final amplifier. The node keys up for at most
 `max_keyup_secs` at a time (20 by default; 0 for no limit): no burst of a
 transfer is longer, the airtime a burst may use at once is no more (above it
-the node keeps to half the time on the air), and beacons and control frames
-wait for its own frames to go out rather than run on after them. In a
+the node keeps to `duty_cycle_percent` of the time on the air, 50 by default:
+set what your transceiver's data-mode rating allows), and beacons and control
+frames wait for its own frames to go out rather than run on after them. In a
 simulated week of five HF stations at 300 bd, half the key-ups are under
 5 s (mostly beacons) and each station's transmitter is on about 1 % of the
 time ([results](../results.md)). Run data modes at reduced power as your

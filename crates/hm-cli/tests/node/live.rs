@@ -79,7 +79,7 @@ fn trusted_stations_change_while_the_node_runs() {
             "custody_suspect_secs": 7200,
             "receipt_retry_attempts": 9,
             "relay": { "enabled": true, "mailbox": true, "max_hops": 4 },
-            "radio": { "max_rounds": 5 },
+            "radio": { "max_rounds": 5, "duty_cycle_percent": 25 },
         })),
         Some(TOKEN),
     );
@@ -98,6 +98,7 @@ fn trusted_stations_change_while_the_node_runs() {
             now["live"]["relay"]["mailbox"].as_bool(),
             now["live"]["relay"]["max_hops"].as_u64(),
             now["live"]["radio"]["max_rounds"].as_u64(),
+            now["live"]["radio"]["duty_cycle_percent"].as_u64(),
         ),
         (
             Some(0.5),
@@ -108,7 +109,8 @@ fn trusted_stations_change_while_the_node_runs() {
             Some(true),
             Some(true),
             Some(4),
-            Some(5)
+            Some(5),
+            Some(25)
         )
     );
     let c = Config::load(&trust_file).unwrap();
@@ -122,8 +124,9 @@ fn trusted_stations_change_while_the_node_runs() {
             c.relay.mailbox,
             c.relay.max_hops,
             c.radio.max_rounds,
+            c.radio.duty_cycle_percent,
         ),
-        (3600, 7200, 9, true, true, 4, 5)
+        (3600, 7200, 9, true, true, 4, 5, 25)
     );
     assert_eq!(c.station.locator.as_deref(), Some("KO02md"));
     let (status, body) = http(

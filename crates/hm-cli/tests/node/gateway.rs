@@ -186,6 +186,36 @@ fn radio_first_and_the_internet_when_radio_fails() {
     assert_eq!(texts, vec!["two", "one"]);
     let est = get(a.http_addr, "/api/status")["estimates"].clone();
     eprintln!("estimates after the band died: {est}");
+    // What the node knows, asked of it: the peer, the paths to it, and the
+    // latest decision about each message, the last one sent by internet.
+    let insight = get(a.http_addr, "/api/insight");
+    assert_eq!(insight["me"], "SA0KAM");
+    let known = |call: &str| {
+        insight["stations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["call"] == call)
+    };
+    assert!(known("SO5KM-1"), "{insight}");
+    let paths: Vec<&str> = insight["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l["mine"] == true)
+        .map(|l| l["bearer"].as_str().unwrap())
+        .collect();
+    assert!(
+        paths.contains(&"radio") && paths.contains(&"internet"),
+        "{paths:?}"
+    );
+    let decisions = insight["decisions"].as_array().unwrap();
+    assert!(
+        decisions
+            .iter()
+            .any(|d| d["verdict"] == "send" && d["route"]["hops"][0]["bearer"] == "internet"),
+        "{decisions:?}"
+    );
     a.stop().unwrap();
     b.stop().unwrap();
 }

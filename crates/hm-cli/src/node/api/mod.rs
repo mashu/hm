@@ -1,13 +1,15 @@
-//! JSON API and the built-in web page.
+//! JSON API and the built-in web interface.
 //!
 //! Every `/api` request needs `Authorization: Bearer <token>`; the token is
-//! created on first start next to the store. The page at `/` holds no data and
-//! is public; it asks for the token and keeps it in the browser.
+//! created on first start next to the store. The web interface ([`web`])
+//! holds no data and is public; it asks for the token and keeps it in the
+//! browser.
 //!
 //! | Method | Path | |
 //! | --- | --- | --- |
-//! | GET | `/` | web page |
+//! | GET | `/`, `/app.css`, `/js/…` | the web interface |
 //! | GET | `/api/status` | callsign, key, bearers and their estimated success per station |
+//! | GET | `/api/insight` | what the node knows: stations, beliefs about paths and custodians, channel, calibration, evidence, routing decisions |
 //! | GET | `/api/messages?direction=in\|out\|all&peer=CALL&kind=chat\|mail\|bulletin&group=NAME&limit=n` | newest first |
 //! | GET | `/api/messages/{id}` | decoded metadata plus the exact raw signed object as hex |
 //! | GET | `/api/events` | server-sent events naming what changed: `message`, `status`, `settings` |
@@ -19,10 +21,12 @@
 //! | DELETE | `/api/trust/{station}` | forget a station's key |
 //! | GET, PATCH | `/api/settings` | settings now, and changing those that may change |
 
+mod insight;
 mod messages;
 mod settings;
 mod status;
 mod trust;
+mod web;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -30,14 +34,16 @@ use std::sync::{Arc, Mutex};
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use hm_store::Store;
 
+use super::coordinator::Query;
 use super::live::LiveConfig;
 use super::{NodeConfig, Notify, Status};
 
+use insight::insight;
 use messages::{delete_conversation, delete_message, events, mark_read, message, messages, send};
 use settings::{change_settings, get_settings};
 use status::status;
@@ -50,6 +56,8 @@ pub struct AppState {
     pub status: Arc<Mutex<Status>>,
     pub live: Arc<LiveConfig>,
     pub notify: Notify,
+    /// Questions for the node, which the coordinator owns.
+    pub node: tokio::sync::mpsc::Sender<Query>,
     /// Unix times of local bulletin publishes in the last hour (rate limit).
     pub bulletin_publishes: Arc<Mutex<VecDeque<u64>>>,
 }
@@ -57,6 +65,7 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/api/status", get(status))
+        .route("/api/insight", get(insight))
         .route("/api/messages", get(messages))
         .route("/api/messages/{id}", get(message).delete(delete_message))
         .route("/api/conversations/{peer}", delete(delete_conversation))
@@ -67,8 +76,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/settings", get(get_settings).patch(change_settings))
         .route("/api/trust/{station}", delete(remove_trust))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
-    Router::new()
-        .route("/", get(index))
+    web::routes()
         .merge(api)
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
@@ -101,11 +109,7 @@ async fn security_headers(req: Request, next: Next) -> Response {
     headers.insert(
         HeaderName::from_static("content-security-policy"),
         HeaderValue::from_static(
-            "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; \
-             form-action 'self'; connect-src 'self' https://tiles.openfreemap.org; \
-             worker-src blob:; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; \
-             style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; \
-             img-src 'self' data: blob: https://cdn.jsdelivr.net https://tiles.openfreemap.org",
+            "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'",
         ),
     );
     headers.insert(
@@ -145,16 +149,4 @@ fn bad(msg: impl Into<String>) -> ApiError {
 
 fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-}
-
-const INDEX: &str = include_str!("../index.html");
-
-async fn index() -> impl IntoResponse {
-    (
-        [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        Html(INDEX),
-    )
 }

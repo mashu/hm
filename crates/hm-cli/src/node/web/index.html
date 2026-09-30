@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>hm station</title>
+<link rel="stylesheet" href="/app.css">
+<script type="module" src="/js/main.js"></script>
+</head>
+<body>
+<header class="bar">
+  <div class="who">
+    <h1 id="call">…</h1>
+    <div class="chips" aria-live="polite">
+      <span class="chip plain" id="chip-grid" hidden></span>
+      <span class="chip" id="chip-radio">Packet radio</span>
+      <span class="chip" id="chip-net" hidden></span>
+      <span class="chip" id="chip-modem" hidden></span>
+      <span class="chip" id="chip-live">Connecting…</span>
+    </div>
+  </div>
+  <form id="token-form" hidden>
+    <label for="token">Access token <span class="muted">(printed by <code>hm node</code> at start-up, kept in <code>station.token</code>)</span></label>
+    <input id="token" type="password" autocomplete="off" spellcheck="false">
+    <button class="btn" type="submit">Use token</button>
+  </form>
+  <nav class="tabs" aria-label="Views">
+    <a href="#chat" data-view="chat">Chat<span class="count" id="badge-chat" hidden></span></a>
+    <a href="#mail" data-view="mail">Mail<span class="count" id="badge-mail" hidden></span></a>
+    <a href="#bulletins" data-view="bulletins">Bulletins<span class="count" id="badge-bulletins" hidden></span></a>
+    <a href="#network" data-view="network">Network</a>
+    <a href="#beliefs" data-view="beliefs">Beliefs<span class="count" id="badge-beliefs" hidden title="Messages under way"></span></a>
+    <a href="#settings" data-view="settings">Settings</a>
+  </nav>
+</header>
+<main id="view"></main>
+<dialog id="message-detail">
+  <div class="dialog-head">
+    <h2>Message</h2>
+    <form method="dialog"><button class="btn quiet small" value="close">Close</button></form>
+  </div>
+  <div class="detail-body"></div>
+</dialog>
+<noscript><p class="empty">The station's page needs JavaScript.</p></noscript>
+</body>
+</html>

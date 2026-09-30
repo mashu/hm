@@ -65,6 +65,9 @@ pub struct RadioSettings {
     /// Longest the transmitter stays keyed at a time, in seconds; 0 for no
     /// limit. Longer transfers go out in several key-ups.
     pub max_keyup_secs: u64,
+    /// Long-run share of the time the transmitter may be keyed, in percent
+    /// (100: no limit): what the transceiver's data-mode rating allows.
+    pub duty_cycle_percent: u8,
 }
 
 impl Default for RadioSettings {
@@ -84,6 +87,7 @@ impl Default for RadioSettings {
             max_rounds: 12,
             beacon_minutes: 10,
             max_keyup_secs: 20,
+            duty_cycle_percent: 50,
         }
     }
 }
@@ -97,6 +101,7 @@ impl RadioSettings {
             guard_ms: self.guard_ms,
             max_rounds: self.max_rounds.max(1).min(u32::from(u8::MAX)) as u8,
             max_keyup_ms: self.max_keyup_secs.saturating_mul(1_000),
+            duty_cycle_permille: u32::from(self.duty_cycle_percent) * 10,
         }
     }
 
@@ -132,6 +137,9 @@ impl RadioSettings {
         }
         if self.max_rounds == 0 {
             return Err("radio.max_rounds must be positive".into());
+        }
+        if !(1..=100).contains(&self.duty_cycle_percent) {
+            return Err("radio.duty_cycle_percent is 1 to 100".into());
         }
         Ok(())
     }

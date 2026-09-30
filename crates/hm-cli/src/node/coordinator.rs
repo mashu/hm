@@ -6,16 +6,21 @@
 //! links up and the modem's state, changed settings) and carries out what it
 //! asks for: radio commands, internet and modem transfers, SYNC to internet
 //! peers. It also reloads the settings file, restarts the internet endpoint
-//! when the settings need one, and publishes the node's status.
+//! when the settings need one, publishes the node's status, and answers
+//! questions about the node ([`Query`]) from the API: the node has one owner,
+//! and is asked, never shared.
 
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use hm_ident::Identity;
 use hm_net::{Net, NetError};
+use hm_node::insight::Insight;
 use hm_node::{Command, Input, ModemSpec, Node, NodeIdentity, NodeStatus, RadioCmd, RadioEvt, Transfer};
 use hm_store::Store;
 use hm_wire::{Callsign, ObjectId};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 
 use super::arq;
 use super::internet::ensure_internet;
@@ -25,21 +30,46 @@ use crate::station::unix_now;
 
 type Done = (ObjectId, Callsign, Transfer);
 
+/// A question for the node, answered on the channel it brings.
+pub(crate) enum Query {
+    /// What the node knows now.
+    Insight(oneshot::Sender<Insight>),
+}
+
+/// Questions waiting for the coordinator, at most: an API client that asks
+/// faster than they are answered waits for room.
+pub(crate) const QUERIES: usize = 16;
+
+/// What the coordinator talks to: the radio thread, internet peers' SYNC,
+/// the API's questions, and the signal to stop.
+pub(crate) struct Channels {
+    pub radio_cmd: mpsc::Sender<RadioCmd>,
+    pub radio_evt: UnboundedReceiver<RadioEvt>,
+    pub net_control_tx: UnboundedSender<(Callsign, Vec<u8>)>,
+    pub net_control: UnboundedReceiver<(Callsign, Vec<u8>)>,
+    pub queries: tokio::sync::mpsc::Receiver<Query>,
+    pub shutdown: tokio::sync::watch::Receiver<bool>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn coordinator(
     cfg: &NodeConfig,
     store: &Arc<Store>,
     net: &mut Option<Arc<Net>>,
     modem: Option<Arc<arq::Arq>>,
-    radio_cmd: mpsc::Sender<RadioCmd>,
-    mut radio_evt: tokio::sync::mpsc::UnboundedReceiver<RadioEvt>,
-    net_control_tx: tokio::sync::mpsc::UnboundedSender<(Callsign, Vec<u8>)>,
-    mut net_control: tokio::sync::mpsc::UnboundedReceiver<(Callsign, Vec<u8>)>,
+    channels: Channels,
     status: &Mutex<Status>,
     live: &Arc<LiveConfig>,
     notify: &Notify,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    let Channels {
+        radio_cmd,
+        mut radio_evt,
+        net_control_tx,
+        mut net_control,
+        mut queries,
+        mut shutdown,
+    } = channels;
     let seed = cfg
         .seed
         .unwrap_or_else(|| getrandom::u64().unwrap_or_else(|_| unix_now()));
@@ -83,6 +113,11 @@ pub(crate) async fn coordinator(
             Some((id, peer, result)) = modem_rx.recv() => {
                 node.handle(unix_now(), Input::ModemDone { id, peer, result }, &mut out);
             }
+            Some(query) = queries.recv() => match query {
+                Query::Insight(answer) => {
+                    let _ = answer.send(node.insight(unix_now()));
+                }
+            },
             _ = tick.tick() => {
                 match live.reload_if_changed() {
                     Some(Ok(())) => log("settings file changed; applied"),

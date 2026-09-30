@@ -1,7 +1,7 @@
 //! What passes between the node and its bearers: commands to the radio and
 //! what the radio reports, and how an internet or modem transfer ended.
 
-use hm_model::Erasure;
+use hm_model::{ChannelModel, Erasure};
 use hm_wire::{Callsign, Dest, ObjectId};
 use hm_xfer::{Failure, PeerBelief, Receipt};
 
@@ -72,10 +72,32 @@ pub enum RadioEvt {
     Heard(Vec<heard::Station>),
     /// We now beacon every this many seconds (more stations, longer).
     BeaconInterval(u64),
-    /// Others keep the channel busy this share of the time.
-    Channel {
-        busy: f64,
-    },
+    /// What the radio now believes of the channel.
+    Channel(ChannelSeen),
+}
+
+/// The shared radio channel, as the radio believes it to be.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ChannelSeen {
+    /// Share of the time others keep it busy.
+    pub busy: f64,
+    /// Other stations active on it, expected.
+    pub contenders: f64,
+}
+
+impl ChannelSeen {
+    /// What the radio believes of a channel it has not listened to yet.
+    pub fn unheard() -> ChannelSeen {
+        ChannelSeen::of(&ChannelModel::default(), 0)
+    }
+
+    /// What `model` says at `now`.
+    pub fn of(model: &ChannelModel, now: u64) -> ChannelSeen {
+        ChannelSeen {
+            busy: model.busy(now),
+            contenders: model.contenders(now),
+        }
+    }
 }
 
 /// How a transfer over the internet or through an ARQ modem ended.

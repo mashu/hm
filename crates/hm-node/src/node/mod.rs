@@ -15,11 +15,15 @@
 //! - [`radio`]: radio events, beacons heard and not heard;
 //! - [`links`]: internet links, contact adverts, holdings SYNC;
 //! - [`custody`]: custody taken or reclaimed, receipts, custody failures;
-//! - [`deliver`]: routing and handing off what is due.
+//! - [`deliver`]: routing and handing off what is due;
+//! - [`decisions`]: the latest routing decision about each message;
+//! - [`insight`]: what the node knows, as a snapshot for people.
 
 mod custody;
+mod decisions;
 mod deliver;
 mod handoff;
+mod insight;
 mod links;
 mod radio;
 
@@ -35,8 +39,9 @@ use hm_wire::{Callsign, ObjectId};
 
 use crate::adverts::advertised_flags;
 use crate::control::{live_window_secs, ControlPlane};
-use crate::{heard, log, Notify, RadioCmd, RadioEvt, Settings, Transfer};
+use crate::{heard, log, ChannelSeen, Notify, RadioCmd, RadioEvt, Settings, Transfer};
 
+use decisions::Decisions;
 use handoff::InFlight;
 use links::LiveClaim;
 
@@ -177,9 +182,10 @@ pub struct Node {
     /// neighbours reported was counted as missed.
     unheard_until: BTreeMap<Callsign, u64>,
     heard: Vec<heard::Station>,
-    /// Share of the time others keep the radio channel busy: what radio
-    /// airtime costs rises with it.
-    channel_busy: f64,
+    /// The radio channel: what radio airtime costs rises with how busy
+    /// others keep it.
+    channel: ChannelSeen,
+    decisions: Decisions,
 }
 
 impl Node {
@@ -234,7 +240,8 @@ impl Node {
             beacons_seen: BTreeMap::new(),
             unheard_until: BTreeMap::new(),
             heard: Vec::new(),
-            channel_busy: hm_model::QUIET_BUSY,
+            channel: ChannelSeen::unheard(),
+            decisions: Decisions::default(),
         };
         node.advertise_schedules(now);
         node

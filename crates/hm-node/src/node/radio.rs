@@ -42,7 +42,7 @@ impl Node {
                 self.graph.set_live_contact_secs(self.live_window);
                 self.beacon_interval = secs;
             }
-            RadioEvt::Channel { busy } => self.channel_busy = busy,
+            RadioEvt::Channel(seen) => self.channel = seen,
             RadioEvt::Down(why) => self.radio_down(now, why),
             RadioEvt::Received {
                 from,

@@ -22,12 +22,13 @@ use std::sync::Arc;
 use hm_bundle::Precedence;
 use hm_core::{DetRng, Millis};
 use hm_ident::Identity;
+use hm_node::insight::Insight;
 use hm_node::{
     Costs, LinkTiming, RelaySettings, Settings, Station, StationCmd, StationEvent, StationSpec, Trust,
 };
 use hm_sim::{Csma, Loss, RadioParams, Sim, Stats};
 use hm_store::{Direction, RetryPolicy, Store};
-use hm_wire::{Callsign, ObjectId, FEATURE_COMPACT};
+use hm_wire::{Callsign, Locator, ObjectId, FEATURE_COMPACT};
 
 /// 2026-01-01 00:00:00 UTC: simulation time 0 is midnight UTC.
 pub const EPOCH: u64 = 1_767_225_600;
@@ -58,6 +59,8 @@ pub fn diurnal(day: f64, night: f64) -> [f64; 24] {
 #[derive(Clone, Debug)]
 pub struct Scenario {
     pub stations: Vec<String>,
+    /// Each station's grid locator, which its beacons carry (none: empty).
+    pub locators: Vec<&'static str>,
     pub paths: Vec<Path>,
     pub days: u64,
     /// Messages are queued over the first this-many hours; the rest of the
@@ -104,6 +107,8 @@ pub struct Outcome {
     /// Each station's belief, at the end, that a handoff to each station it
     /// knows of would complete now.
     pub estimates: Vec<(Callsign, Vec<Estimate>)>,
+    /// What each station knows, at the end.
+    pub insights: Vec<(Callsign, Insight)>,
     /// With [`Scenario::log`]: unicast frames by kind and by what became of
     /// them at the station they were for (`Delivered`, `Corrupted`,
     /// `LostCollision`, ..., or `Unheard`: no path to it then): (frames,
@@ -200,7 +205,7 @@ fn identity(seed: u64, i: usize) -> Identity {
 }
 
 /// The daemon's settings, for a station that relays.
-fn settings(trust: Trust) -> Settings {
+fn settings(trust: Trust, locator: Option<Locator>) -> Settings {
     Settings {
         trust,
         costs: Costs::default(),
@@ -222,7 +227,7 @@ fn settings(trust: Trust) -> Settings {
         },
         beacon_secs: 600,
         radio_bitrate: 300,
-        locator: None,
+        locator,
     }
 }
 
@@ -328,9 +333,16 @@ pub fn run(scenario: &Scenario) -> Outcome {
                     guard_ms: 1_500,
                     max_rounds: 12,
                     max_keyup_ms: 20_000,
+                    duty_cycle_permille: 500,
                 },
                 link_features: FEATURE_COMPACT,
-                settings: settings(trust.clone()),
+                settings: settings(
+                    trust.clone(),
+                    scenario
+                        .locators
+                        .get(i)
+                        .map(|l| Locator::parse(l).expect("valid locator")),
+                ),
                 schedules: Vec::new(),
                 epoch: EPOCH,
                 seed: scenario.seed.wrapping_mul(1_000).wrapping_add(i as u64),
@@ -511,6 +523,10 @@ pub fn run(scenario: &Scenario) -> Outcome {
             .machines()
             .map(|station| (station.me(), station.node().status(EPOCH + end / 1_000).estimates))
             .collect(),
+        insights: sim
+            .machines()
+            .map(|station| (station.me(), station.node().insight(EPOCH + end / 1_000)))
+            .collect(),
     }
 }
 
@@ -539,6 +555,7 @@ pub fn baltic(days: u64, seed: u64) -> Scenario {
         stations: ["SM0AAA", "OH2BBB", "LA1CCC", "OZ1DDD", "ES1EEE"]
             .map(String::from)
             .to_vec(),
+        locators: vec!["JO99ah", "KP20le", "JO59jv", "JO65gq", "KO29jk"],
         paths: vec![
             near(0, 1, 18.0),
             near(0, 2, 16.0),
@@ -570,6 +587,7 @@ pub fn line(hours: u64, seed: u64) -> Scenario {
     };
     Scenario {
         stations: ["SM0AAA", "OH2BBB", "LA1CCC"].map(String::from).to_vec(),
+        locators: vec!["JO99ah", "KP20le", "JO59jv"],
         paths: vec![open(0, 1), open(1, 2)],
         days: hours.div_ceil(24),
         traffic_hours: hours / 2,
@@ -615,6 +633,7 @@ pub fn scattered(n: usize, side_km: f64, per_station_per_day: usize, days: u64, 
     }
     Scenario {
         stations: (0..n).map(|i| format!("SM{}A{}", i % 10, letters(i))).collect(),
+        locators: Vec::new(),
         paths,
         days,
         traffic_hours: 24 * days.saturating_sub(2).max(1),
