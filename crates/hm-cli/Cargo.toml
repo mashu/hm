@@ -8,7 +8,7 @@ license.workspace = true
 
 [[bin]]
 name = "hm"
-path = "src/main.rs"
+path = "src/bin/hm/main.rs"
 
 [dependencies]
 hm-core = { path = "../hm-core" }
