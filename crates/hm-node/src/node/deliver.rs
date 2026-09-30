@@ -153,8 +153,9 @@ impl Node {
     /// start from its bearer's population. An internet link may be to the
     /// destination under its base callsign (then it is up, seen); an ARQ
     /// modem can call any station; the destination may be in radio range,
-    /// unheard; a relaying internet gateway may reach it through the internet
-    /// core (a default route).
+    /// unheard, of this station or, when nothing known leads there, of a
+    /// relay it reaches; a relaying internet gateway may reach it through the
+    /// internet core (a default route).
     fn add_potential_contacts(
         &mut self,
         now: u64,
@@ -216,6 +217,36 @@ impl Node {
                 rate,
                 (u64::from(rate) * RADIO_CONTACT_SECS / 8).max(routed_len),
             ));
+        }
+        // Nothing known leads to the destination: beacons tell of two hops
+        // around, and it is further. A relay this station reaches may hear
+        // it, unheard here, as this station itself may; the chance is the
+        // beliefs' about that path, which start from the population's. The
+        // relay, a hop nearer, plans with what it knows.
+        if rf_ok && self.graph.links_from(destination).next().is_none() {
+            let relays: Vec<(Callsign, u32)> = self
+                .graph
+                .links_from(me)
+                .filter(|&(to, bearer, _)| {
+                    bearer.on_air()
+                        && to != destination
+                        && !visited.contains(&to)
+                        && self
+                            .graph
+                            .flags(to, now)
+                            .is_some_and(|flags| flags & FLAG_RELAY != 0)
+                })
+                .map(|(to, _, known)| (to, known.rate_bps))
+                .collect();
+            for (relay, rate) in relays {
+                let _ = self.graph.add_potential(potential(
+                    relay,
+                    destination,
+                    Bearer::Radio,
+                    rate,
+                    (u64::from(rate) * RADIO_CONTACT_SECS / 8).max(routed_len),
+                ));
+            }
         }
         let gateways: Vec<Callsign> = self
             .graph

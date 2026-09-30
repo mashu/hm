@@ -218,7 +218,12 @@ impl Node {
 
     /// Ask `peer` for what it holds for us (and for relaying, if we relay).
     pub(super) fn send_filters(&mut self, peer: Callsign, bearer: Bearer, now: u64, out: &mut Vec<Command>) {
-        let relaying = self.settings.relay.enabled || self.settings.relay.mailbox;
+        // Over the internet a relay also collects what it could carry on;
+        // on the radio that would copy every holding to every relay in reach,
+        // against the routes: a relay that hears a station tries what waits
+        // for it anyway.
+        let relaying =
+            (self.settings.relay.enabled || self.settings.relay.mailbox) && bearer == Bearer::Internet;
         match self.control.filters(peer, &self.store, relaying, now) {
             Ok(filters) => {
                 for payload in filters {

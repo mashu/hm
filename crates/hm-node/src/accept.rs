@@ -172,13 +172,19 @@ pub fn accept(
         if hop_count >= max_hops || visited.contains(&me) {
             return Acceptance::Rejected("hop limit or routing loop".into());
         }
-        // A holding this node gave up on is taken on again when custody is
-        // offered anew: the sender has a reason to believe it is reachable
-        // now. One this node handed on and gets back from its custodian is
-        // taken back now, not when its receipt would have been overdue.
-        // Anything else already held is a duplicate.
+        // A holding this node gave up on, or handed on, is taken on again
+        // when custody is offered anew: the sender believes it undelivered,
+        // and has a reason to believe it reachable now. One this node handed
+        // on and gets back from its custodian is taken back now, not when its
+        // receipt would have been overdue. Anything else already held (one
+        // whose end-to-end receipt passed this way, too) is a duplicate.
         let revive = match store.record(m.id) {
-            Ok(Some(record)) if record.direction == Direction::Relay && record.state == State::Failed => true,
+            Ok(Some(record))
+                if record.direction == Direction::Relay
+                    && (record.state == State::Failed || record.handed_on()) =>
+            {
+                true
+            }
             Ok(Some(record)) if record.state == State::InTransit && record.custody_by == Some(via) => {
                 return match store.reclaim_custody(m.id, now, &format!("handed back by {via}")) {
                     Ok(_) => {

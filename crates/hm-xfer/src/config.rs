@@ -100,9 +100,10 @@ impl Config {
     /// quiet for longer on a slow link.
     ///
     /// On a simulated 300 bd path with Watterson-style fading (0.5 to 1 Hz
-    /// Doppler spread, `hm-sim`'s `Loss::Fading`), 64-byte symbols delivered
-    /// more, sooner and with less airtime than 128 or 200 bytes: a shorter
-    /// frame is less likely to meet a fade. Overs of up to 60 s did better
+    /// Doppler spread, `hm-sim`'s `Loss::Fading`), 32-byte symbols (2 s
+    /// frames) lost a third less airtime to fades than 64 bytes (3 s), and
+    /// 64 bytes less than 128 or 200: a shorter frame is less likely to meet
+    /// a fade, down to where the header outweighs the symbol. Overs of up to 60 s did better
     /// than 20 s: fewer key-ups and ACK round trips for the same symbols.
     pub fn for_link(me: Callsign, bitrate_bps: u32, txdelay: Millis) -> Config {
         let mut cfg = Config::vhf_1200(me);
@@ -121,7 +122,7 @@ impl Config {
     }
 
     /// HF packet at 300 bd through a KISS TNC (Direwolf's `MODEM 300` or a
-    /// hardware HF TNC): 64-byte symbols, about 2.9 s per DATA frame, and
+    /// hardware HF TNC): 32-byte symbols, about 2 s per DATA frame, and
     /// overs of up to 60 s.
     pub fn hf_300(me: Callsign) -> Config {
         Config::for_link(me, 300, Millis(300))

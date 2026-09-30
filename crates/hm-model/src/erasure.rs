@@ -29,6 +29,9 @@ use minicbor::{Decode, Encode};
 
 use crate::evidence::Prior;
 
+/// The most frames an [`Erasure::airtime_factor`] counts to get one through.
+pub const MAX_AIRTIME_FACTOR: f64 = 20.0;
+
 /// Belief about frame loss on a link: Beta(`lost`, `got`) over the loss rate,
 /// with fade dispersion `dispersion`.
 #[derive(Copy, Clone, Debug, PartialEq, Encode, Decode)]
@@ -55,6 +58,18 @@ impl Erasure {
     /// Expected share of frames lost.
     pub fn mean(&self) -> f64 {
         self.lost / (self.lost + self.got)
+    }
+
+    /// Expected airtime to get a frame through, in frames: `E[1/(1 − ε)]`,
+    /// which for `ε ~ Beta(lost, got)` is `(lost + got − 1) / (got − 1)`.
+    /// More than `1/(1 − mean)`: a link little is known about may be worse
+    /// than it looks. Capped at [`MAX_AIRTIME_FACTOR`] (and there when fewer
+    /// than one frame in [`MAX_AIRTIME_FACTOR`] is believed to arrive).
+    pub fn airtime_factor(&self) -> f64 {
+        if self.got <= 1.0 {
+            return MAX_AIRTIME_FACTOR;
+        }
+        ((self.lost + self.got - 1.0) / (self.got - 1.0)).min(MAX_AIRTIME_FACTOR)
     }
 
     /// An over of `sent` frames of which `got` arrived.

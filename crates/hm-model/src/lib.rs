@@ -45,10 +45,8 @@ mod evidence;
 mod link;
 pub mod math;
 
-pub use beliefs::{
-    Beliefs, Estimate, LinkEstimate, Mean, RestoreError, Thompson, FORGET_AFTER, MISS_HORIZON,
-};
-pub use channel::{access_wait, clear_slot, ChannelModel, ChannelObservation, CHANNEL_HALF_LIFE, QUIET_BUSY};
+pub use beliefs::{Beliefs, Estimate, Mean, RestoreError, Thompson, FORGET_AFTER, MISS_HORIZON};
+pub use channel::{access_wait, ChannelModel, ChannelObservation, CHANNEL_HALF_LIFE, QUIET_BUSY};
 pub use custodian::{CustodianModel, CustodianObservation, CustodianPrior, HandedOver, CUSTODIAN_HALF_LIFE};
 pub use erasure::{broadcast_burst, burst_size, plan_overs, Erasure, OverCost};
 pub use evidence::{Beta, Evidence, Prior};
@@ -77,10 +75,6 @@ impl Bearer {
             Bearer::Internet => "internet",
             Bearer::Modem => "modem",
         }
-    }
-
-    pub fn from_name(name: &str) -> Option<Bearer> {
-        Bearer::ALL.into_iter().find(|b| b.name() == name)
     }
 
     /// Whether the bearer goes over the air (and follows propagation).

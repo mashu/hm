@@ -57,7 +57,7 @@ pub fn diurnal(day: f64, night: f64) -> [f64; 24] {
 
 #[derive(Clone, Debug)]
 pub struct Scenario {
-    pub stations: Vec<&'static str>,
+    pub stations: Vec<String>,
     pub paths: Vec<Path>,
     pub days: u64,
     /// Messages are queued over the first this-many hours; the rest of the
@@ -104,6 +104,11 @@ pub struct Outcome {
     /// Each station's belief, at the end, that a handoff to each station it
     /// knows of would complete now.
     pub estimates: Vec<(Callsign, Vec<Estimate>)>,
+    /// With [`Scenario::log`]: unicast frames by kind and by what became of
+    /// them at the station they were for (`Delivered`, `Corrupted`,
+    /// `LostCollision`, ..., or `Unheard`: no path to it then): (frames,
+    /// milliseconds).
+    pub fates: BTreeMap<(String, String), (u64, u64)>,
 }
 
 impl Outcome {
@@ -371,28 +376,62 @@ pub fn run(scenario: &Scenario) -> Outcome {
     let end = scenario.days * DAY_MS;
     sim.run_until(Millis(end));
     let mut airtime = BTreeMap::new();
+    // Unicast frames by id: their kind, addressee and airtime, until their
+    // fate at the addressee is known.
+    let mut unicast: BTreeMap<u64, (String, usize, u64)> = BTreeMap::new();
+    let mut fates: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
     for entry in sim.log() {
-        if let hm_sim::LogEntry::Tx {
-            from,
-            start,
-            end,
-            data,
-            ..
-        } = entry
-        {
-            let (kind, to) = match hm_wire::FrameHeader::decode(data) {
-                Ok((h, _)) => (format!("{:?}", h.ftype), format!("{:?}", h.dst)),
-                Err(_) => ("?".into(), "?".into()),
-            };
-            if std::env::var("HM_TRACE").is_ok_and(|t| t == format!("{}>{}", scenario.stations[*from], to)) {
-                eprintln!("{} {kind} {} bytes", start.0 / 1000, data.len());
+        match entry {
+            hm_sim::LogEntry::Tx {
+                id,
+                from,
+                start,
+                end,
+                data,
+                ..
+            } => {
+                let (kind, to, dst) = match hm_wire::FrameHeader::decode(data) {
+                    Ok((h, _)) => (
+                        format!("{:?}", h.ftype),
+                        format!("{:?}", h.dst),
+                        match h.dst {
+                            hm_wire::Dest::Station(c) => calls.iter().position(|call| *call == c),
+                            hm_wire::Dest::Broadcast => None,
+                        },
+                    ),
+                    Err(_) => ("?".into(), "?".into(), None),
+                };
+                if std::env::var("HM_TRACE")
+                    .is_ok_and(|t| t == format!("{}>{}", scenario.stations[*from], to))
+                {
+                    eprintln!("{} {kind} {} bytes", start.0 / 1000, data.len());
+                }
+                let ms = end.0 - start.0;
+                if let Some(dst) = dst {
+                    // Unheard unless the addressee's reception says otherwise.
+                    unicast.insert(*id, (kind.clone(), dst, ms));
+                }
+                let e = airtime
+                    .entry((kind, scenario.stations[*from].clone(), to))
+                    .or_insert((0, 0));
+                e.0 += 1;
+                e.1 += ms;
             }
-            let e = airtime
-                .entry((kind, scenario.stations[*from].to_string(), to))
-                .or_insert((0, 0));
-            e.0 += 1;
-            e.1 += end.0 - start.0;
+            hm_sim::LogEntry::Rx { tx, to, outcome, .. } => {
+                if unicast.get(tx).is_some_and(|(_, dst, _)| dst == to) {
+                    let (kind, _, ms) = unicast.remove(tx).expect("just found");
+                    let e = fates.entry((kind, format!("{outcome:?}"))).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 += ms;
+                }
+            }
+            _ => {}
         }
+    }
+    for (kind, _, ms) in unicast.into_values() {
+        let e = fates.entry((kind, "Unheard".into())).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += ms;
     }
 
     let mut queued: BTreeMap<(u64, usize), ObjectId> = BTreeMap::new();
@@ -436,6 +475,7 @@ pub fn run(scenario: &Scenario) -> Outcome {
         trace: report.trace,
         wall_secs: wall.elapsed().as_secs_f64(),
         airtime,
+        fates,
         estimates: sim
             .machines()
             .map(|station| (station.me(), station.node().status(EPOCH + end / 1_000).estimates))
@@ -465,7 +505,9 @@ pub fn baltic(days: u64, seed: u64) -> Scenario {
     };
     Scenario {
         // 0 Stockholm, 1 Helsinki, 2 Oslo, 3 Copenhagen, 4 Tallinn.
-        stations: vec!["SM0AAA", "OH2BBB", "LA1CCC", "OZ1DDD", "ES1EEE"],
+        stations: ["SM0AAA", "OH2BBB", "LA1CCC", "OZ1DDD", "ES1EEE"]
+            .map(String::from)
+            .to_vec(),
         paths: vec![
             near(0, 1, 18.0),
             near(0, 2, 16.0),
@@ -496,7 +538,7 @@ pub fn line(hours: u64, seed: u64) -> Scenario {
         doppler_hz: 0.1,
     };
     Scenario {
-        stations: vec!["SM0AAA", "OH2BBB", "LA1CCC"],
+        stations: ["SM0AAA", "OH2BBB", "LA1CCC"].map(String::from).to_vec(),
         paths: vec![open(0, 1), open(1, 2)],
         days: hours.div_ceil(24),
         traffic_hours: hours / 2,
@@ -505,4 +547,83 @@ pub fn line(hours: u64, seed: u64) -> Scenario {
         tick: Millis(10_000),
         log: false,
     }
+}
+
+/// `n` stations scattered at random over a square `side_km` wide, sharing
+/// one HF channel. Whether two hear each other, and when, follows their
+/// distance: near ones by day (NVIS), middling ones some of the time, far
+/// ones mostly at night, and none beyond about 1,000 km. Each station sends
+/// `per_station_per_day` messages a day to stations picked at random, so the
+/// load each station offers stays the same as the network grows.
+pub fn scattered(n: usize, side_km: f64, per_station_per_day: usize, days: u64, seed: u64) -> Scenario {
+    let mut rng = DetRng::from_seed(seed.wrapping_mul(7_919));
+    let unit = |rng: &mut DetRng| rng.below(1_000_000) as f64 / 1_000_000.0;
+    let places: Vec<(f64, f64)> = (0..n)
+        .map(|_| (unit(&mut rng) * side_km, unit(&mut rng) * side_km))
+        .collect();
+    let mut paths = Vec::new();
+    for a in 0..n {
+        for b in a + 1..n {
+            let ((xa, ya), (xb, yb)) = (places[a], places[b]);
+            let km = (xa - xb).hypot(ya - yb);
+            let (open, doppler_hz, snr_db) = match km {
+                d if d < 250.0 => (diurnal(0.85, 0.15), 0.5, 18.0),
+                d if d < 600.0 => (diurnal(0.5, 0.4), 0.7, 15.0),
+                d if d < 1_000.0 => (diurnal(0.2, 0.6), 1.0, 12.0),
+                _ => continue,
+            };
+            paths.push(Path {
+                a,
+                b,
+                open,
+                persistence: 0.7,
+                snr_db: snr_db + unit(&mut rng) * 6.0 - 3.0,
+                doppler_hz,
+            });
+        }
+    }
+    Scenario {
+        stations: (0..n).map(|i| format!("SM{}A{}", i % 10, letters(i))).collect(),
+        paths,
+        days,
+        traffic_hours: 24 * days.saturating_sub(2).max(1),
+        messages_per_day: per_station_per_day * n,
+        seed,
+        tick: Millis(10_000),
+        log: false,
+    }
+}
+
+/// Two letters for station `i`: AA, AB, ...
+fn letters(i: usize) -> String {
+    let letter = |k: usize| char::from(b'A' + (k % 26) as u8);
+    [letter(i / 26 / 10), letter(i / 10)].iter().collect()
+}
+
+/// Each station's share of time the channel is busy where it is: its own
+/// frames and those of the stations it has a path to (the others reuse the
+/// channel without contending). Needs [`Scenario::log`].
+pub fn local_busy(scenario: &Scenario, outcome: &Outcome) -> Vec<f64> {
+    let mut sent_ms = BTreeMap::new();
+    for ((_, from, _), (_, ms)) in &outcome.airtime {
+        *sent_ms.entry(from.as_str()).or_insert(0) += ms;
+    }
+    let seconds = outcome.seconds.max(1) as f64;
+    (0..scenario.stations.len())
+        .map(|me| {
+            let near = scenario
+                .paths
+                .iter()
+                .filter_map(|p| match (p.a == me, p.b == me) {
+                    (true, _) => Some(p.b),
+                    (_, true) => Some(p.a),
+                    _ => None,
+                });
+            let ms: u64 = std::iter::once(me)
+                .chain(near)
+                .map(|i| sent_ms.get(scenario.stations[i].as_str()).copied().unwrap_or(0))
+                .sum();
+            ms as f64 / 1_000.0 / seconds
+        })
+        .collect()
 }

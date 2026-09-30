@@ -111,14 +111,6 @@ pub struct RoutingReport {
     pub calibration_brier: Option<f64>,
 }
 
-impl RoutingReport {
-    pub fn airtime_per_delivered_byte(&self, delivered_payload_bytes: u64) -> Option<f64> {
-        (delivered_payload_bytes > 0).then(|| {
-            (self.payload_airtime_ms + self.control_airtime_ms) as f64 / delivered_payload_bytes as f64
-        })
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct RoutingComparison {
     pub reports: Vec<RoutingReport>,

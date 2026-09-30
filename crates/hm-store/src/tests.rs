@@ -1,3 +1,5 @@
+use minicbor::Encode;
+
 use super::*;
 
 fn call(s: &str) -> Callsign {
@@ -191,7 +193,7 @@ fn relay_custody_moves_without_claiming_final_delivery() {
                 grace_secs: 3600,
                 suspect_secs: 86_400,
                 eta: 0,
-                answered: true,
+                awaits_receipt: true,
             }
         )
         .unwrap());
@@ -231,7 +233,7 @@ fn active_custody_is_l_one_normally_and_l_two_only_when_urgent() {
                 grace_secs: 3600,
                 suspect_secs: 86_400,
                 eta: 0,
-                answered: true,
+                awaits_receipt: true,
             }
         )
         .unwrap());
@@ -246,7 +248,7 @@ fn active_custody_is_l_one_normally_and_l_two_only_when_urgent() {
                 grace_secs: 3600,
                 suspect_secs: 86_400,
                 eta: 0,
-                answered: true,
+                awaits_receipt: true,
             }
         )
         .unwrap());
@@ -273,7 +275,7 @@ fn unverified_receipt_does_not_transfer_custody() {
                 grace_secs: 3600,
                 suspect_secs: 86_400,
                 eta: 0,
-                answered: true,
+                awaits_receipt: true,
             }
         )
         .unwrap());
@@ -302,7 +304,7 @@ fn cancellation_ignores_late_receipt_and_e2e_requires_destination() {
                 grace_secs: 3600,
                 suspect_secs: 86_400,
                 eta: 0,
-                answered: true,
+                awaits_receipt: true,
             }
         )
         .unwrap());
@@ -344,7 +346,7 @@ fn deletion_cancels_first_and_never_removes_active_custody() {
                 grace_secs: 3600,
                 suspect_secs: 86_400,
                 eta: 0,
-                answered: true,
+                awaits_receipt: true,
             }
         )
         .unwrap());
@@ -371,7 +373,7 @@ fn suspect_reclaims_then_delivered_unconfirmed_when_expired() {
                 grace_secs: 50,
                 suspect_secs: 30,
                 eta: 0,
-                answered: true,
+                awaits_receipt: true,
             }
         )
         .unwrap());
@@ -410,7 +412,7 @@ fn suspect_reclaims_then_delivered_unconfirmed_when_expired() {
                 grace_secs: 10,
                 suspect_secs: 5,
                 eta: 0,
-                answered: true,
+                awaits_receipt: true,
             }
         )
         .unwrap());
@@ -444,7 +446,7 @@ fn custody_fail_notice_reclaims() {
                 grace_secs: 3600,
                 suspect_secs: 86_400,
                 eta: 0,
-                answered: true,
+                awaits_receipt: true,
             }
         )
         .unwrap());
@@ -457,6 +459,57 @@ fn custody_fail_notice_reclaims() {
         s.apply_custody_fail(id(1), relay, 60, "stale").unwrap(),
         ReclaimOutcome::Ignored
     );
+}
+
+/// A relay's part ends when it hands a holding on; the custodian after it
+/// that cannot deliver hands it back with a custody-fail notice, and the
+/// relay takes it on again.
+#[test]
+fn a_relay_takes_back_what_its_custodian_could_not_deliver() {
+    let db = TempDb::new("relay-fail-back");
+    let s = Store::open(&db.0).unwrap();
+    let (origin, next, destination) = (call("M0AAA"), call("M0BBB"), call("M0CCC"));
+    let metadata = RelayMetadata {
+        custody_from: origin,
+        destination,
+        precedence: 1,
+        hop_count: 1,
+        visited: &[origin],
+        max_hops: 8,
+        expires_at: 100_000,
+        wire_seq: None,
+    };
+    assert!(s.enqueue_relay(id(1), b"bundle", metadata, 100).unwrap());
+    assert!(s.set_next_hop(id(1), next).unwrap());
+    assert!(s
+        .custody_transferred(
+            id(1),
+            CustodyHandoff {
+                next_hop: next,
+                receipt_verified: true,
+                by: "radio",
+                now: 110,
+                grace_secs: 3600,
+                suspect_secs: 86_400,
+                eta: 200,
+                awaits_receipt: false,
+            }
+        )
+        .unwrap());
+    let record = s.record(id(1)).unwrap().unwrap();
+    assert!(record.handed_on());
+    assert!(s.suspect_due(1_000_000).unwrap().is_empty());
+    // Someone else's notice about it changes nothing.
+    assert_eq!(
+        s.apply_custody_fail(id(1), destination, 500, "not mine").unwrap(),
+        ReclaimOutcome::Ignored
+    );
+    assert_eq!(
+        s.apply_custody_fail(id(1), next, 600, "no route").unwrap(),
+        ReclaimOutcome::Requeued
+    );
+    assert_eq!(s.record(id(1)).unwrap().unwrap().state, State::Queued);
+    assert_eq!(s.due(600).unwrap()[0].id, id(1));
 }
 
 #[test]
@@ -573,7 +626,7 @@ fn end_to_end_receipts_report_custody_outcomes_once() {
                 grace_secs: 60,
                 suspect_secs: 3_600,
                 eta: 500,
-                answered: true,
+                awaits_receipt: true,
             },
         )
         .unwrap());
@@ -611,7 +664,7 @@ fn a_receipt_after_a_reclaim_is_credited_to_the_first_custodian() {
                     grace_secs: 60,
                     suspect_secs: 600,
                     eta,
-                    answered: true,
+                    awaits_receipt: true,
                 },
             )
             .unwrap());
@@ -744,7 +797,7 @@ fn a_duplicate_is_answered_again_once_the_first_receipt_is_gone() {
                 grace_secs: 60,
                 suspect_secs: 600,
                 eta: 300,
-                answered: false,
+                awaits_receipt: false,
             },
         )
         .unwrap());
@@ -774,7 +827,7 @@ fn an_unanswered_handoff_ends_with_custody() {
                 grace_secs: 60,
                 suspect_secs: 600,
                 eta: 100,
-                answered: false,
+                awaits_receipt: false,
             },
         )
         .unwrap());
@@ -929,7 +982,7 @@ fn a_receipt_passing_through_closes_the_relay_holding_it_answers() {
                 grace_secs: 50,
                 suspect_secs: 30,
                 eta: 0,
-                answered: true,
+                awaits_receipt: true,
             }
         )
         .unwrap());

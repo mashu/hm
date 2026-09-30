@@ -120,12 +120,6 @@ pub fn access_wait(busy: f64, busy_period: f64) -> f64 {
     busy / (1.0 - busy) * busy_period
 }
 
-/// Chance, under the contender belief, that a slot is clear of everyone else
-/// who transmits with probability `p` per slot: `E[(1-p)^N]` for Poisson `N`.
-pub fn clear_slot(contenders: f64, p: f64) -> f64 {
-    libm::exp(-contenders * p)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +172,5 @@ mod tests {
         let busy = c.occupancy(0).mean();
         assert!(busy > 0.45 && busy < 0.5, "{busy}");
         assert!(c.access_wait(0, 10.0) > 8.0);
-        assert!((clear_slot(0.0, 0.5) - 1.0).abs() < 1e-12);
     }
 }

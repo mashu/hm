@@ -17,20 +17,20 @@ const HOLDING_CHECK_SECS: u64 = 30;
 const MIN_SUSPECT_SECS: u64 = 60;
 
 impl Node {
-    /// `flight`'s custodian took custody with a verified receipt. Wait for
-    /// the end-to-end receipt as long as waiting pays: resending sooner risks
-    /// a duplicate, later a lost message found out too late. The final
-    /// destination itself cannot lose what it holds: from there, resending
-    /// never pays. A receipt or a custody-fail notice, which nothing answers,
-    /// is the custodian's from here.
+    /// `flight`'s custodian took custody with a verified receipt. The origin
+    /// waits for the end-to-end receipt as long as waiting pays: resending
+    /// sooner risks a duplicate, later a lost message found out too late.
+    /// The final destination itself cannot lose what it holds: from there,
+    /// resending never pays. A relay's part ends here, as it does for a
+    /// receipt or a custody-fail notice, which nothing answers: every
+    /// custodian on a route watching for the end-to-end receipt, which goes
+    /// back to the origin and not through them, could only resend what was
+    /// delivered.
     pub(super) fn custody_taken(&mut self, now: u64, id: ObjectId, flight: &InFlight) {
         let peer = flight.peer;
-        let at_destination = self
-            .store
-            .record(id)
-            .ok()
-            .flatten()
-            .is_some_and(|r| r.final_destination() == peer);
+        let record = self.store.record(id).ok().flatten();
+        let at_destination = record.as_ref().is_some_and(|r| r.final_destination() == peer);
+        let origin = record.as_ref().is_some_and(|r| r.direction == Direction::Out);
         let eta = flight.route.arrival.max(now);
         let handed = HandedOver {
             downstream: flight.downstream,
@@ -57,7 +57,7 @@ impl Node {
                 grace_secs: self.settings.custody_grace_secs,
                 suspect_secs,
                 eta,
-                answered: answered_end_to_end(&self.store, id),
+                awaits_receipt: origin && answered_end_to_end(&self.store, id),
             },
         ) {
             Ok(true) => {

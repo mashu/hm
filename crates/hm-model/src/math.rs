@@ -28,12 +28,6 @@ pub fn ln_beta(a: f64, b: f64) -> f64 {
     lgamma(a) + lgamma(b) - lgamma(a + b)
 }
 
-/// `ln C(n, k)`.
-pub fn ln_choose(n: u32, k: u32) -> f64 {
-    let (n, k) = (f64::from(n), f64::from(k));
-    lgamma(n + 1.0) - lgamma(k + 1.0) - lgamma(n - k + 1.0)
-}
-
 /// The regularized incomplete beta function `I_x(a, b)`.
 pub fn incomplete_beta(a: f64, b: f64, x: f64) -> f64 {
     if x <= 0.0 {

@@ -1,6 +1,8 @@
 use super::toy::{Beacon, BeaconCmd, BeaconEvent};
 use super::*;
+use crate::radio::stuffed_bits;
 use hm_wire::{Ack, Callsign, Dest};
+use hm_wire::{FrameHeader, FrameType};
 
 type BeaconSim = Sim<Beacon, BeaconCmd, BeaconEvent>;
 

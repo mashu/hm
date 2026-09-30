@@ -1454,12 +1454,12 @@ fn slow_links_get_smaller_symbols_and_shorter_overs() {
     let vhf = Config::for_link(me, 1200, Millis(300));
     assert_eq!(vhf, Config::vhf_1200(me));
     let hf = Config::hf_300(me);
-    // 64-byte symbols: a DATA frame of 105 bytes on air, 2.9 s at 300 bd.
-    assert_eq!(hf.symbol_size, 64);
+    // 32-byte symbols: a DATA frame of 73 bytes on air, 2 s at 300 bd.
+    assert_eq!(hf.symbol_size, 32);
     assert_eq!(hf.max_over, SLOW_MAX_OVER);
-    let frame = hf.air(1, hf.data_frame_len(64));
-    assert!(frame >= Millis(2_800) && frame <= Millis(3_000), "{frame:?}");
-    assert_eq!(Config::for_link(me, 600, Millis(300)).symbol_size, 184);
+    let frame = hf.air(1, hf.data_frame_len(32));
+    assert!(frame >= Millis(1_900) && frame <= Millis(2_100), "{frame:?}");
+    assert_eq!(Config::for_link(me, 600, Millis(300)).symbol_size, 104);
     assert_eq!(Config::for_link(me, 9600, Millis(100)).symbol_size, 200);
     for bitrate in [50, 75, 110, 300, 600, 1200, 2400, 9600] {
         let c = Config::for_link(me, bitrate, Millis(300));

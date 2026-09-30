@@ -93,7 +93,7 @@ const MIN_WINDOW: u32 = 2;
 /// Most transfers under way at once, to different peers.
 const MAX_ACTIVE: usize = 4;
 /// Below 1200 bit/s, DATA frames are sized to take about this long on air.
-pub const SLOW_FRAME_SECS: u64 = 3;
+pub const SLOW_FRAME_SECS: u64 = 2;
 /// Smallest symbol a slow link is given.
 const MIN_SLOW_SYMBOL: usize = 32;
 /// Longest over on a link below 1200 bit/s.

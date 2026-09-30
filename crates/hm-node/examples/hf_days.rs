@@ -43,6 +43,22 @@ fn main() {
             .map(|(kind, (frames, ms))| format!("{kind} {frames} frames {:.1}%", *ms as f64 / 10.0 / seconds))
             .collect();
         println!("        airtime: {}", shares.join(", "));
+        let fates: Vec<String> = outcome
+            .fates
+            .iter()
+            .filter(|((kind, _), _)| kind == "Data")
+            .map(|((_, fate), (_, ms))| format!("{fate} {:.1}%", *ms as f64 / 10.0 / seconds))
+            .collect();
+        println!("        data frames: {}", fates.join(", "));
+        for m in outcome.sent.iter().filter(|m| m.delivered_after.is_none()) {
+            println!(
+                "        not delivered: {} {} -> {} queued at {} h",
+                hex_prefix(&m.id),
+                scenario.stations[m.from],
+                scenario.stations[m.to],
+                m.at / 3600
+            );
+        }
         if std::env::var("HM_ESTIMATES").is_ok() {
             for (me, estimates) in &outcome.estimates {
                 let shown: Vec<String> = estimates
@@ -69,4 +85,8 @@ fn main() {
         q(0.9),
         100.0 * busy / seeds as f64
     );
+}
+
+fn hex_prefix(id: &hm_wire::ObjectId) -> String {
+    id.0[..6].iter().map(|b| format!("{b:02x}")).collect()
 }

@@ -42,16 +42,6 @@ enum Subject {
     Custodian(Callsign),
 }
 
-/// A summary of one link, for status displays.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub struct LinkEstimate {
-    pub p_open: f64,
-    pub handoff: f64,
-    pub loss: f64,
-    pub persistence_secs: f64,
-    pub last_open: Option<u64>,
-}
-
 /// A record that could not be restored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestoreError(pub &'static str);
@@ -225,26 +215,6 @@ impl Beliefs {
             bounds,
             now,
         )
-    }
-
-    /// Summary of every link believed in, for status.
-    pub fn link_estimates(&self, now: u64) -> Vec<(LinkKey, LinkEstimate)> {
-        self.links
-            .iter()
-            .map(|(key, link)| {
-                let prior = self.link_prior(key.bearer);
-                (
-                    *key,
-                    LinkEstimate {
-                        p_open: link.p_open(now, now),
-                        handoff: link.handoff(prior, now).mean(),
-                        loss: link.erasure(prior, now).mean(),
-                        persistence_secs: link.persistence_secs(),
-                        last_open: link.last_open(),
-                    },
-                )
-            })
-            .collect()
     }
 
     /// Forget models that have not been observed for [`FORGET_AFTER`].
@@ -465,6 +435,9 @@ pub trait Estimate {
     fn accepts(&mut self, station: Callsign, t: u64) -> f64;
     /// Chance `station`, holding custody, does its part.
     fn delivers(&mut self, station: Callsign) -> f64;
+    /// Expected airtime to get a frame through `link` while it is open, in
+    /// frames ([`Erasure::airtime_factor`]).
+    fn airtime_factor(&mut self, link: LinkKey) -> f64;
 }
 
 /// Weigh a stated probability against the station's own estimate `own`,
@@ -494,6 +467,10 @@ impl Estimate for Mean<'_> {
 
     fn delivers(&mut self, station: Callsign) -> f64 {
         self.beliefs.p_delivers(station, self.now)
+    }
+
+    fn airtime_factor(&mut self, link: LinkKey) -> f64 {
+        self.beliefs.erasure(link, self.now).airtime_factor()
     }
 }
 
@@ -551,6 +528,12 @@ impl Estimate for Thompson<'_> {
                 None => prior.delivers.beta().sample(rng),
             }
         })
+    }
+
+    /// The expectation, not a draw: what a link costs to use is not what is
+    /// explored.
+    fn airtime_factor(&mut self, link: LinkKey) -> f64 {
+        self.beliefs.erasure(link, self.now).airtime_factor()
     }
 }
 

@@ -63,7 +63,7 @@ use crate::{ContactGraph, ContactKey};
 /// An urgent message loses half its value every this many seconds.
 pub const URGENT_HALF_LIFE: u64 = 600;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct RouteHop {
     pub contact: ContactKey,
     pub depart: u64,
