@@ -66,12 +66,13 @@ the dense twenty from 94.3 % busy to 77.6 % and the sparse twenty from
 smaller networks, which had little to correct, stayed where they were. One
 seed of twenty stations varies a lot, so the sparse twenty was run on three:
 
-| Sparse twenty, seeds 1 / 2 / 3 | Delivered | Busy, mean | Latency p50 |
+| Sparse twenty, seeds 1 to 5 | Delivered | Busy, mean | Latency p50 |
 | --- | --- | --- | --- |
-| before | 127 / 134 / 141 (402) | 65.2 / 69.5 / 66.9 % | 19.6 / 11.7 / 12.6 h |
-| handoff chances checked | 119 / 141 / 142 (402) | 45.2 / 60.5 / 57.8 % | 12.9 / 9.2 / 12.3 h |
+| before | 127, 134, 141, 124, 124 (650 / 800) | 65.2, 69.5, 66.9, 67.5, 55.0 % (64.8) | 19.6, 11.7, 12.6, 11.9, 14.0 h |
+| handoff chances checked | 119, 141, 142, 136, 130 (668 / 800) | 45.2, 60.5, 57.8, 58.4, 48.9 % (54.2) | 12.9, 9.2, 12.3, 14.6, 13.1 h |
 
-The same messages delivered, sooner, with a fifth less of the channel.
+A few more messages delivered, mostly sooner, with a sixth less of the
+channel.
 Earlier in this round the ten-station networks went from 27.6 % busy
 (dense) and 46.3 % (sparse) to about 24 % and 30 %, and the sparse twenty
 from 104 delivered to 127: planning that scales (a four-day run of twenty
@@ -135,8 +136,10 @@ cut both; a logistic map per kind stretched the seen paths' chances to 99.9 %
 record; shrinking them toward each other lets the few dozen handoffs a day a
 station makes to paths never heard teach every band at once (without it,
 a band given 3.6 % came down only to 1.7 %, where 0.2 % came true). Over
-three seeds the kept version delivers what the model did before on a fifth
-less of the channel (above).
+five seeds the bins without the shrinking delivered 680 of 800 at 57.9 %
+busy, the kept version 668 at 54.2 %: per seed the two differ by −10 to
++20 messages either way, and the shrunk bins used less of the channel on
+four seeds of five.
 
 **Custodians' retries in a route's chance.** A route counts each hop past
 the first as one try, though each custodian tries again until the message
@@ -166,9 +169,15 @@ kept.
   toward the stations that claimed a way and then stalled at them. Knowing
   more was not what was missing, so it was not kept.
 - **A dense channel of twenty.** Twenty stations sharing one 300 bd channel
-  keep it busy 78 % of the time. Carrier sense persistence is fixed
-  (p = 0.25), where the number of stations contending is known and could
-  set it.
+  keep it busy 78 % of the time, a fifth of it in frames lost to collisions.
+  They are not the collisions carrier sense can prevent: with the
+  persistence of every station set to 1/16, 1/8, 1/4 (the default), 1/2 and
+  1, the dense twenty ran 85.2, 83.1, 77.6, 84.2 and 82.7 % busy with
+  21.9, 21.1, 18.4, 22.1 and 21.2 % of the time in collisions (seed 1), and
+  the sparse twenty much the same at 1/16 and 1/2. Most are between stations
+  that cannot hear each other at that hour (their path is closed) sending
+  to one that hears both. Setting persistence from the number of stations
+  contending, as planned, would not help.
 - **300 bd AFSK is a poor HF mode.** It has no forward error correction of
   its own and its symbols are short against multipath. The simulated
   numbers are for it because it can be simulated; on the air, HF traffic
