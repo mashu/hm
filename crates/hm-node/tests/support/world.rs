@@ -445,13 +445,13 @@ pub fn run(scenario: &Scenario) -> Outcome {
                 e.0 += 1;
                 e.1 += ms;
             }
-            hm_sim::LogEntry::Rx { tx, to, outcome, .. } => {
-                if unicast.get(tx).is_some_and(|(_, dst, _)| dst == to) {
-                    let (kind, _, ms) = unicast.remove(tx).expect("just found");
-                    let e = fates.entry((kind, format!("{outcome:?}"))).or_insert((0, 0));
-                    e.0 += 1;
-                    e.1 += ms;
-                }
+            hm_sim::LogEntry::Rx { tx, to, outcome, .. }
+                if unicast.get(tx).is_some_and(|(_, dst, _)| dst == to) =>
+            {
+                let (kind, _, ms) = unicast.remove(tx).expect("just found");
+                let e = fates.entry((kind, format!("{outcome:?}"))).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += ms;
             }
             _ => {}
         }
