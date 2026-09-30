@@ -68,6 +68,30 @@ moves exactly the parts it bears on:
 A refusal or a "busy" answer is evidence about the custodian, not the path:
 the path carried the question and the answer.
 
+### Is it open now?
+
+Two decisions need the state now rather than a forecast: whether a transfer
+under way should send another over, and whether to wait to hear the next hop
+before sending at all. The path model keeps that state; a transfer takes a
+copy of it (`hm_model::Openness`) and follows it as it goes:
+
+```text
+p(t + Δ) = π + (p(t) − π) · e^(−Δ/T)          nothing observed for Δ
+p' = 1                                         the far end heard
+p' = p (1 − a) / (p (1 − a) + 1 − p)           unanswered, where an open path answers with chance a
+```
+
+A transfer carries it from the moment it starts ([transfer](transfer.md)),
+so what the sender learns from each over counts at once, and hearing the
+peer makes the path certain to be open only at that moment.
+
+**When the next hop is heard.** A station transmits about once a beacon
+interval, at a moment unknown to us, and each transmission is heard if the
+path is open then and the frame gets through. `first_hearing` gives the
+chance the peer is heard within a window and the expected wait for it, from
+the forecast of the path being open over the window
+([routing](routing.md#or-when-the-next-hop-is-heard)).
+
 ## Custodians
 
 A station that takes custody:

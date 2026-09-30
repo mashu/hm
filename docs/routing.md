@@ -58,8 +58,10 @@ heard.
 ## When: forecast departures
 
 Besides the contacts the graph holds, every known link can be taken later:
-at departures every 15 minutes up to 36 hours ahead, each with the chance
-the beliefs forecast for that moment. A doubtful link now, or a likely one
+at departures every 15 minutes for the first three hours, while what the
+path is doing now still tells about it, then hourly up to 36 hours ahead
+(the daily pattern is two harmonics of the day, so an hour resolves it),
+each with the chance the beliefs forecast for that moment. A doubtful link now, or a likely one
 in the morning through a relay: the one of greater expected utility wins,
 and a route that departs later tells the station to wait. Only departures
 likelier than every earlier one on the same link are tried (the upper
@@ -94,11 +96,27 @@ minutes of hearing the peer three times in four.
 
 ## The search
 
-The planner is an A* search over partial routes (labels). Each label's bound
-`P·u(arrival) − C` can only fall as it is extended, so the first complete
-routes out of the queue are the best, and the search ends at the first label
+The planner is an A* search over partial routes (labels). A label at station
+`s` has reached it with chance `P`, at `arrival`, having cost `C`; its bound
+is
+
+```text
+P · e^(−togo(s)) · u(arrival) − C
+```
+
+where `togo(s)` is the least risk (`−ln` of the chance) any route from `s`
+to the destination can have: a shortest path back from the destination
+before the search starts, each link counted at its best chance on the
+forecast grid and each custodian at its chance of doing its part. No route
+from `s` is likelier, so the bound never understates what a label can still
+be worth, and it can only fall as the label is extended: the first complete
+routes out of the queue are the best. The search ends at the first label
 whose bound is not above zero: nothing through it, or through anything after
-it, is worth its cost.
+it, is worth its cost. A label far from the destination, or at a station
+that reaches it only over doubtful links, is known to be worth little before
+it is expanded, and a station from which nothing known leads on is never
+entered, so the search stays near the routes that matter however many
+stations the graph holds.
 
 - **Dominance.** A label is dropped when one already expanded at the same
   station, through the same first hop, arrived no later, with no more risk,
@@ -112,8 +130,8 @@ it, is worth its cost.
   are used.
 - **Cost.** Labels live in an arena, each pointing at the one it extends, so
   extending copies nothing. Each known link's chance at each departure on
-  the forecast grid is computed once per plan and shared by every label that
-  leaves over it.
+  the forecast grid (45 departures over 36 hours) is computed once per plan,
+  for the bound, and shared by every label that leaves over it.
 
 ## Failing over, and urgent copies
 

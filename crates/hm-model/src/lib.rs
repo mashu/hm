@@ -45,6 +45,7 @@ mod evidence;
 mod hearing;
 mod link;
 pub mod math;
+mod openness;
 
 pub use beliefs::{Beliefs, Estimate, Mean, RestoreError, Thompson, FORGET_AFTER, MISS_HORIZON};
 pub use channel::{access_wait, ChannelModel, ChannelObservation, CHANNEL_HALF_LIFE, QUIET_BUSY};
@@ -53,6 +54,7 @@ pub use erasure::{broadcast_burst, burst_size, plan_overs, Erasure, OverCost};
 pub use evidence::{Beta, Evidence, Prior};
 pub use hearing::{first_hearing, Hearing};
 pub use link::{LinkModel, LinkObservation, LinkPrior, SampledLink, ERASURE_HALF_LIFE, HANDOFF_HALF_LIFE};
+pub use openness::Openness;
 
 /// How a link carries bundles.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]

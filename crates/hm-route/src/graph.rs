@@ -259,6 +259,15 @@ impl ContactGraph {
             .map(|((to, bearer), link)| (*to, *bearer, link))
     }
 
+    /// Every known link: `(from, to, bearer, link)`.
+    pub fn links(&self) -> impl Iterator<Item = (Callsign, Callsign, Bearer, &KnownLink)> {
+        self.links.iter().flat_map(|(from, links)| {
+            links
+                .iter()
+                .map(move |((to, bearer), link)| (*from, *to, *bearer, link))
+        })
+    }
+
     pub fn contact(&self, key: ContactKey) -> Option<&Contact> {
         self.contacts.get(&key.from)?.get(&key)
     }

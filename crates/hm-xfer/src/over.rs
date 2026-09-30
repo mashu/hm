@@ -271,7 +271,7 @@ impl Xfer {
             let to = self.active[i].to;
             let halved = (self.window(to) / 2).max(MIN_WINDOW);
             self.window.insert(to, halved);
-            if !self.worth_another_over(i) {
+            if !self.worth_another_over(i, now) {
                 self.active[i].abandoned = true;
                 self.active[i].state = OutState::Ready { at: now };
                 continue;
@@ -297,7 +297,8 @@ impl Xfer {
     /// burst.
     pub(crate) fn opens_with_probe(&self, to: Callsign, need: u32, t: u16) -> bool {
         let belief = self.belief(to);
-        if belief.open >= 1.0 {
+        let open = belief.open.p;
+        if open >= 1.0 {
             return false;
         }
         let frame_air = self.cfg.air(1, self.cfg.data_frame_len(usize::from(t)));
@@ -306,28 +307,47 @@ impl Xfer {
         let probe = need.clamp(1, 2).min(burst);
         let saved = f64::from(burst - probe) * frame_air.0 as f64;
         let turnaround = (self.cfg.txdelay + self.ack_air()).0 as f64;
-        (1.0 - belief.open) * saved > belief.open * turnaround
+        (1.0 - open) * saved > open * turnaround
     }
 
     /// After an over that brought no answer: Bayes' rule on whether the link
-    /// is open, and whether the next over's chance of being answered is worth
-    /// its airtime. An over is answered, if the link is open, when at least
-    /// one of its frames arrives and so does the ACK, under the Beta-binomial
-    /// predictive of frame loss; a short probe of an open link is rarely
-    /// unanswered, so a few silent ones say the link is closed.
-    fn worth_another_over(&mut self, i: usize) -> bool {
+    /// is open ([`Openness`](hm_model::Openness)), and whether another over
+    /// is worth sending. An over is answered, if the link is open, when at
+    /// least one of its frames arrives and so does the ACK, under the
+    /// Beta-binomial predictive of frame loss; a short probe of an open link
+    /// is rarely unanswered, so a few silent ones say the link is closed.
+    ///
+    /// Another over must be worth its airtime `c` (both in units of what
+    /// completing the transfer is worth): `p·a ≥ c`, with `p` the chance the
+    /// link is open and `a` that the over is answered if it is. And it must
+    /// be worth sending now rather than stopping to send again once the peer
+    /// is next heard, when the link is known open. The over's airtime is
+    /// wasted if the link has closed; stopping costs, if it is still open,
+    /// the wait `w` (the share of the worth the delay loses) and reopening
+    /// the transfer `r` (an OPEN, a key-up, and the symbols the receiver
+    /// already has, which it forgets when kept waiting). So `c·(1 − p) ≤
+    /// p·(w + r)`. Mail, which loses little by waiting a beacon interval,
+    /// stops once the link is about as likely closed as open; urgent traffic,
+    /// which loses much, keeps trying; a transfer nearly done is not given up
+    /// lightly.
+    fn worth_another_over(&mut self, i: usize, now: Millis) -> bool {
         let belief = self.belief(self.active[i].to);
         let answered = |frames: u32| belief.erasure.p_at_least(frames, 1) * belief.erasure.p_at_least(1, 1);
-        let (open, sent, probe, symbol_size, opened) = {
-            let o = &self.active[i];
-            let sent = o.sent_last_round + u32::from(o.opened) + 1;
-            (o.open, sent, o.need.clamp(1, 2), o.t, o.opened)
-        };
-        let silent = 1.0 - answered(sent);
-        let open = open * silent / (open * silent + 1.0 - open);
+        let o = &self.active[i];
+        let sent = o.sent_last_round + u32::from(o.opened) + 1;
+        let (probe, symbol_size, opened) = (o.need.clamp(1, 2), o.t, o.opened);
+        let progress = o.k.saturating_sub(o.need);
+        let elapsed = now.saturating_sub(o.open_at).0 as f64 / 1_000.0;
+        let open = o.open.after(elapsed).unanswered(answered(sent));
         self.active[i].open = open;
-        let air = self.probe_air(symbol_size, probe, opened);
-        open * answered(probe + 1 + u32::from(opened)) >= belief.airtime_cost * air.0 as f64 / 1_000.0
+        self.active[i].open_at = now;
+        let per_ms = belief.airtime_cost / 1_000.0;
+        let cost = per_ms * self.probe_air(symbol_size, probe, opened).0 as f64;
+        let frame_air = self.cfg.air(1, self.cfg.data_frame_len(usize::from(symbol_size)));
+        let reopen = self.cfg.txdelay + self.open_air() + Millis(frame_air.0 * u64::from(progress));
+        let restart = per_ms * reopen.0 as f64;
+        let next = open.p * answered(probe + 1 + u32::from(opened));
+        next >= cost && cost * (1.0 - open.p) <= open.p * (belief.wait_cost + restart)
     }
 
     /// The link has put on air everything we gave it, the last frame ending at

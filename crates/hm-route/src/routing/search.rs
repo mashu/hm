@@ -5,8 +5,8 @@
 //! one copies nothing of the route so far, and the stations a route has
 //! passed are found by walking back (routes are at most 16 hops). The chance
 //! of a handoff on each known link is forecast once per plan on a grid of
-//! departures, the first time a label reaches the link's station, and shared
-//! by every label that leaves over it.
+//! departures ([`Forecasts`]), shared by the bound ([`RiskToGo`]) and by
+//! every label that leaves over the link.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BinaryHeap};
 use hm_model::{Estimate, LinkKey};
 use hm_wire::Callsign;
 
+use super::forecast::{transfer_secs, Forecasts, RiskToGo};
 use super::{Route, RouteError, RouteHop, RouteRequest, RoutingPolicy};
 use crate::{Bearer, ContactGraph, ContactKey};
 
@@ -186,56 +187,6 @@ struct Step {
     spend: f64,
 }
 
-/// The chance of a handoff (the link completes it, the next station accepts)
-/// on each known link at each departure on the grid `first + k·step`, worked
-/// out once per plan.
-struct Forecasts {
-    first: u64,
-    step: u64,
-    /// Departures on the grid before the horizon.
-    count: u64,
-    handed: BTreeMap<LinkKey, Vec<f64>>,
-}
-
-impl Forecasts {
-    fn new(request: &RouteRequest<'_>, policy: RoutingPolicy) -> Self {
-        let step = policy.forecast_step_secs.max(1);
-        let first = (request.now / step + 1) * step;
-        let horizon = request
-            .expires_at
-            .min(request.now.saturating_add(policy.forecast_horizon_secs));
-        let count = if policy.forecast_horizon_secs == 0 {
-            0
-        } else {
-            horizon.saturating_sub(first).div_ceil(step)
-        };
-        Forecasts {
-            first,
-            step,
-            count,
-            handed: BTreeMap::new(),
-        }
-    }
-
-    /// The end of the grid.
-    fn horizon(&self) -> u64 {
-        self.first + self.count * self.step
-    }
-
-    /// The grid for `link`, on which a handoff takes `transfer` seconds.
-    fn grid(&mut self, estimate: &mut dyn Estimate, link: LinkKey, transfer: u64) -> &[f64] {
-        let (first, step, count) = (self.first, self.step, self.count);
-        self.handed.entry(link).or_insert_with(|| {
-            (0..count)
-                .map(|k| {
-                    let depart = first + k * step;
-                    estimate.link(link, depart, None) * estimate.accepts(link.to, depart + transfer)
-                })
-                .collect()
-        })
-    }
-}
-
 /// Routes to the destination, best bound first. A* over labels, pruned by
 /// dominance: a label is not expanded when an expanded one at the same
 /// station, with the same first hop, dominates it. Keeping first hops apart
@@ -273,8 +224,12 @@ pub(super) fn find_candidates(
         }],
         request,
     };
-    let mut queue = BinaryHeap::from([Queued::of(&arena.labels[0], 0)]);
     let mut forecasts = Forecasts::new(request, policy);
+    let to_go = RiskToGo::new(graph, estimate, request, &mut forecasts);
+    if to_go.from(request.source).is_none() {
+        return Err(RouteError::NoRoute);
+    }
+    let mut queue = BinaryHeap::from([Queued::of(&arena.labels[0], 0)]);
     let mut routes = Vec::new();
     let mut expanded: BTreeMap<(Callsign, Callsign), Vec<Expanded>> = BTreeMap::new();
     let mut examined = 0_usize;
@@ -323,7 +278,7 @@ pub(super) fn find_candidates(
         contact_steps(graph, estimate, &arena, index, &mut steps);
         forecast_steps(graph, estimate, policy, &mut forecasts, &arena, index, &mut steps);
         for step in steps.drain(..) {
-            let Some(next) = extend(estimate, request, policy, &arena, index, step) else {
+            let Some(next) = extend(estimate, request, policy, &to_go, &arena, index, step) else {
                 continue;
             };
             let first = next.first.expect("an extended label has a first hop");
@@ -358,13 +313,6 @@ fn allowed(request: &RouteRequest<'_>, label: &Label, link: LinkKey, depart: u64
     let at_source = label.parent.is_none();
     !(at_source
         && (request.forbidden[link.bearer] || (depart <= request.now && request.closed_now.contains(&link))))
-}
-
-fn transfer_secs(bytes: u64, rate_bps: u32) -> u64 {
-    bytes
-        .saturating_mul(8)
-        .div_ceil(u64::from(rate_bps.max(1)))
-        .max(1)
 }
 
 /// Leaving by the contacts the graph holds.
@@ -418,7 +366,7 @@ fn forecast_steps(
     index: usize,
     steps: &mut Vec<Step>,
 ) {
-    if forecasts.count == 0 {
+    if forecasts.is_empty() {
         return;
     }
     let (request, label) = (arena.request, &arena.labels[index]);
@@ -464,18 +412,10 @@ fn forecast_steps(
             offer(label.arrival, now);
         }
         // Grid departures after the label's arrival.
-        let from = (label.arrival / forecasts.step + 1)
-            .saturating_mul(forecasts.step)
-            .saturating_sub(forecasts.first)
-            / forecasts.step;
-        let (first, step) = (forecasts.first, forecasts.step);
-        for (k, handed) in forecasts
-            .grid(estimate, link, transfer)
-            .iter()
-            .enumerate()
-            .skip(from as usize)
-        {
-            offer(first + k as u64 * step, *handed);
+        let (departures, handed) = forecasts.grid(estimate, link, transfer);
+        let after = departures.partition_point(|&depart| depart <= label.arrival);
+        for (&depart, &handed) in departures[after..].iter().zip(&handed[after..]) {
+            offer(depart, handed);
         }
         if let Some(step) = hearing_step(estimate, request, policy, label, link, known.rate_bps, transfer) {
             steps.push(step);
@@ -532,11 +472,12 @@ fn hearing_step(
 }
 
 /// The label one step on from label `index`, if it fits the deadline and the
-/// airtime budget.
+/// airtime budget and the destination can be reached from where it arrives.
 fn extend(
     estimate: &mut dyn Estimate,
     request: &RouteRequest<'_>,
     policy: RoutingPolicy,
+    to_go: &RiskToGo,
     arena: &Arena<'_>,
     index: usize,
     step: Step,
@@ -565,6 +506,7 @@ fn extend(
         return None;
     }
     let to = step.key.to;
+    let risk_to_go = to_go.from(to)?;
     let handed = step.handed.clamp(1.0e-9, 1.0);
     // Before the destination, the custodian must also do its part.
     let probability = if to == request.destination {
@@ -592,7 +534,7 @@ fn extend(
         } else {
             label.first_probability
         },
-        bound: (-risk_cost).exp() * request.value_at(step.arrive) - attempt_cost,
+        bound: (-risk_cost - risk_to_go).exp() * request.value_at(step.arrive) - attempt_cost,
         hop: Some(RouteHop {
             contact: step.key,
             depart: step.depart,

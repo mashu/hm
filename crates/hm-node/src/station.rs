@@ -63,7 +63,7 @@ pub enum StationEvent {
     NotQueued { to: Callsign, reason: String },
 }
 
-/// A station's node and radio as one machine; see the [module docs](self).
+/// A station's node and radio as one machine; see the crate docs.
 pub struct Station {
     me: Callsign,
     identity: Identity,

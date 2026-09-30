@@ -457,3 +457,43 @@ mod search_limit {
         );
     }
 }
+
+/// The search's bound: from the destination back, each hop adds its risk,
+/// and a station with no way on to the destination has none at all.
+#[test]
+fn risk_to_go_grows_back_from_the_destination() {
+    let mut graph = ContactGraph::new(GraphConfig::default()).unwrap();
+    add(
+        &mut graph,
+        "M0AAA",
+        "M0BBB",
+        Bearer::Internet,
+        (0, 500, 5_000, 9_000),
+    );
+    add(
+        &mut graph,
+        "M0BBB",
+        "M0DDD",
+        Bearer::Internet,
+        (0, 500, 5_000, 5_000),
+    );
+    add(
+        &mut graph,
+        "M0AAA",
+        "M0EEE",
+        Bearer::Internet,
+        (0, 500, 5_000, 10_000),
+    );
+    let request = request(&[], &[]);
+    let beliefs = Beliefs::new();
+    let mut estimate = beliefs.mean(0);
+    let mut forecasts = forecast::Forecasts::new(&request, RoutingPolicy::default());
+    let to_go = forecast::RiskToGo::new(&graph, &mut estimate, &request, &mut forecasts);
+    assert_eq!(to_go.from(call("M0DDD")), Some(0.0));
+    assert_eq!(to_go.from(call("M0EEE")), None);
+    let (a, b) = (
+        to_go.from(call("M0AAA")).unwrap(),
+        to_go.from(call("M0BBB")).unwrap(),
+    );
+    assert!(b > 0.0 && a > b, "{a} {b}");
+}

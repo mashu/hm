@@ -75,6 +75,9 @@ cargo run --release -p hm-node --example hf_scale -- 5,10,20,40 4 800 4 1
 
 # One station's log lines (anything containing the text):
 HM_LOG=LA1CCC: cargo run --release -p hm-node --example hf_days -- 7 1 10
+
+# Every frame one station sends another, seconds into the run:
+HM_TRACE='LA1CCC>ES1EEE' cargo run --release -p hm-node --example hf_days -- 7 1 10
 ```
 
 What they print:

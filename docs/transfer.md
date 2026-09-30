@@ -65,12 +65,41 @@ the burst.
 
 An over with no answer is evidence that the path is closed, weighed by how
 likely silence was were it open (an ACK lost to a fade, a collision). The
-sender keeps a posterior that the path is open, updated after every silent
-over, and stops when another over is worth less than its airtime:
+sender follows whether the path is open through the transfer
+([`hm_model::Openness`](models.md#is-it-open-now)): hearing the peer says it
+is open then; between observations the chance relaxes toward the daily
+pattern over the path's correlation time, so a path heard a minute ago is
+very likely still open, one heard an hour ago less so; each silent over is
+Bayes' rule on the two states. (Hearing the peer once used to make the path
+certain to be open for the rest of the transfer, and silence after it
+counted for nothing: a sender whose session had opened went on sending into
+a closed path for half an hour.)
+
+After each silent over, another is sent only if it is worth it in two ways.
+It must be worth its airtime `c` (in units of what completing the transfer
+is worth):
 
 ```text
-P(open) · P(answer | open)  <  price of airtime · airtime of a probe
+P(open) · P(answer | open)  ≥  c
 ```
+
+And it must be worth sending now rather than stopping and sending again once
+the peer is next heard, when the path is known to be open. The over's
+airtime is wasted if the path has closed; stopping costs, if the path is
+still open, the wait `w` (the value the message loses until the peer is
+next heard, which the node works out from its forecast of hearing it) and
+reopening the transfer `r` (an OPEN, a key-up, and the symbols the receiver
+already has, which it forgets when kept waiting):
+
+```text
+c · (1 − P(open))  ≤  P(open) · (w + r)
+```
+
+Mail loses little by waiting a beacon interval, so it stops once the path
+is about as likely closed as open, and the station waits to hear the peer
+([routing](routing.md#or-when-the-next-hop-is-heard)); urgent traffic loses
+much by waiting and keeps trying; a transfer nearly done is not given up
+lightly.
 
 After a missed ACK the next over is a short probe (one or two symbols),
 after a random exponential backoff in units of the last over's airtime; a

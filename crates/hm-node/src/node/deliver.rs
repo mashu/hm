@@ -2,7 +2,7 @@
 //! by expected utility over the contact plan and handed to its next hop.
 
 use hm_bundle::{Bundle, Kind, Opened};
-use hm_model::{Bearer, Erasure, LinkKey, LinkObservation, PerBearer};
+use hm_model::{Bearer, Erasure, Estimate, LinkKey, LinkObservation, PerBearer};
 use hm_route::{plan_routes, LiveContact, Route, RouteError, RouteRequest, RoutingPolicy};
 use hm_store::{Direction, Record};
 use hm_wire::{wrap_routed, Callsign, ObjectId, FLAG_INTERNET, FLAG_MAILBOX, FLAG_RELAY};
@@ -31,6 +31,9 @@ struct Handoff<'a> {
     alternative: f64,
     /// What getting past the first hop is worth, in a delivered message's value.
     worth: f64,
+    /// Share of that worth lost by stopping a radio transfer and sending
+    /// again once the first hop is next heard.
+    wait_cost: f64,
 }
 
 impl Node {
@@ -383,6 +386,9 @@ impl Node {
             // What getting past the first hop is worth: the rest of the
             // route's chance, and the value of arriving when it would.
             let worth = route.downstream_probability() * request.value_at(route.arrival);
+            let wait_cost = route
+                .next_hop()
+                .map_or(1.0, |peer| self.wait_cost(&request, peer, policy, now));
             let hop = Handoff {
                 visited: &visited,
                 expires_at: bundle.expires_at(),
@@ -390,9 +396,32 @@ impl Node {
                 routed_len,
                 alternative,
                 worth,
+                wait_cost,
             };
             self.send_on(now, r, route, hop, out);
         }
+    }
+
+    /// Share of what sending to `peer` over the radio now is worth that is lost
+    /// by stopping and sending once `peer` is next heard: the value the
+    /// message loses over the expected wait (the window, or longer, when it
+    /// is not heard within it). Mail loses little by waiting a beacon
+    /// interval; urgent traffic loses much.
+    fn wait_cost(&self, request: &RouteRequest<'_>, peer: Callsign, policy: RoutingPolicy, now: u64) -> f64 {
+        let link = LinkKey {
+            from: self.id.me,
+            to: peer,
+            bearer: Bearer::Radio,
+        };
+        let window = policy
+            .hearing_window_secs
+            .min(request.expires_at.saturating_sub(now));
+        let heard = self
+            .beliefs
+            .mean(now)
+            .hearing(link, window, self.beacon_interval.max(1));
+        let wait = heard.chance * heard.wait_secs as f64 + (1.0 - heard.chance) * window as f64;
+        (1.0 - request.value_at(now + wait as u64)).clamp(0.0, 1.0)
     }
 
     /// The links from this station that cannot carry anything now: the
@@ -467,6 +496,7 @@ impl Node {
             routed_len,
             alternative,
             worth,
+            wait_cost,
         } = hop;
         let held = route.contacts();
         if self.graph.reserve_many(&held, routed_len).is_err() {
@@ -527,8 +557,9 @@ impl Node {
                     precedence: r.precedence,
                     belief: PeerBelief {
                         erasure: self.beliefs.erasure(link, now),
-                        open: self.beliefs.p_open(link, now, now),
+                        open: self.beliefs.openness(link, now),
                         airtime_cost: price / worth.max(1.0e-6),
+                        wait_cost,
                     },
                 }));
             }

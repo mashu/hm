@@ -18,8 +18,10 @@
 //!
 //! **When** is part of the choice. Besides the contacts the graph holds as
 //! windows, every link the station has seen can be taken later: departures
-//! every [`RoutingPolicy::forecast_step_secs`] up to the horizon, each with
-//! the chance the beliefs forecast for that moment. A doubtful link now, or
+//! every [`RoutingPolicy::forecast_step_secs`] for the first hours, while
+//! what a path is doing now still tells about it, then hourly (the daily
+//! pattern's resolution) up to the horizon, each with the chance the beliefs
+//! forecast for that moment. A doubtful link now, or
 //! a likely one in the morning through a relay: the one of greater expected
 //! utility wins, and a route that departs later says to wait. Only
 //! departures likelier than every earlier one on the same link are tried
@@ -27,8 +29,11 @@
 //! with a better chance dominates.
 //!
 //! The search is A* over partial routes (labels) with the bound
-//! `P·u(arrival) − C`, which can only fall as a label is extended: the first
-//! complete routes out of the queue are the best. Labels dominated in every
+//! `P·e^{−togo}·u(arrival) − C`, where `togo` is the least risk any route
+//! from the label's station on can have (a shortest path back from the
+//! destination over each link's best forecast). It never understates what a
+//! label can still be worth and can only fall as the label is extended: the
+//! first complete routes out of the queue are the best. Labels dominated in every
 //! respect (less likely, later, dearer, more airtime, fewer stations still
 //! open to them) by one already expanded at the same station through the
 //! same first hop are dropped.
@@ -62,6 +67,7 @@
 //! cost of the second copy (compared by utility, not by a threshold on the
 //! gain in probability).
 
+mod forecast;
 mod rank;
 mod search;
 
@@ -190,8 +196,11 @@ pub struct RoutingPolicy {
     pub attempt_cost: PerBearer<f64>,
     /// Cost of a second of airtime, in delivered messages' value.
     pub airtime_price: PerBearer<f64>,
-    /// Known links are planned at departures this far apart.
+    /// Known links are planned at departures this far apart at first...
     pub forecast_step_secs: u64,
+    /// ...for this long, while what a path is doing now still tells about it;
+    /// then an hour apart.
+    pub forecast_fine_secs: u64,
     /// How far ahead known links are planned; zero plans only the contacts
     /// the graph holds.
     pub forecast_horizon_secs: u64,
@@ -210,6 +219,7 @@ impl Default for RoutingPolicy {
             attempt_cost: PerBearer([0.0, 0.02, 0.0]),
             airtime_price: PerBearer([0.05 / 60.0, 0.0, 0.05 / 60.0]),
             forecast_step_secs: 15 * 60,
+            forecast_fine_secs: 3 * 3_600,
             forecast_horizon_secs: 36 * 3_600,
             hearing_window_secs: 2 * 3_600,
         }

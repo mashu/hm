@@ -18,7 +18,7 @@
 //! frames in and out. [`Station`] puts the two together as one machine, for
 //! simulators.
 //!
-//! - [`accept`]: the one gate for everything that arrives, for delivery here
+//! - [`accept`](mod@accept): the one gate for everything that arrives, for delivery here
 //!   or relay custody;
 //! - [`control`]: contact adverts, holdings reconciliation, the control
 //!   airtime budget;

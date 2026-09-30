@@ -19,7 +19,7 @@ pub enum Outcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogEntry {
     /// `asked_at` is when the machine asked to transmit and `queued_at` when
-    /// the radio took the frame: the same, except on a radio with [`Csma`],
+    /// the radio took the frame: the same, except on a radio with [`Csma`](crate::Csma),
     /// where it is when the channel was found clear. `keyup` is false when the
     /// frame followed the previous one without a new TXDELAY.
     Tx {

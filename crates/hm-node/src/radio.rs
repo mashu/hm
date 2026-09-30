@@ -79,7 +79,7 @@ pub struct RadioSpec {
     pub seed: u64,
 }
 
-/// The radio side of a station; see the [module docs](self).
+/// The radio side of a station; see the crate docs.
 pub struct Radio {
     me: Callsign,
     identity: Identity,

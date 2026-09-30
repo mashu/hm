@@ -8,7 +8,8 @@
 //! Five stations around the Baltic share one 300 bd HF channel; paths open
 //! and close through the day and fade while open (see `tests/support/world.rs`).
 //! `HM_LOG=<text>` prints the log lines of the stations that contain it
-//! (`HM_LOG=LA1CCC:` for one station's).
+//! (`HM_LOG=LA1CCC:` for one station's); `HM_TRACE=LA1CCC>ES1EEE` prints
+//! every frame the one sends the other.
 
 #[path = "../tests/support/world.rs"]
 mod world;

@@ -401,8 +401,10 @@ pub fn run(scenario: &Scenario) -> Outcome {
                     ),
                     Err(_) => ("?".into(), "?".into(), None),
                 };
+                // HM_TRACE=A>B: every frame A sends B (seconds into the run).
+                let addressee = dst.map_or(to.as_str(), |d| scenario.stations[d].as_str());
                 if std::env::var("HM_TRACE")
-                    .is_ok_and(|t| t == format!("{}>{}", scenario.stations[*from], to))
+                    .is_ok_and(|t| t == format!("{}>{addressee}", scenario.stations[*from]))
                 {
                     eprintln!("{} {kind} {} bytes", start.0 / 1000, data.len());
                 }

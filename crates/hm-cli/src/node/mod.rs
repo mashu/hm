@@ -14,7 +14,7 @@
 //! RF and ARQ transmissions are gated by [`hm_node::rf_policy`]: the
 //! end-to-end origin must be this station or a trusted station. Everything
 //! that arrives over any bearer goes through one acceptance gate
-//! ([`hm_node::accept`]) for destination delivery or relay custody. The
+//! ([`hm_node::accept()`]) for destination delivery or relay custody. The
 //! coordinator here is the shell that feeds the node and carries out what it
 //! asks for.
 //!

@@ -1,7 +1,7 @@
 //! What the station asks of the engine, and what the engine tells it.
 
 use alloc::vec::Vec;
-use hm_model::Erasure;
+use hm_model::{Erasure, Openness};
 use hm_wire::{Callsign, ObjectId};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -15,7 +15,7 @@ pub enum Command {
     },
     /// Publish `object` once on RF (`Dest::Broadcast`). No ACK wait; listeners
     /// that reconstruct it emit [`Event::Received`] and do not ACK. Completes
-    /// locally as [`Event::Delivered`] to [`broadcast_peer`] with
+    /// locally as [`Event::Delivered`] to [`broadcast_peer`](crate::broadcast_peer) with
     /// [`Receipt::Unverified`].
     Broadcast { object: Vec<u8>, precedence: u8 },
     /// What the station believes about the link towards `peer`: overs to it
@@ -36,13 +36,20 @@ pub enum Command {
 pub struct PeerBelief {
     /// Frame loss while the link is open: overs are sized from it.
     pub erasure: Erasure,
-    /// Chance the link is open now.
-    pub open: f64,
+    /// Whether the link is open now, followed through the transfer: hearing
+    /// the peer says it is, an over that brings no answer is evidence that it
+    /// has closed, and between the two it relaxes to the daily pattern.
+    pub open: Openness,
     /// What a second of airtime costs, in units of what completing the
-    /// transfer is worth. An over that brings no answer is evidence that the
-    /// link has closed; overs stop once the next one's chance of being
+    /// transfer is worth. Overs stop once the next one's chance of being
     /// answered is worth less than its airtime.
     pub airtime_cost: f64,
+    /// Share of what completing the transfer is worth that is lost by
+    /// stopping and sending again once the peer is next heard: the delay, and
+    /// the chance it is not heard in time. Overs also stop once the airtime
+    /// the next one wastes if the link has closed is worth more than the wait
+    /// it saves if it is answered.
+    pub wait_cost: f64,
 }
 
 impl PeerBelief {
@@ -51,8 +58,9 @@ impl PeerBelief {
     pub fn open(erasure: Erasure) -> PeerBelief {
         PeerBelief {
             erasure,
-            open: 1.0,
+            open: Openness::OPEN,
             airtime_cost: 0.0,
+            wait_cost: 1.0,
         }
     }
 }

@@ -230,7 +230,7 @@ impl Xfer {
     /// Belief about frame loss towards `peer`: what the station told us and
     /// ACKs have said since, or, for a peer it told us nothing about, the
     /// population prior for radio links. Broadcasts ([`broadcast_peer`]) use
-    /// the belief the station gave for them, or [`BROADCAST_LOSS`].
+    /// the belief the station gave for them, or a prior of 30 % loss.
     pub fn erasure(&self, peer: Callsign) -> Erasure {
         self.beliefs.get(&peer).map(|b| b.erasure).unwrap_or_else(|| {
             if peer == broadcast_peer() {
@@ -324,7 +324,8 @@ impl Xfer {
         if h.dst == Dest::Station(self.cfg.me) {
             // Anything from a peer we are sending to shows the link open.
             for o in self.active.iter_mut().filter(|o| o.to == h.src) {
-                o.open = 1.0;
+                o.open = o.open.heard();
+                o.open_at = now;
             }
         }
         let for_me = h.dst == Dest::Station(self.cfg.me);

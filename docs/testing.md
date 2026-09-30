@@ -6,6 +6,7 @@ Requires Rust 1.90 or newer.
 cargo test --workspace                                  # everything that runs in CI
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps   # API docs, every link resolved
 cargo install --path crates/hm-cli                      # the `hm` command
 ```
 

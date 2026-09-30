@@ -55,6 +55,7 @@ use minicbor::{Decode, Encode};
 use crate::diurnal::{Diurnal, Likelihood, SampledDiurnal};
 use crate::erasure::Erasure;
 use crate::evidence::{Beta, Evidence, Prior};
+use crate::openness::Openness;
 use crate::Bearer;
 
 const DAY: u64 = 86_400;
@@ -315,6 +316,16 @@ impl LinkModel {
     /// time-of-day pattern.
     pub fn p_open(&self, t: u64, now: u64) -> f64 {
         self.reachable() * self.p_open_in_reach(t, now)
+    }
+
+    /// Whether the link is open now, to follow through a transfer: the chance
+    /// it is open, the daily pattern's chance it relaxes to, and how fast.
+    pub fn openness(&self, now: u64) -> Openness {
+        Openness {
+            p: self.p_open(now, now),
+            daily: self.reachable() * self.availability.p_open(now, now),
+            persistence_secs: self.persistence_secs(),
+        }
     }
 
     /// Probability that the link is open at `t`, were it within reach.

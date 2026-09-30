@@ -1,4 +1,4 @@
-//! Build, send and receive bundles over a radio [`Link`](crate::driver::Link).
+//! Build, send and receive bundles over a radio [`crate::driver::Link`].
 //!
 //! Used by `hm send` / `hm listen` and by the node. The transfer engine is the
 //! same sans-IO machine the simulator drives; this module only supplies the clock,

@@ -5,6 +5,7 @@ use crate::symbols::{fit_symbol, oti};
 use crate::{Event, Failure, Receipt, Xfer, MAX_ACTIVE, SYMBOL_ALIGNMENT};
 use alloc::vec::Vec;
 use hm_core::{Millis, Output};
+use hm_model::Openness;
 use hm_wire::{Callsign, ObjectId};
 use raptorq::{EncodingPacket, SourceBlockEncoder};
 
@@ -70,10 +71,11 @@ pub(crate) struct Outgoing {
     /// How long to wait for the ACK once our last over has left the air: the
     /// peer's guard and answer, our slack and a random part.
     pub(crate) ack_wait: Millis,
-    /// Chance the link is open: the station's belief when the transfer
-    /// started, then Bayes' rule on each over that brought no answer, and
-    /// certainty on hearing the peer.
-    pub(crate) open: f64,
+    /// Whether the link is open, as of `open_at`: the station's belief when
+    /// the transfer started, then Bayes' rule on each over that brought no
+    /// answer, and certainty on hearing the peer, relaxing in between.
+    pub(crate) open: Openness,
+    pub(crate) open_at: Millis,
     /// Silence made another over not worth its airtime.
     pub(crate) abandoned: bool,
     pub(crate) state: OutState,
@@ -206,6 +208,7 @@ impl Xfer {
             finished: false,
             ack_wait: Millis::ZERO,
             open: self.belief(p.to).open,
+            open_at: now,
             abandoned: false,
             state: OutState::Ready { at: now },
         });
