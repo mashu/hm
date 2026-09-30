@@ -174,9 +174,21 @@ pub fn accept(
         }
         // A holding this node gave up on is taken on again when custody is
         // offered anew: the sender has a reason to believe it is reachable
-        // now. Anything else already held is a duplicate.
+        // now. One this node handed on and gets back from its custodian is
+        // taken back now, not when its receipt would have been overdue.
+        // Anything else already held is a duplicate.
         let revive = match store.record(m.id) {
             Ok(Some(record)) if record.direction == Direction::Relay && record.state == State::Failed => true,
+            Ok(Some(record)) if record.state == State::InTransit && record.custody_by == Some(via) => {
+                return match store.reclaim_custody(m.id, now, &format!("handed back by {via}")) {
+                    Ok(_) => {
+                        log(format!("took {} back from {via}", short(&m.id)));
+                        notify.send("message");
+                        Acceptance::Duplicate
+                    }
+                    Err(error) => Acceptance::Rejected(format!("store: {error}")),
+                };
+            }
             Ok(Some(_)) => return Acceptance::Duplicate,
             Ok(None) => false,
             Err(error) => return Acceptance::Rejected(format!("store: {error}")),

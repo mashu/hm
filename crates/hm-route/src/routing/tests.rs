@@ -1,8 +1,8 @@
 use hm_core::DetRng;
-use hm_model::{Beliefs, LinkKey, LinkObservation};
+use hm_model::{Beliefs, LinkKey, LinkObservation, PerBearer};
 
 use super::*;
-use crate::{GraphConfig, ScheduledContact};
+use crate::{Bearer, ContactKey, GraphConfig, ScheduledContact};
 
 fn call(value: &str) -> Callsign {
     value.parse().unwrap()
@@ -31,7 +31,7 @@ fn add(
         .unwrap()
 }
 
-fn request<'a>(visited: &'a [Callsign], excluded: &'a [ContactKey]) -> RouteRequest<'a> {
+fn request<'a>(visited: &'a [Callsign], closed_now: &'a [LinkKey]) -> RouteRequest<'a> {
     RouteRequest {
         source: call("M0AAA"),
         destination: call("M0DDD"),
@@ -41,7 +41,8 @@ fn request<'a>(visited: &'a [Callsign], excluded: &'a [ContactKey]) -> RouteRequ
         max_hops: 8,
         airtime_budget_millis: 10_000,
         visited,
-        excluded_contacts: excluded,
+        forbidden: PerBearer::default(),
+        closed_now,
         urgent: false,
     }
 }
@@ -74,7 +75,10 @@ fn chooses_by_utility_and_keeps_failovers() {
     let plan = plan(&graph, &request(&[], &[])).unwrap();
     assert_eq!(plan.active.len(), 1);
     assert_eq!(plan.active[0].next_hop(), Some(call("M0BBB")));
-    assert_eq!(plan.alternatives.len(), 2);
+    // Through M0CCC is kept to fail over to; straight to M0DDD, stated
+    // never to complete, is not worth its attempt.
+    assert_eq!(plan.alternatives.len(), 1);
+    assert_eq!(plan.alternatives[0].next_hop(), Some(call("M0CCC")));
     assert!(plan.combined_success_probability >= plan.active[0].success_probability);
 }
 
@@ -166,10 +170,12 @@ fn reservation_is_all_or_nothing() {
         (0, 500, 1_000, 9_000),
     );
     let plan = plan(&graph, &request(&[], &[])).unwrap();
-    reserve_active(&mut graph, &plan, 1_000).unwrap();
+    let held = plan.active[0].contacts();
+    graph.reserve_many(&held, 1_000).unwrap();
     assert_eq!(graph.contact(first).unwrap().residual_capacity(), 0);
     assert_eq!(graph.contact(second).unwrap().residual_capacity(), 0);
-    release_active(&mut graph, &plan, 1_000);
+    assert!(graph.reserve_many(&held, 1).is_err());
+    graph.release_many(&held, 1_000);
     assert_eq!(graph.contact(first).unwrap().residual_capacity(), 1_000);
     assert_eq!(graph.contact(second).unwrap().residual_capacity(), 1_000);
 }
@@ -200,19 +206,55 @@ fn a_slightly_safer_route_days_later_loses_to_one_now() {
     assert_eq!(plan.active[0].hops[0].depart, 0);
 }
 
+/// Holding is worth nothing and costs nothing: a slow radio link so doubtful
+/// that its airtime is worth more than its chance is not tried at all.
+#[test]
+fn a_link_not_worth_its_airtime_is_not_tried() {
+    let try_radio = |permyriad: u16| {
+        let mut graph = ContactGraph::new(GraphConfig::default()).unwrap();
+        graph
+            .add_schedule(ScheduledContact {
+                from: call("M0AAA"),
+                to: call("M0DDD"),
+                bearer: Bearer::Radio,
+                start: 0,
+                end: 900,
+                rate_bps: 300,
+                capacity_bytes: 10_000,
+                success_permyriad: Some(permyriad),
+                flags: 0,
+            })
+            .unwrap();
+        let mut req = request(&[], &[]);
+        req.expires_at = 86_400;
+        req.airtime_budget_millis = 60_000;
+        plan(&graph, &req).map(|plan| plan.active[0].next_hop())
+    };
+    assert_eq!(try_radio(2_000), Ok(Some(call("M0DDD"))));
+    // 32 s on the air, 2.7 % of a message's value, for a 2 % chance.
+    assert_eq!(try_radio(200), Err(RouteError::NotWorthIt));
+}
+
 /// A likely radio hop with the internet to fall back on goes first; an
-/// unlikely one does not.
+/// unlikely one on a slow link does not: its airtime is worth more than the
+/// internet attempt it would save.
 #[test]
 fn cheap_radio_first_when_it_is_likely_and_the_internet_is_there_to_fall_back_on() {
     let first_bearer = |radio: u16| {
         let mut graph = ContactGraph::new(GraphConfig::default()).unwrap();
-        add(
-            &mut graph,
-            "M0AAA",
-            "M0DDD",
-            Bearer::Radio,
-            (0, 900, 10_000, radio),
-        );
+        graph
+            .add_schedule(ScheduledContact {
+                from: call("M0AAA"),
+                to: call("M0DDD"),
+                bearer: Bearer::Radio,
+                start: 0,
+                end: 900,
+                rate_bps: 1_200,
+                capacity_bytes: 10_000,
+                success_permyriad: Some(radio),
+                flags: 0,
+            })
+            .unwrap();
         add(
             &mut graph,
             "M0AAA",
@@ -220,9 +262,10 @@ fn cheap_radio_first_when_it_is_likely_and_the_internet_is_there_to_fall_back_on
             Bearer::Internet,
             (0, 900, 10_000, 9_900),
         );
-        plan(&graph, &request(&[], &[])).unwrap().active[0].hops[0]
-            .contact
-            .bearer
+        // Mail good for a day: the radio's minute or so is no loss of value.
+        let mut req = request(&[], &[]);
+        req.expires_at = 86_400;
+        plan(&graph, &req).unwrap().active[0].hops[0].contact.bearer
     };
     assert_eq!(first_bearer(8_000), Bearer::Radio);
     assert_eq!(first_bearer(2_000), Bearer::Internet);
@@ -271,7 +314,7 @@ fn two_good_hops_are_worth_more_than_one_poor_hop() {
 }
 
 /// Drawing the estimates from the beliefs (Thompson sampling) tries a link
-/// never used now and then, and a well-known good one most of the time.
+/// never used now and then, and a well-known mediocre one most of the time.
 #[test]
 fn thompson_plans_explore_links_little_is_known_about() {
     let (me, dest) = (call("M0AAA"), call("M0DDD"));
@@ -283,7 +326,7 @@ fn thompson_plans_explore_links_little_is_known_about() {
     };
     for n in 0..30 {
         beliefs.observe_link(known, n * 60, LinkObservation::Heard);
-        beliefs.observe_link(known, n * 60 + 1, LinkObservation::Handoff { ok: n % 4 != 0 });
+        beliefs.observe_link(known, n * 60 + 1, LinkObservation::Handoff { ok: n % 2 == 0 });
     }
     let now = 30 * 60;
     let mut graph = ContactGraph::new(GraphConfig::default()).unwrap();
@@ -360,7 +403,8 @@ mod search_limit {
             max_hops: 8,
             airtime_budget_millis: 60_000,
             visited: &[],
-            excluded_contacts: &[],
+            forbidden: PerBearer::default(),
+            closed_now: &[],
             urgent: false,
         }
     }

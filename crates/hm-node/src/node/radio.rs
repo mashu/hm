@@ -42,6 +42,7 @@ impl Node {
                 self.graph.set_live_contact_secs(self.live_window);
                 self.beacon_interval = secs;
             }
+            RadioEvt::Channel { busy } => self.channel_busy = busy,
             RadioEvt::Down(why) => self.radio_down(now, why),
             RadioEvt::Received {
                 from,
@@ -135,12 +136,8 @@ impl Node {
             return;
         };
         if to == hm_xfer::broadcast_peer() {
-            // Bulletin publish: no custody receipt expected.
-            if let Some(flight) = self.in_flight.remove(&(id, to)) {
-                for hop in &flight.route.hops {
-                    let _ = self.graph.release(hop.contact, flight.object_bytes);
-                }
-            }
+            // Bulletin publish: no custody receipt expected, and no route held.
+            self.in_flight.remove(&(id, to));
             match self.store.delivered(id, false, "radio", now) {
                 Ok(()) => log(format!("published bulletin {}", short(&id))),
                 Err(e) => log(format!("store: {e}")),

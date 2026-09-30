@@ -43,6 +43,15 @@ fn main() {
             .map(|(kind, (frames, ms))| format!("{kind} {frames} frames {:.1}%", *ms as f64 / 10.0 / seconds))
             .collect();
         println!("        airtime: {}", shares.join(", "));
+        if std::env::var("HM_ESTIMATES").is_ok() {
+            for (me, estimates) in &outcome.estimates {
+                let shown: Vec<String> = estimates
+                    .iter()
+                    .map(|(to, _, p)| format!("{to} {:.3}", p))
+                    .collect();
+                println!("        {me}: {}", shown.join(", "));
+            }
+        }
         sent += outcome.sent.len();
         delivered += outcome.delivered();
         possible += outcome.possible();

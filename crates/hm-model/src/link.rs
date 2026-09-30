@@ -1,15 +1,26 @@
-//! One directed link (from, to, bearer): is it open, how well does it carry
-//! frames, and does a handoff over it complete?
+//! One link's path (both directions, one bearer): is it within reach at all,
+//! is it open, how well does it carry frames, and does a handoff over it
+//! complete?
 //!
-//! Generative story, per link:
+//! Generative story, per path:
 //!
 //! ```text
-//! π(t)   = P(open at t) by time of day          (diurnal::Diurnal)
+//! r      ∈ {within reach, not}, fixed           (a station too far never opens)
+//! π(t)   = P(open at t | r) by time of day       (diurnal::Diurnal)
 //! o_t    ∈ {open, closed}, a Markov chain that relaxes to π(t) with
 //!          correlation time T:  P(o_{t+Δ}=open | o_t) = π + (1[o_t] − π) e^{−Δ/T}
 //! ε      = frame loss while open                 (erasure::Erasure)
 //! h      = P(a handoff completes | open)         (Beta, fading evidence)
 //! ```
+//!
+//! Reach is what makes a path that never opens cheap to rule out. The daily
+//! pattern alone learns probabilities near zero slowly (a miss says little
+//! once the path is believed mostly closed), so draws from it would keep
+//! finding hours worth a try. Each miss on a path never seen open multiplies
+//! the odds that it is within reach by `P(miss | within reach) = 1 − d·P(open)`,
+//! the predictive of the rest of the model: a dozen misses at hours it
+//! would be open if it were in reach rule it out. Anything seen open puts it
+//! within reach for good.
 //!
 //! Every observation is a likelihood on this state, so each kind of news
 //! moves exactly the parts it bears on:
@@ -65,7 +76,9 @@ const STATE_FLOOR: f64 = 1.0e-6;
 /// population prior for its bearer.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct LinkPrior {
-    /// Chance the link is open at a random time.
+    /// Chance the path is within reach at all.
+    pub reachable: f64,
+    /// Chance the link is open at a random time, when within reach.
     pub p_open: f64,
     /// Whether openings follow the time of day.
     pub daily: bool,
@@ -85,6 +98,7 @@ impl LinkPrior {
     pub fn for_bearer(bearer: Bearer) -> LinkPrior {
         match bearer {
             Bearer::Radio => LinkPrior {
+                reachable: 0.5,
                 p_open: 0.3,
                 daily: true,
                 handoff: Prior::new(0.8, 2.0),
@@ -93,6 +107,7 @@ impl LinkPrior {
                 persistence_secs: 3_600.0,
             },
             Bearer::Modem => LinkPrior {
+                reachable: 0.5,
                 p_open: 0.3,
                 daily: true,
                 handoff: Prior::new(0.7, 2.0),
@@ -101,6 +116,7 @@ impl LinkPrior {
                 persistence_secs: 3_600.0,
             },
             Bearer::Internet => LinkPrior {
+                reachable: 0.95,
                 p_open: 0.5,
                 daily: false,
                 handoff: Prior::new(0.95, 4.0),
@@ -225,6 +241,13 @@ pub struct LinkModel {
     last_beacon: Option<u64>,
     #[n(12)]
     beacon_gap: Option<f64>,
+    /// Chance the path is not within reach at all: never seen open, and
+    /// missed where it would have been heard if it were. Zero once anything
+    /// came through (and for records saved before reach was modelled, which
+    /// were of paths heard).
+    #[n(13)]
+    #[cbor(default)]
+    out_of_reach: f64,
 }
 
 /// A beacon gap estimate grows by this share of itself with each beacon, so a
@@ -251,7 +274,13 @@ impl LinkModel {
             expected_until: now,
             last_beacon: None,
             beacon_gap: None,
+            out_of_reach: 1.0 - prior.reachable.clamp(0.0, 1.0),
         }
+    }
+
+    /// Chance the path is within reach at all.
+    pub fn reachable(&self) -> f64 {
+        1.0 - self.out_of_reach
     }
 
     /// Correlation time of the open/closed state, seconds.
@@ -282,8 +311,14 @@ impl LinkModel {
     }
 
     /// Probability that the link is open at `t` (Unix seconds), as believed at
-    /// `now`: the latest state, relaxed toward the time-of-day pattern.
+    /// `now`: within reach, and then the latest state relaxed toward the
+    /// time-of-day pattern.
     pub fn p_open(&self, t: u64, now: u64) -> f64 {
+        self.reachable() * self.p_open_in_reach(t, now)
+    }
+
+    /// Probability that the link is open at `t`, were it within reach.
+    fn p_open_in_reach(&self, t: u64, now: u64) -> f64 {
         let pi = self.availability.p_open(t, now);
         if t <= self.state_at {
             return self.state;
@@ -340,7 +375,10 @@ impl LinkModel {
             LinkObservation::Missed => Likelihood::Missed { detect },
             LinkObservation::Handoff { ok: false } => Likelihood::Missed { detect: handoff_mean },
         };
-        let open_after = self.filter(at, likelihood, observation != LinkObservation::Reported);
+        let in_reach = self.reach(at, likelihood);
+        // Open, and within reach: what a miss's lost frame or a failed
+        // handoff is weighed by.
+        let open_after = in_reach * self.filter(at, likelihood, observation != LinkObservation::Reported);
         let weight = self.diurnal_at.map_or(1.0, |last| {
             (at.abs_diff(last) as f64 / self.persistence_secs()).min(1.0)
         });
@@ -393,6 +431,26 @@ impl LinkModel {
             .take_while(move |t| *t <= by)
     }
 
+    /// Bayes' rule on whether the path is within reach, for an observation at
+    /// `at`: anything seen open puts it there for good; a miss counts
+    /// against it by how likely it was to get through were the path within
+    /// reach (the predictive of the rest of the model). Returns the chance
+    /// it is within reach after the observation.
+    fn reach(&mut self, at: u64, likelihood: Likelihood) -> f64 {
+        match likelihood {
+            Likelihood::Open => self.out_of_reach = 0.0,
+            Likelihood::Closed => {}
+            Likelihood::Missed { detect } => {
+                let r = self.reachable();
+                if r > 0.0 && r < 1.0 {
+                    let within = r * (1.0 - detect * self.p_open_in_reach(at, at));
+                    self.out_of_reach = ((1.0 - r) / (within + 1.0 - r)).clamp(0.0, 1.0);
+                }
+            }
+        }
+        self.reachable()
+    }
+
     /// Bayes' rule on the open/closed state for an observation at `at`, and
     /// a step of `ln T` up its predictive log-likelihood (when `learn`).
     /// Returns P(open at `at`) after the observation.
@@ -435,6 +493,7 @@ impl LinkModel {
     /// One plausible link, drawn from the belief (Thompson sampling).
     pub fn sample(&self, prior: &LinkPrior, rng: &mut DetRng, now: u64) -> SampledLink {
         SampledLink {
+            reachable: rng.chance(self.reachable()),
             availability: self.availability.sample(rng, now),
             state: self.state,
             state_at: self.state_at,
@@ -448,6 +507,7 @@ impl LinkModel {
 /// Thompson sampling.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct SampledLink {
+    reachable: bool,
     availability: SampledDiurnal,
     state: f64,
     state_at: u64,
@@ -457,6 +517,9 @@ pub struct SampledLink {
 
 impl SampledLink {
     pub fn success(&self, t: u64) -> f64 {
+        if !self.reachable {
+            return 0.0;
+        }
         let pi = self.availability.p_open(t);
         let open = if t <= self.state_at {
             self.state

@@ -26,8 +26,7 @@ impl Xfer {
         let t = o.t as usize;
         let frame_air = self.cfg.air(1, self.cfg.data_frame_len(t));
         let (need, probe, is_broadcast) = (o.need, o.probe, o.broadcast);
-        self.note_occupancy(now);
-        let over_cost = self.over_cost(now, frame_air, cap, is_broadcast);
+        let over_cost = self.over_cost(frame_air, cap, is_broadcast);
         let n = if probe {
             need.clamp(1, 2).min(cap)
         } else if is_broadcast {
@@ -272,6 +271,11 @@ impl Xfer {
             let to = self.active[i].to;
             let halved = (self.window(to) / 2).max(MIN_WINDOW);
             self.window.insert(to, halved);
+            if !self.worth_another_over(i) {
+                self.active[i].abandoned = true;
+                self.active[i].state = OutState::Ready { at: now };
+                continue;
+            }
             let o = &mut self.active[i];
             o.timeouts += 1;
             let window = (o.last_cost.0 + self.cfg.ack_guard.0) << o.timeouts.min(MAX_BACKOFF_DOUBLINGS);
@@ -281,6 +285,27 @@ impl Xfer {
             o.probe = true;
             o.state = OutState::Ready { at: now + backoff };
         }
+    }
+
+    /// After an over that brought no answer: Bayes' rule on whether the link
+    /// is open, and whether the next over's chance of being answered is worth
+    /// its airtime. An over is answered, if the link is open, when at least
+    /// one of its frames arrives and so does the ACK, under the Beta-binomial
+    /// predictive of frame loss; a short probe of an open link is rarely
+    /// unanswered, so a few silent ones say the link is closed.
+    fn worth_another_over(&mut self, i: usize) -> bool {
+        let belief = self.belief(self.active[i].to);
+        let answered = |frames: u32| belief.erasure.p_at_least(frames, 1) * belief.erasure.p_at_least(1, 1);
+        let (open, sent, probe, symbol_size, opened) = {
+            let o = &self.active[i];
+            let sent = o.sent_last_round + u32::from(o.opened) + 1;
+            (o.open, sent, o.need.clamp(1, 2), o.t, o.opened)
+        };
+        let silent = 1.0 - answered(sent);
+        let open = open * silent / (open * silent + 1.0 - open);
+        self.active[i].open = open;
+        let air = self.probe_air(symbol_size, probe, opened);
+        open * answered(probe + 1 + u32::from(opened)) >= belief.airtime_cost * air.0 as f64 / 1_000.0
     }
 
     /// The link has put on air everything we gave it, the last frame ending at
@@ -297,13 +322,11 @@ impl Xfer {
         }
     }
 
-    // ---- receiving ------------------------------------------------------
-
     /// Take an ACK's count into the loss belief and report it.
     pub(crate) fn observe_over(&mut self, to: Callsign, sent: u32, got: u32, out: &mut Vec<Output<Event>>) {
-        let mut erasure = self.erasure(to);
-        erasure.observe(sent, got);
-        self.erasure.insert(to, erasure);
+        let mut belief = self.belief(to);
+        belief.erasure.observe(sent, got);
+        self.beliefs.insert(to, belief);
         out.push(Output::Event(Event::Over { to, sent, got }));
     }
 }

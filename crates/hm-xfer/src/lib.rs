@@ -46,7 +46,7 @@ use alloc::vec::Vec;
 
 use hm_core::{DetRng, Input, Machine, Millis, Output, Port};
 use hm_ident::{Identity, PublicKey};
-use hm_model::{Bearer, ChannelModel, Erasure, LinkPrior, Prior};
+use hm_model::{Bearer, Erasure, LinkPrior, Prior, QUIET_BUSY};
 use hm_wire::{
     Callsign, Close, Dest, FrameHeader, FrameType, ObjectId, Open, CTRL_CLOSE, CTRL_OFFER, CTRL_OPEN,
 };
@@ -63,7 +63,7 @@ mod send;
 mod session;
 mod symbols;
 
-pub use command::{Command, Event, Failure, Receipt};
+pub use command::{Command, Event, Failure, PeerBelief, Receipt};
 pub use config::Config;
 pub use receipt::{object_id, receipt_statement, HASH_CONTEXT, RECEIPT_PREFIX};
 pub use symbols::fit_symbol;
@@ -80,8 +80,6 @@ const LOSS_PRIOR_DISPERSION: f64 = 0.1;
 /// Listeners a broadcast is sized for until the station says how many share
 /// the channel.
 const DEFAULT_LISTENERS: u32 = 4;
-/// Channel occupancy is taken into the belief at most this often.
-const OCCUPANCY_EVERY: Millis = Millis::from_secs(10);
 /// Largest "frames remaining" believed when predicting the end of a peer's over,
 /// so one corrupted byte cannot hold our answers back for minutes.
 const MAX_REMAINING_TRUSTED: u8 = 64;
@@ -145,16 +143,13 @@ pub struct Xfer {
     /// what each ACK says arrived. A missed ACK is not counted as loss: it may
     /// as well mean a busy or colliding channel, where larger overs would make
     /// things worse.
-    erasure: BTreeMap<Callsign, Erasure>,
+    beliefs: BTreeMap<Callsign, PeerBelief>,
     /// Congestion window towards each peer: most symbols in one over. Halved
     /// when an ACK does not come, grown by one with each ACK that does.
     window: BTreeMap<Callsign, u32>,
-    /// How busy other stations keep the channel, from the frames we hear:
-    /// every over we add waits for the channel to clear.
-    channel: ChannelModel,
-    /// Airtime of others' frames heard since `busy_since`.
-    busy_ms: u64,
-    busy_since: Millis,
+    /// Share of the time other stations keep the channel busy, as the
+    /// station believes it: every over we add waits for the channel to clear.
+    channel_busy: f64,
     /// Stations a broadcast is sized for.
     listeners: u32,
     tokens_ms: i64,
@@ -184,11 +179,9 @@ impl Xfer {
             active: Vec::new(),
             incoming: BTreeMap::new(),
             seen: BTreeMap::new(),
-            erasure: BTreeMap::new(),
+            beliefs: BTreeMap::new(),
             window: BTreeMap::new(),
-            channel: ChannelModel::default(),
-            busy_ms: 0,
-            busy_since: Millis::ZERO,
+            channel_busy: QUIET_BUSY,
             listeners: DEFAULT_LISTENERS,
             tokens_ms,
             tokens_at: Millis::ZERO,
@@ -239,7 +232,7 @@ impl Xfer {
     /// population prior for radio links. Broadcasts ([`broadcast_peer`]) use
     /// the belief the station gave for them, or [`BROADCAST_LOSS`].
     pub fn erasure(&self, peer: Callsign) -> Erasure {
-        self.erasure.get(&peer).copied().unwrap_or_else(|| {
+        self.beliefs.get(&peer).map(|b| b.erasure).unwrap_or_else(|| {
             if peer == broadcast_peer() {
                 Erasure::from_prior(BROADCAST_LOSS, LOSS_PRIOR_DISPERSION)
             } else {
@@ -249,8 +242,21 @@ impl Xfer {
         })
     }
 
-    /// Stations sharing the channel, whom a broadcast is sized for.
-    pub fn set_listeners(&mut self, listeners: u32) {
+    /// What the station told us about the link towards `peer`, with frame
+    /// loss as ACKs have said since; for a peer it told us nothing about, a
+    /// link taken to be open.
+    fn belief(&self, peer: Callsign) -> PeerBelief {
+        self.beliefs
+            .get(&peer)
+            .copied()
+            .unwrap_or_else(|| PeerBelief::open(self.erasure(peer)))
+    }
+
+    /// What the station believes about the channel: the share of the time
+    /// others keep it busy, and how many stations share it (whom a broadcast
+    /// is sized for).
+    pub fn set_channel(&mut self, busy: f64, listeners: u32) {
+        self.channel_busy = busy.clamp(0.0, 1.0);
         self.listeners = listeners.max(1);
     }
 
@@ -314,8 +320,13 @@ impl Xfer {
         if h.src == self.cfg.me {
             return;
         }
-        self.busy_ms += self.cfg.air(1, data.len()).0;
         self.hear_traffic(now, &h, payload);
+        if h.dst == Dest::Station(self.cfg.me) {
+            // Anything from a peer we are sending to shows the link open.
+            for o in self.active.iter_mut().filter(|o| o.to == h.src) {
+                o.open = 1.0;
+            }
+        }
         let for_me = h.dst == Dest::Station(self.cfg.me);
         let broadcast = h.dst == Dest::Broadcast;
         if let (FrameType::Ack, Dest::Station(to)) = (h.ftype, h.dst) {
@@ -365,8 +376,8 @@ impl Machine for Xfer {
                 accepted,
                 retry_after,
             }) => self.application_verdict(now, from, id, accepted, retry_after),
-            Input::Command(Command::Belief { peer, erasure }) => {
-                self.erasure.insert(peer, erasure);
+            Input::Command(Command::Belief { peer, belief }) => {
+                self.beliefs.insert(peer, belief);
             }
             Input::Frame { port, data } if port == self.cfg.port => self.on_frame(now, &data, out),
             Input::Frame { .. } => {}

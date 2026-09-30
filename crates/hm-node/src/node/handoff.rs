@@ -151,22 +151,23 @@ impl Node {
         let peer = flight.peer;
         let bearer = flight.bearer;
         learn(&mut self.beliefs, self.id.me, &flight, &outcome, now);
+        let held = flight.route.contacts();
         let Some((reason, permanent)) = outcome.failure() else {
-            if let Some(first) = flight.route.hops.first() {
-                if let Err(error) = self.graph.consume(first.contact, flight.object_bytes) {
-                    log(format!("route capacity: {error}"));
+            // The first hop's room was used; the rest was only held.
+            match flight.route.hops.first() {
+                Some(first) if !first.forecast => {
+                    if let Err(error) = self.graph.consume(first.contact, flight.object_bytes) {
+                        log(format!("route capacity: {error}"));
+                    }
+                    self.graph.release_many(&held[1..], flight.object_bytes);
                 }
-                for hop in flight.route.hops.iter().skip(1) {
-                    let _ = self.graph.release(hop.contact, flight.object_bytes);
-                }
+                _ => self.graph.release_many(&held, flight.object_bytes),
             }
             self.custody_taken(now, id, &flight);
             self.notify.send("message");
             return;
         };
-        for hop in &flight.route.hops {
-            let _ = self.graph.release(hop.contact, flight.object_bytes);
-        }
+        self.graph.release_many(&held, flight.object_bytes);
         let store = &self.store;
         if let Err(error) = store.clear_next_hop(id, peer) {
             log(format!("store: {error}"));
@@ -232,9 +233,8 @@ impl Node {
     /// A bulletin pushed to an internet peer: no custody, it is published.
     fn bulletin_pushed(&mut self, now: u64, id: ObjectId, flight: InFlight, outcome: Outcome) {
         let peer = flight.peer;
-        for hop in &flight.route.hops {
-            let _ = self.graph.release(hop.contact, flight.object_bytes);
-        }
+        self.graph
+            .release_many(&flight.route.contacts(), flight.object_bytes);
         learn(&mut self.beliefs, self.id.me, &flight, &outcome, now);
         match outcome.failure() {
             None => match self.store.delivered(id, false, "internet", now) {

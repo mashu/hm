@@ -317,9 +317,10 @@ pub struct ContactEntry {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DeliverySettings {
-    /// Cost of a delivery attempt by radio, over the internet and through an
-    /// ARQ modem, in hundredths of a delivered message's value: what route
-    /// choice weighs against a route's chance and speed.
+    /// What sending costs, in hundredths of a delivered message's value:
+    /// what route choice weighs against a route's chance and speed. A minute
+    /// of radio airtime on a quiet channel (dearer as others keep it busy),
+    /// an attempt over the internet, a minute of ARQ modem airtime.
     pub radio_cost: f64,
     pub internet_cost: f64,
     pub modem_cost: f64,
@@ -342,10 +343,11 @@ pub struct DeliverySettings {
 
 impl Default for DeliverySettings {
     fn default() -> Self {
+        let costs = hm_node::Costs::default();
         DeliverySettings {
-            radio_cost: 1.0,
-            internet_cost: 2.0,
-            modem_cost: 1.5,
+            radio_cost: costs.radio,
+            internet_cost: costs.internet,
+            modem_cost: costs.modem,
             retry_first_secs: 60,
             retry_max_secs: 3600,
             retry_attempts: 12,
@@ -876,13 +878,16 @@ address = "{hub_addr}"
 #   port = 8300
 #   ptt = "none"            or how to key the radio when the modem asks
 
-# The cheaper way that reaches a station is tried first; a failed delivery
-# is retried after first_secs, doubling up to max_secs, attempts times.
-# After a hop handoff, shadow retain and suspect reclaim apply.
+# Costs, in hundredths of a delivered message's value: a minute of radio
+# airtime (dearer as the channel gets busier), an internet attempt, a minute
+# of ARQ modem airtime. Each message goes the way, now or later, that is
+# worth most for its chance and speed. A failed delivery is retried after
+# first_secs, doubling up to max_secs, attempts times. After a hop handoff,
+# shadow retain and suspect reclaim apply.
 [delivery]
-radio_cost = 1.0
+radio_cost = 5.0
 internet_cost = 2.0
-modem_cost = 1.5
+modem_cost = 5.0
 retry_first_secs = 60
 retry_max_secs = 3600
 retry_attempts = 12
@@ -933,7 +938,7 @@ mod tests {
         let c = Config::parse("[radio]\nenabled = false\n[delivery]\ninternet_cost = 0.5\n").unwrap();
         assert!(!c.radio.enabled);
         assert_eq!(c.delivery.internet_cost, 0.5);
-        assert_eq!(c.delivery.radio_cost, 1.0);
+        assert_eq!(c.delivery.radio_cost, hm_node::Costs::default().radio);
         // A typo is an error, not a silently ignored setting.
         let e = Config::parse("[radio]\nbecaon_minutes = 5\n").unwrap_err();
         assert!(e.contains("becaon_minutes"), "{e}");

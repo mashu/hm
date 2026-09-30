@@ -6,29 +6,43 @@
 //! ```text
 //! a_n  = P(accepts custody | the handoff reached it)      Beta, fading evidence
 //! r_n  = P(does its part | it accepted)                    Beta, fading evidence
-//! d    = delay from handoff to the end-to-end receipt:
-//!        ln d ~ N(μ, 1/λ),  (μ, λ) ~ Normal-Gamma           fading sufficient statistics
+//! ℓ    = how late the end-to-end receipt comes back, past the time the
+//!        route planned the message to arrive (the way back, and any slip):
+//!        ln max(ℓ, 1 min) ~ N(μ, 1/λ),  (μ, λ) ~ Normal-Gamma   fading statistics
 //! ```
+//!
+//! Measuring from the route's own arrival, not from the handoff, keeps what
+//! the router already knows out of the custodian's account: a route that
+//! waits for the morning opening is not a slow custodian.
 //!
 //! A message handed to `n` reaches its destination with probability `r_n q`,
 //! where `q` is the rest of the route's chance, which the router predicted.
-//! So a missing end-to-end receipt is a mixture: `n` dropped it (weight
-//! `1 − r_n`) or the rest of the way failed (weight `r_n (1 − q)`). Assumed
-//! density filtering gives `n` only its share of the blame.
+//! No receipt yet, `ℓ` past the planned arrival, is a mixture: `n` dropped
+//! it (weight `1 − r_n`), the rest of the way failed (`r_n (1 − q)`), or
+//! the receipt is still on its way (`r_n q (1 − F(ℓ))`). Assumed density
+//! filtering gives `n` only its share of the blame,
+//! `(1 − r_n) / (1 − r_n q F(ℓ))`: silence soon after the planned arrival
+//! says little, since receipts are often later than that. (Counting it as a
+//! loss outright would teach that custodians drop what they only delay, and
+//! reclaim ever sooner.) A receipt that comes after all, even after custody
+//! was reclaimed, counts as delivered with its true lateness: the delays are
+//! learned from the slow receipts too, not only from those quick enough to
+//! beat the timer.
 //!
 //! A refusal or a "busy" answer is the custodian's, not the link's: the link
 //! carried the question and the answer.
 //!
 //! The custody suspect timer becomes a stopping problem: when to reclaim
-//! custody and send again, maybe another way. Resending at `τ` (if no receipt
-//! came by then) rescues a lost message, worth `V·u(τ)` with the chance `a`
-//! of the other way, where `u` falls from 1 now to 0 at expiry; it costs a
-//! copy's airtime `A` whenever no receipt came, including when the first copy
-//! was only slow. Up to terms that do not depend on `τ`,
+//! custody and send again, maybe another way. Resending `τ` past the planned
+//! arrival (if no receipt came by then) rescues a lost message, worth
+//! `V·u(τ)` with the chance `a` of the other way, where `u` falls from 1 now
+//! to 0 at expiry; it costs a copy's airtime `A` whenever no receipt came,
+//! including when the first copy was only slow. Up to terms that do not
+//! depend on `τ`,
 //!
 //! ```text
 //! G(τ) = V·L·a·u(τ) − A·(L + p·S(τ))      L = 1 − p lost,  p = r_n q,
-//!                                          S(τ) = P(delay > τ)
+//!                                          S(τ) = P(ℓ > τ)
 //! ```
 //!
 //! `τ*` maximises `G`; when no `τ` makes it positive, resending never pays
@@ -65,7 +79,8 @@ impl Default for CustodianPrior {
         CustodianPrior {
             accepts: Prior::new(0.9, 2.0),
             delivers: Prior::new(0.8, 2.0),
-            // A delivery takes about an hour, give or take a factor of e.
+            // A receipt comes back about an hour after the planned arrival,
+            // give or take a factor of four.
             delay_mean: log(3_600.0),
             delay_count: 1.0,
             delay_shape: 2.0,
@@ -73,6 +88,10 @@ impl Default for CustodianPrior {
         }
     }
 }
+
+/// The shortest lateness learned from: a receipt earlier than planned says
+/// the custodian was quick, not how much quicker.
+const MIN_LATE_SECS: f64 = 60.0;
 
 /// Something seen that bears on a custodian.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -83,12 +102,28 @@ pub enum CustodianObservation {
     Refused,
     /// It is busy for `retry_after` seconds.
     Busy { retry_after: u64 },
-    /// An end-to-end receipt came back for a message it took, `delay_secs`
-    /// after the handoff.
-    Delivered { delay_secs: u64 },
-    /// No receipt came back in time (or it sent a custody failure notice);
-    /// the rest of the route beyond it had chance `downstream`.
-    Lost { downstream: f64 },
+    /// An end-to-end receipt came back for a message it took, `late_secs`
+    /// past the time the route planned the message to arrive.
+    Delivered { late_secs: u64 },
+    /// No receipt has come back `late_secs` past the planned arrival, and
+    /// custody was reclaimed; the rest of the route beyond it had chance
+    /// `downstream`.
+    Silent { downstream: f64, late_secs: u64 },
+}
+
+/// A handoff of custody, as far as deciding when to reclaim it goes.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct HandedOver {
+    /// The route's chance beyond the custodian.
+    pub downstream: f64,
+    /// The chance of the best other way, were custody reclaimed.
+    pub alternative: f64,
+    /// A delivered message's worth, in copies sent.
+    pub value: f64,
+    /// Seconds from the handoff to the route's planned arrival.
+    pub expected_secs: u64,
+    /// Seconds from the handoff until the message expires.
+    pub remaining_secs: u64,
 }
 
 /// Fading sufficient statistics of ln(delay).
@@ -195,15 +230,11 @@ impl CustodianModel {
         }
     }
 
-    /// Chance a delivery it took has produced a receipt within `secs`.
-    pub fn delay_cdf(&self, prior: &CustodianPrior, secs: u64, now: u64) -> f64 {
+    /// Chance a receipt for a message it took has come back by `late_secs`
+    /// past the planned arrival.
+    pub fn delay_cdf(&self, prior: &CustodianPrior, late_secs: u64, now: u64) -> f64 {
         let (nu, m, s) = self.delays.predictive(prior, now);
-        math::student_t_cdf((log(secs.max(1) as f64) - m) / s, nu)
-    }
-
-    /// Median delay to an end-to-end receipt, seconds.
-    pub fn median_delay(&self, prior: &CustodianPrior, now: u64) -> f64 {
-        exp(self.delays.predictive(prior, now).1)
+        math::student_t_cdf((log(late_secs.max(1) as f64) - m) / s, nu)
     }
 
     pub fn observe(&mut self, prior: &CustodianPrior, at: u64, observation: CustodianObservation) {
@@ -214,58 +245,46 @@ impl CustodianModel {
             CustodianObservation::Busy { retry_after } => {
                 self.busy_until = self.busy_until.max(at.saturating_add(retry_after));
             }
-            CustodianObservation::Delivered { delay_secs } => {
+            CustodianObservation::Delivered { late_secs } => {
                 self.delivers.add(1.0, 0.0, at, h);
-                self.delays.add(log(delay_secs.max(1) as f64), at);
+                self.delays.add(log((late_secs as f64).max(MIN_LATE_SECS)), at);
             }
-            CustodianObservation::Lost { downstream } => {
+            CustodianObservation::Silent {
+                downstream,
+                late_secs,
+            } => {
                 let r = self.delivers(prior, at).mean();
                 let q = downstream.clamp(0.0, 1.0);
-                // P(it dropped the message | no receipt).
-                let blame = (1.0 - r) / (1.0 - r * q).max(1.0e-9);
+                let back = self.delay_cdf(prior, late_secs, at);
+                // P(it dropped the message | no receipt yet).
+                let blame = (1.0 - r) / (1.0 - r * q * back).max(1.0e-9);
                 self.delivers.add(0.0, blame.clamp(0.0, 1.0), at, h);
             }
         }
         self.observed_at = self.observed_at.max(at);
     }
 
-    /// Chance the message is lost, given that no receipt has come back
-    /// `elapsed` seconds after handing it over with route chance `downstream`
-    /// beyond this custodian.
-    pub fn p_lost_after(&self, prior: &CustodianPrior, elapsed: u64, downstream: f64, now: u64) -> f64 {
-        let p = (self.delivers(prior, now).mean() * downstream.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-        let slow = 1.0 - self.delay_cdf(prior, elapsed, now);
-        let lost = 1.0 - p;
-        lost / (lost + p * slow).max(1.0e-12)
-    }
-
     /// How long after a handoff to wait for the end-to-end receipt before
-    /// reclaiming custody: the `τ` in `bounds` that maximises the expected
-    /// gain of resending then (module docs). `downstream`: the route's chance
-    /// beyond this custodian; `alternative`: the chance of sending again;
-    /// `value`: a delivered message's worth in copies' airtime; `remaining`:
-    /// seconds until the message expires. Returns `bounds.1` when resending
-    /// never pays.
-    #[allow(clippy::too_many_arguments)]
+    /// reclaiming custody: the planned arrival, then the lateness `τ` in
+    /// `bounds` that maximises the expected gain of resending (module docs).
+    /// Waits to the end of `bounds` when resending never pays.
     pub fn suspect_after(
         &self,
         prior: &CustodianPrior,
-        downstream: f64,
-        alternative: f64,
-        value: f64,
-        remaining: u64,
+        handed: &HandedOver,
         bounds: (u64, u64),
         now: u64,
     ) -> u64 {
         const STEPS: u32 = 200;
         let (low, high) = (bounds.0.max(1), bounds.1.max(bounds.0.max(1)));
-        let p = (self.delivers(prior, now).mean() * downstream.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        let p = (self.delivers(prior, now).mean() * handed.downstream.clamp(0.0, 1.0)).clamp(0.0, 1.0);
         let lost = 1.0 - p;
-        let remaining = remaining.max(1) as f64;
+        let remaining = handed.remaining_secs.max(1) as f64;
+        let rescuing = handed.value * lost * handed.alternative.clamp(0.0, 1.0);
         let gain = |tau: u64| {
-            let rescue = (1.0 - tau as f64 / remaining).max(0.0);
+            let rescue = (1.0 - handed.expected_secs.saturating_add(tau) as f64 / remaining).max(0.0);
             let slow = 1.0 - self.delay_cdf(prior, tau, now);
-            value * lost * alternative.clamp(0.0, 1.0) * rescue - (lost + p * slow)
+            rescuing * rescue - (lost + p * slow)
         };
         let (from, to) = (log(low as f64), log(high as f64));
         let mut best = (0.0, high);
@@ -276,7 +295,7 @@ impl CustodianModel {
                 best = (g, tau);
             }
         }
-        best.1
+        handed.expected_secs.saturating_add(best.1)
     }
 }
 
@@ -285,6 +304,17 @@ mod tests {
     use super::*;
 
     const HOUR: u64 = 3_600;
+    const WEEK: u64 = 7 * 24 * HOUR;
+
+    fn handed(downstream: f64, alternative: f64, expected_secs: u64) -> HandedOver {
+        HandedOver {
+            downstream,
+            alternative,
+            value: 10.0,
+            expected_secs,
+            remaining_secs: WEEK,
+        }
+    }
 
     #[test]
     fn refusals_lower_acceptance_and_busy_blocks_until_its_time() {
@@ -299,49 +329,102 @@ mod tests {
         assert!(c.p_accept(&prior, 161, 161) > 0.0);
     }
 
-    /// A custodian is blamed less for a loss when the rest of the route was
-    /// unlikely to get through anyway.
+    /// A custodian is blamed less for silence when the rest of the route was
+    /// unlikely to get through anyway, and less the sooner after the planned
+    /// arrival: the receipt may well be on its way.
     #[test]
-    fn blame_is_shared_with_the_rest_of_the_route() {
+    fn blame_is_shared_with_the_rest_of_the_route_and_with_time() {
         let prior = CustodianPrior::default();
-        let mut sure_route = CustodianModel::default();
-        let mut shaky_route = CustodianModel::default();
-        sure_route.observe(&prior, 0, CustodianObservation::Lost { downstream: 0.99 });
-        shaky_route.observe(&prior, 0, CustodianObservation::Lost { downstream: 0.2 });
-        assert!(sure_route.delivers(&prior, 0).mean() < shaky_route.delivers(&prior, 0).mean());
+        let blamed = |downstream, late_secs| {
+            let mut c = CustodianModel::default();
+            c.observe(
+                &prior,
+                0,
+                CustodianObservation::Silent {
+                    downstream,
+                    late_secs,
+                },
+            );
+            c.delivers(&prior, 0).mean()
+        };
+        assert!(blamed(0.99, 12 * HOUR) < blamed(0.2, 12 * HOUR));
+        assert!(blamed(0.99, 12 * HOUR) < blamed(0.99, 10 * 60));
     }
 
-    /// Deliveries that take about two hours teach the delay; the suspect time
-    /// lands past most of them, earlier for a custodian that often drops.
+    /// Receipts that come about two hours late teach the lateness; the
+    /// suspect time lands past most of them, earlier for a custodian that
+    /// often drops, and never before the route's planned arrival.
     #[test]
-    fn suspect_time_follows_the_delay_and_the_reliability() {
+    fn suspect_time_follows_the_plan_the_lateness_and_the_reliability() {
         let prior = CustodianPrior::default();
         let mut good = CustodianModel::default();
         for n in 0..20 {
             good.observe(
                 &prior,
                 n * HOUR,
-                CustodianObservation::Delivered { delay_secs: 2 * HOUR },
+                CustodianObservation::Delivered { late_secs: 2 * HOUR },
             );
         }
         let now = 20 * HOUR;
-        let median = good.median_delay(&prior, now);
-        assert!((median / (2.0 * HOUR as f64) - 1.0).abs() < 0.2, "{median}");
-        let week = 7 * 24 * HOUR;
-        let bounds = (60, week);
-        let wait_good = good.suspect_after(&prior, 0.95, 0.8, 10.0, week, bounds, now);
+        let half = good.delay_cdf(&prior, 2 * HOUR, now);
+        assert!((half - 0.5).abs() < 0.1, "{half}");
+        let bounds = (60, WEEK);
+        let wait_good = good.suspect_after(&prior, &handed(0.95, 0.8, 0), bounds, now);
         // Past nearly all its receipts, well before the message expires.
         assert!(good.delay_cdf(&prior, wait_good, now) > 0.95, "{wait_good}");
         assert!(wait_good < 2 * 24 * HOUR, "{wait_good}");
+        // A route that waits nine hours for its link is given nine hours more.
+        let planned = good.suspect_after(&prior, &handed(0.95, 0.8, 9 * HOUR), bounds, now);
+        assert!(planned >= wait_good + 8 * HOUR, "{planned} {wait_good}");
         let mut dropper = good.clone();
         for n in 0..10 {
-            dropper.observe(&prior, now + n, CustodianObservation::Lost { downstream: 0.95 });
+            dropper.observe(
+                &prior,
+                now + n,
+                CustodianObservation::Silent {
+                    downstream: 0.95,
+                    late_secs: 24 * HOUR,
+                },
+            );
         }
-        let wait_dropper = dropper.suspect_after(&prior, 0.95, 0.8, 10.0, week, bounds, now + 10);
+        let wait_dropper = dropper.suspect_after(&prior, &handed(0.95, 0.8, 0), bounds, now + 10);
         assert!(wait_dropper < wait_good, "{wait_dropper} {wait_good}");
         // Right after the handoff resending never pays: the first copy is
         // most likely on its way.
         assert!(wait_dropper > HOUR, "{wait_dropper}");
+    }
+
+    /// Reclaiming early and counting it a loss would feed on itself: silence
+    /// soon after the planned arrival barely moves the belief, and the
+    /// receipts that come late after all are learned from.
+    #[test]
+    fn early_silence_does_not_teach_that_a_slow_custodian_drops() {
+        let prior = CustodianPrior::default();
+        let mut c = CustodianModel::default();
+        for n in 0..20 {
+            let at = n * 12 * HOUR;
+            c.observe(
+                &prior,
+                at,
+                CustodianObservation::Silent {
+                    downstream: 0.9,
+                    late_secs: 20 * 60,
+                },
+            );
+            c.observe(
+                &prior,
+                at + 6 * HOUR,
+                CustodianObservation::Delivered { late_secs: 6 * HOUR },
+            );
+        }
+        let now = 20 * 12 * HOUR;
+        assert!(
+            c.delivers(&prior, now).mean() > 0.6,
+            "{}",
+            c.delivers(&prior, now).mean()
+        );
+        let wait = c.suspect_after(&prior, &handed(0.9, 0.8, 0), (60, WEEK), now);
+        assert!(wait > 6 * HOUR, "{wait}");
     }
 
     /// With no alternative worth trying, waiting to the bound is best.
@@ -350,7 +433,7 @@ mod tests {
         let prior = CustodianPrior::default();
         let c = CustodianModel::default();
         assert_eq!(
-            c.suspect_after(&prior, 0.9, 0.0, 10.0, 7 * 86_400, (60, 86_400), 0),
+            c.suspect_after(&prior, &handed(0.9, 0.0, 0), (60, 86_400), 0),
             86_400
         );
     }

@@ -490,7 +490,7 @@ fn bursts_follow_the_loss_belief() {
             Millis(0),
             Input::Command(Command::Belief {
                 peer,
-                erasure: Erasure::from_prior(Prior::new(loss, 200.0), 0.0),
+                belief: PeerBelief::open(Erasure::from_prior(Prior::new(loss, 200.0), 0.0)),
             }),
             &mut Vec::new(),
         );
@@ -500,6 +500,66 @@ fn bursts_follow_the_loss_belief() {
     let (clean, lossy) = (over(0.01), over(0.3));
     assert!((5..=6).contains(&clean), "{clean}");
     assert!(lossy > clean + 1, "{lossy} vs {clean}");
+}
+
+/// Overs that bring no answer are evidence the link is closed. Told the
+/// link is doubtful and airtime costs something, a sender stops after a few
+/// silent overs; told nothing, it goes on for `max_rounds`.
+#[test]
+fn silence_ends_a_transfer_once_another_over_is_not_worth_its_airtime() {
+    let overs_into_silence = |belief: Option<PeerBelief>| {
+        let mut a = engine("SA0KAM");
+        let peer = call("SO5KM-1");
+        let mut out = Vec::new();
+        if let Some(belief) = belief {
+            a.handle(
+                Millis(0),
+                Input::Command(Command::Belief { peer, belief }),
+                &mut out,
+            );
+        }
+        a.handle(
+            Millis(0),
+            Input::Command(Command::Send {
+                to: peer,
+                object: vec![7; 300],
+                precedence: 0,
+            }),
+            &mut out,
+        );
+        let mut overs = 0;
+        loop {
+            overs += frames(&out)
+                .iter()
+                .filter(|f| ctrl_type(f) == Some(CTRL_OFFER))
+                .count();
+            if events(&out).contains(&Event::Failed {
+                to: peer,
+                id: object_id(&[7; 300]),
+                reason: Failure::NoAnswer,
+            }) {
+                return overs;
+            }
+            out.clear();
+            let t = a.next_deadline().expect("a transfer under way");
+            a.on_deadline(t, &mut out);
+        }
+    };
+    let told_nothing = overs_into_silence(None);
+    assert_eq!(told_nothing, usize::from(engine("SA0KAM").config().max_rounds));
+    let doubtful = overs_into_silence(Some(PeerBelief {
+        erasure: Erasure::from_prior(Prior::new(0.1, 20.0), 0.1),
+        open: 0.3,
+        airtime_cost: 0.01,
+    }));
+    assert!((1..=3).contains(&doubtful), "{doubtful} overs");
+    // A link just heard is given more overs before silence counts against it.
+    let heard = overs_into_silence(Some(PeerBelief {
+        erasure: Erasure::from_prior(Prior::new(0.1, 20.0), 0.1),
+        open: 0.95,
+        airtime_cost: 0.01,
+    }));
+    assert!(heard > doubtful && heard < told_nothing, "{heard} vs {doubtful}");
 }
 
 /// Run A -> B through one clean over; returns B's final ACK frame and A.

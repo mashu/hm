@@ -171,7 +171,8 @@ pub struct Record {
     /// Station that most recently accepted custody from this node.
     #[n(16)]
     pub custody_by: Option<Callsign>,
-    /// Verified destination receipt bundle, if known.
+    /// Outbound: the destination's verified receipt, once it came.
+    /// Inbound: the receipt this station answered with last.
     #[n(17)]
     pub e2e_receipt: Option<ObjectId>,
     /// Bundle expiry in Unix seconds, for relay admission and cleanup.
@@ -198,21 +199,54 @@ pub struct Record {
     /// When `custody_by` took custody, Unix seconds.
     #[n(25)]
     pub custody_at: Option<u64>,
+    /// Queued, waiting to leave through this station when its link is
+    /// forecast to open: tried sooner if the station is heard first.
+    #[n(26)]
+    pub waiting_for: Option<Callsign>,
+    /// When the route `custody_by` took it on planned it to arrive.
+    #[n(27)]
+    pub custody_eta: Option<u64>,
+    /// The first custody reclaimed from, kept so a receipt that comes late
+    /// after all is still credited to it.
+    #[n(28)]
+    pub first_custody: Option<Handed>,
 }
 
-/// A message handed to `custodian` at `handed_at` was confirmed delivered end
-/// to end at `delivered_at`.
+/// Custody handed to `custodian` at `at`, on a route planned to arrive at
+/// `eta`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Handed {
+    #[n(0)]
+    pub custodian: Callsign,
+    #[n(1)]
+    pub at: u64,
+    #[n(2)]
+    pub eta: u64,
+}
+
+/// A message handed to `custodian`, on a route planned to arrive at
+/// `expected_at`, was confirmed delivered end to end at `delivered_at`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CustodyOutcome {
     pub id: ObjectId,
     pub custodian: Callsign,
-    pub handed_at: u64,
+    pub expected_at: u64,
     pub delivered_at: u64,
 }
 
 impl Record {
     pub fn final_destination(&self) -> Callsign {
         self.final_peer.unwrap_or(self.peer)
+    }
+
+    /// The custody handed over now, if any.
+    pub fn handed(&self) -> Option<Handed> {
+        let (custodian, at) = self.custody_by.zip(self.custody_at)?;
+        Some(Handed {
+            custodian,
+            at,
+            eta: self.custody_eta.unwrap_or(at),
+        })
     }
 
     pub fn immediate_peer(&self) -> Callsign {
@@ -305,6 +339,12 @@ pub struct CustodyHandoff<'a> {
     pub now: u64,
     pub grace_secs: u64,
     pub suspect_secs: u64,
+    /// When the route planned the message to arrive.
+    pub eta: u64,
+    /// An end-to-end receipt will answer the message. Nothing answers a
+    /// receipt or a custody-fail notice: for those, custody passing on ends
+    /// this station's part.
+    pub answered: bool,
 }
 
 impl AdmissionLimits {
@@ -486,6 +526,9 @@ impl Store {
             shadow_until: None,
             wire_seq: None,
             custody_at: None,
+            waiting_for: None,
+            custody_eta: None,
+            first_custody: None,
         }
     }
 
@@ -544,19 +587,44 @@ impl Store {
         let inserted;
         {
             let mut messages = tx.open_table(MESSAGES)?;
-            inserted = messages.get(received.id.0)?.is_none();
-            if inserted {
-                let seq = Store::next_seq(&mut tx.open_table(META)?)?;
-                let mut record = Store::blank_record(received.id, Direction::In, received.from, now, seq);
-                record.state = State::Unread;
-                record.verified = received.verified;
-                record.wire_seq = received.wire_seq;
-                tx.open_table(OBJECTS)?.insert(received.id.0, received.object)?;
+            let known = match messages.get(received.id.0)? {
+                Some(bytes) => Some(decode(bytes.value())?),
+                None => None,
+            };
+            inserted = known.is_none();
+            // A message received again was sent again: its sender has not
+            // seen the receipt. Answer again, unless the receipt is still on
+            // its way.
+            let answering = match known.as_ref().and_then(|record| record.e2e_receipt) {
+                Some(receipt) => match messages.get(receipt.0)? {
+                    Some(bytes) => {
+                        let receipt = decode(bytes.value())?;
+                        !matches!(receipt.state, State::Queued | State::InTransit)
+                    }
+                    None => true,
+                },
+                None => true,
+            };
+            if inserted || answering {
+                let mut record = match known {
+                    Some(record) => record,
+                    None => {
+                        let seq = Store::next_seq(&mut tx.open_table(META)?)?;
+                        let mut record =
+                            Store::blank_record(received.id, Direction::In, received.from, now, seq);
+                        record.state = State::Unread;
+                        record.verified = received.verified;
+                        record.wire_seq = received.wire_seq;
+                        tx.open_table(OBJECTS)?.insert(received.id.0, received.object)?;
+                        tx.open_table(BY_TIME)?
+                            .insert((0_u8, now, seq, received.id.0), ())?;
+                        record
+                    }
+                };
+                record.e2e_receipt = Some(reply.id);
                 messages.insert(received.id.0, encode(&record).as_slice())?;
-                tx.open_table(BY_TIME)?
-                    .insert((0_u8, now, seq, received.id.0), ())?;
             }
-            if messages.get(reply.id.0)?.is_none() {
+            if answering && messages.get(reply.id.0)?.is_none() {
                 let seq = Store::next_seq(&mut tx.open_table(META)?)?;
                 let mut record = Store::blank_record(reply.id, Direction::Out, reply.to, now, seq);
                 record.state = State::Queued;
@@ -802,9 +870,23 @@ impl Store {
         })
     }
 
-    /// `destination` is in reach (heard on the radio, or linked): its queued
-    /// messages waiting for a later attempt are tried now. Returns how many.
-    pub fn wake(&self, destination: Callsign, now: u64) -> Result<usize> {
+    /// Hold a queued message until `until`, waiting to leave through `via`
+    /// (see [`Store::wake`]); no attempt is counted. False if it is not queued.
+    pub fn defer(&self, id: ObjectId, until: u64, via: Option<Callsign>) -> Result<bool> {
+        self.update(id, |r| {
+            if r.state != State::Queued {
+                return false;
+            }
+            r.next_attempt = until;
+            r.waiting_for = via;
+            true
+        })
+    }
+
+    /// `station` is in reach (heard on the radio, or linked): queued messages
+    /// for it, and those waiting to leave through it, waiting for a later
+    /// attempt are tried now. Returns how many.
+    pub fn wake(&self, station: Callsign, now: u64) -> Result<usize> {
         let tx = self.write_tx()?;
         let mut woken = 0;
         {
@@ -819,7 +901,8 @@ impl Store {
                 }
             }
             for mut r in records {
-                if r.state == State::Queued && r.final_destination() == destination && r.next_attempt > now {
+                let for_station = r.final_destination() == station || r.waiting_for == Some(station);
+                if r.state == State::Queued && for_station && r.next_attempt > now {
                     r.next_attempt = now;
                     messages.insert(r.id.0, encode(&r).as_slice())?;
                     woken += 1;
@@ -911,6 +994,8 @@ impl Store {
             now,
             grace_secs,
             suspect_secs,
+            eta,
+            answered,
         } = handoff;
         self.update(id, |r| {
             if !matches!(r.state, State::Queued | State::InTransit)
@@ -940,8 +1025,23 @@ impl Store {
             r.verified |= receipt_verified;
             r.custody_by = Some(next_hop);
             r.custody_at = Some(now);
+            r.custody_eta = Some(eta.max(now));
             r.next_hop = r.next_hops.as_ref().and_then(|hops| hops.first().copied());
             r.attempts += 1;
+            r.by = Some(by.to_string());
+            if !answered {
+                // No receipt will come to wait for: handed to its destination
+                // it is delivered, to a custodian it is that custodian's.
+                r.state = if next_hop == r.final_destination() {
+                    State::Delivered
+                } else {
+                    State::DeliveredUnconfirmed
+                };
+                r.next_attempt = now;
+                r.shadow_until = None;
+                r.note = Some(format!("custody passed to {next_hop}"));
+                return true;
+            }
             let mut suspect_at = now.saturating_add(suspect_secs.max(1));
             if let Some(expires) = r.expires_at {
                 suspect_at = suspect_at.min(expires);
@@ -949,7 +1049,6 @@ impl Store {
             r.next_attempt = suspect_at;
             r.shadow_until = Some(now.saturating_add(grace_secs.max(1)));
             r.note = None;
-            r.by = Some(by.to_string());
             true
         })
     }
@@ -985,6 +1084,9 @@ impl Store {
             }
             let expired = r.expires_at.is_some_and(|expires| expires <= now);
             if !expired {
+                if r.first_custody.is_none() {
+                    r.first_custody = r.handed();
+                }
                 if let Some(by) = r.custody_by.take() {
                     if let Some(copies) = &mut r.custody_copies {
                         copies.retain(|c| *c != by);
@@ -1080,9 +1182,11 @@ impl Store {
             {
                 return None;
             }
-            let handed = (r.state == State::InTransit)
-                .then_some(())
-                .and(r.custody_by.zip(r.custody_at));
+            // The first custodian's copy had the head start: credit it,
+            // even when the receipt comes after it was reclaimed.
+            let handed = r
+                .first_custody
+                .or_else(|| (r.state == State::InTransit).then(|| r.handed()).flatten());
             r.state = State::Delivered;
             r.verified = true;
             r.e2e_receipt = Some(receipt);
@@ -1094,10 +1198,10 @@ impl Store {
         let Some(handed) = outcome else {
             return Ok(false);
         };
-        if let Some((custodian, handed_at)) = handed {
+        if let Some(handed) = handed {
             let mut value = [0_u8; 22];
-            value[..6].copy_from_slice(&custodian.to_bytes());
-            value[6..14].copy_from_slice(&handed_at.to_be_bytes());
+            value[..6].copy_from_slice(&handed.custodian.to_bytes());
+            value[6..14].copy_from_slice(&handed.eta.to_be_bytes());
             value[14..].copy_from_slice(&now.to_be_bytes());
             let tx = self.write_tx()?;
             tx.open_table(CUSTODY_OUTCOMES)?.insert(id.0, value)?;
@@ -1121,7 +1225,7 @@ impl Store {
                 out.push(CustodyOutcome {
                     id: ObjectId(id.value()),
                     custodian,
-                    handed_at: u64::from_be_bytes(value[6..14].try_into().expect("8 bytes")),
+                    expected_at: u64::from_be_bytes(value[6..14].try_into().expect("8 bytes")),
                     delivered_at: u64::from_be_bytes(value[14..].try_into().expect("8 bytes")),
                 });
             }

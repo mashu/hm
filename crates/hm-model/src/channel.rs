@@ -25,7 +25,9 @@ pub const CHANNEL_HALF_LIFE: u64 = 3_600;
 /// tenth of a window (so a few minutes of listening outweigh it).
 const CONTENDER_PRIOR: (f64, f64) = (0.2, 0.1);
 /// Busy share of the carrier before anything is measured, worth a minute.
-const BUSY_PRIOR: Prior = Prior::new(0.1, 60_000.0);
+const BUSY_PRIOR: Prior = Prior::new(QUIET_BUSY, 60_000.0);
+/// Share of the time others keep a channel busy, believed before listening.
+pub const QUIET_BUSY: f64 = 0.1;
 
 /// Something seen on the channel.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -93,8 +95,12 @@ impl ChannelModel {
     /// busy with chance β, and on a channel busy a share β of the time the
     /// wait for it to clear is about `β / (1 − β)` busy periods.
     pub fn access_wait(&self, now: u64, busy_period: f64) -> f64 {
-        let beta = self.occupancy(now).mean().min(0.95);
-        beta / (1.0 - beta) * busy_period
+        access_wait(self.occupancy(now).mean(), busy_period)
+    }
+
+    /// Share of the time others keep the carrier busy, as believed at `now`.
+    pub fn busy(&self, now: u64) -> f64 {
+        self.occupancy(now).mean()
     }
 
     /// KISS persistence byte for p-persistent CSMA: transmit with probability
@@ -103,6 +109,15 @@ impl ChannelModel {
         let p = 1.0 / (1.0 + self.contenders(now));
         (libm::round(p * 256.0) - 1.0).clamp(15.0, 255.0) as u8
     }
+}
+
+/// Expected wait for a clear channel that others keep busy a share `busy`
+/// of the time, in units of their typical transmission `busy_period`:
+/// arriving at a random moment the carrier is busy with chance `busy`, and
+/// the wait for it to clear is about `busy / (1 − busy)` busy periods.
+pub fn access_wait(busy: f64, busy_period: f64) -> f64 {
+    let busy = busy.clamp(0.0, 0.95);
+    busy / (1.0 - busy) * busy_period
 }
 
 /// Chance, under the contender belief, that a slot is clear of everyone else

@@ -1,9 +1,10 @@
-//! Airtime: the transmitter's budget, what an over costs, and how busy others keep the channel.
+//! Airtime: the transmitter's budget, what frames and overs cost on air, and
+//! the wait for a channel others keep busy.
 
 use crate::send::OutState;
-use crate::{Xfer, MAX_REMAINING_TRUSTED, NACK_SPREAD_ACKS, OCCUPANCY_EVERY};
+use crate::{Xfer, MAX_REMAINING_TRUSTED, NACK_SPREAD_ACKS};
 use hm_core::Millis;
-use hm_model::{ChannelObservation, OverCost};
+use hm_model::OverCost;
 use hm_wire::{DataPreamble, Dest, FrameHeader, FrameType, HEADER_LEN, OPEN_LEN};
 
 impl Xfer {
@@ -25,13 +26,26 @@ impl Xfer {
         }
     }
 
-    // ---- sending --------------------------------------------------------
-
     /// How long a broadcaster listens for repair requests after an over: the
     /// listeners' guard, the spread of their moments, one request, our slack.
     pub(crate) fn repair_wait(&self) -> Millis {
         let ack_air = self.ack_air();
         self.cfg.ack_guard + Millis(ack_air.0 * NACK_SPREAD_ACKS) + ack_air + self.cfg.ack_guard
+    }
+
+    /// Airtime of a probe after a missed ACK: key-up, OFFER (and OPEN) and
+    /// `symbols` DATA frames of `symbol_size`.
+    pub(crate) fn probe_air(&self, symbol_size: u16, symbols: u32, open: bool) -> Millis {
+        let mut air = self.cfg.txdelay
+            + self.cfg.air(1, HEADER_LEN + hm_wire::OFFER_LEN)
+            + self.cfg.air(
+                symbols as usize,
+                self.cfg.data_frame_len(usize::from(symbol_size)),
+            );
+        if open {
+            air += self.open_air();
+        }
+        air
     }
 
     /// Airtime of an OPEN frame.
@@ -40,11 +54,15 @@ impl Xfer {
     }
 
     /// Airtime of an ACK with a receipt, key-up included.
+    pub(crate) fn ack_air(&self) -> Millis {
+        self.cfg.txdelay + self.cfg.air(1, HEADER_LEN + 7 + 8 + hm_wire::RECEIPT_LEN)
+    }
+
     /// What an over costs besides its DATA frames: our key-up, the peer's
     /// key-up and ACK, the guard between (for a broadcast, the repair window
     /// listeners ask in), and the wait for the others on the channel to
     /// finish, whose overs are taken to be as long as a full one of ours.
-    pub(crate) fn over_cost(&self, now: Millis, frame_air: Millis, cap: u32, broadcast: bool) -> OverCost {
+    pub(crate) fn over_cost(&self, frame_air: Millis, cap: u32, broadcast: bool) -> OverCost {
         let ack = self.ack_air().0 as f64;
         let answer = if broadcast {
             (NACK_SPREAD_ACKS + 1) as f64 * ack
@@ -52,31 +70,11 @@ impl Xfer {
             ack
         };
         let full_over = (self.cfg.txdelay.0 + frame_air.0 * u64::from(cap)) as f64;
-        let wait = self.channel.access_wait(now.0 / 1_000, full_over);
+        let wait = hm_model::access_wait(self.channel_busy, full_over);
         OverCost {
             frame_ms: frame_air.0 as f64,
             turnaround_ms: 2.0 * self.cfg.txdelay.0 as f64 + self.cfg.ack_guard.0 as f64 + answer + wait,
         }
-    }
-
-    /// Take the airtime of others' frames heard lately into the channel belief.
-    pub(crate) fn note_occupancy(&mut self, now: Millis) {
-        if now < self.busy_since + OCCUPANCY_EVERY {
-            return;
-        }
-        self.channel.observe(
-            now.0 / 1_000,
-            ChannelObservation::Occupancy {
-                busy_ms: self.busy_ms,
-                total_ms: now.0 - self.busy_since.0,
-            },
-        );
-        self.busy_ms = 0;
-        self.busy_since = now;
-    }
-
-    pub(crate) fn ack_air(&self) -> Millis {
-        self.cfg.txdelay + self.cfg.air(1, HEADER_LEN + 7 + 8 + hm_wire::RECEIPT_LEN)
     }
 
     /// While we wait for an ACK, other traffic on the channel means our over

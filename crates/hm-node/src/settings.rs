@@ -1,39 +1,50 @@
 //! The settings the node decides with, which may change while it runs.
 
+use hm_model::PerBearer;
 use hm_store::RetryPolicy;
 use hm_wire::Locator;
 use serde::{Deserialize, Serialize};
 
 use crate::Trust;
 
-/// Cost of a delivery attempt on each bearer, in hundredths of a delivered
-/// message's value (`[delivery] *_cost` in `station.toml`).
+/// What sending costs, in hundredths of a delivered message's value
+/// (`[delivery] *_cost` in `station.toml`): a minute of airtime on the radio
+/// and through the ARQ modem, an attempt over the internet.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Costs {
+    /// A minute of radio airtime on a quiet channel.
     pub radio: f64,
+    /// An attempt over the internet.
     pub internet: f64,
+    /// A minute of ARQ modem airtime.
     pub modem: f64,
 }
 
 impl Default for Costs {
     fn default() -> Self {
         Costs {
-            radio: 1.0,
+            radio: 5.0,
             internet: 2.0,
-            modem: 1.5,
+            modem: 5.0,
         }
     }
 }
 
 impl Costs {
-    /// The costs in a delivered message's value, by [`hm_model::Bearer::index`],
-    /// for route choice.
-    pub fn attempt_cost(&self) -> [f64; 3] {
-        [self.radio, self.internet, self.modem].map(|c| c / 100.0)
+    /// What an attempt costs besides its airtime, in a delivered message's
+    /// value.
+    pub fn attempt(&self) -> PerBearer<f64> {
+        PerBearer([0.0, self.internet / 100.0, 0.0])
     }
 
-    pub fn of(&self, bearer: hm_model::Bearer) -> f64 {
-        self.attempt_cost()[bearer.index()]
+    /// What a second of airtime costs, in a delivered message's value, when
+    /// others keep the radio channel busy a share `busy` of the time: the
+    /// airtime is theirs to want too, so it is dearer the busier they keep
+    /// it, by `1 / (1 − busy)`, the factor by which a queue's delay grows
+    /// with its load.
+    pub fn airtime(&self, busy: f64) -> PerBearer<f64> {
+        let congestion = 1.0 / (1.0 - busy.clamp(0.0, 0.95));
+        PerBearer([self.radio / 6_000.0 * congestion, 0.0, self.modem / 6_000.0])
     }
 }
 

@@ -70,6 +70,12 @@ pub(crate) struct Outgoing {
     /// How long to wait for the ACK once our last over has left the air: the
     /// peer's guard and answer, our slack and a random part.
     pub(crate) ack_wait: Millis,
+    /// Chance the link is open: the station's belief when the transfer
+    /// started, then Bayes' rule on each over that brought no answer, and
+    /// certainty on hearing the peer.
+    pub(crate) open: f64,
+    /// Silence made another over not worth its airtime.
+    pub(crate) abandoned: bool,
     pub(crate) state: OutState,
 }
 
@@ -199,6 +205,8 @@ impl Xfer {
             quiet_windows: 0,
             finished: false,
             ack_wait: Millis::ZERO,
+            open: self.belief(p.to).open,
+            abandoned: false,
             state: OutState::Ready { at: now },
         });
     }
@@ -251,7 +259,7 @@ impl Xfer {
                 && if o.broadcast {
                     o.finished
                 } else {
-                    o.stalls >= max_rounds
+                    o.stalls >= max_rounds || o.abandoned
                 };
             if done {
                 ended.push(if o.broadcast {

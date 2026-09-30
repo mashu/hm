@@ -481,7 +481,8 @@ impl Model {
                     max_hops: (nodes.saturating_sub(1).min(16)) as u8,
                     airtime_budget_millis: u64::MAX / 4,
                     visited: &[],
-                    excluded_contacts: &[],
+                    forbidden: hm_model::PerBearer::default(),
+                    closed_now: &[],
                     urgent: message.bundle.urgent,
                 };
                 let mut estimate = beliefs.mean(contact.start);

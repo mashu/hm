@@ -18,9 +18,9 @@ pub enum Command {
     /// locally as [`Event::Delivered`] to [`broadcast_peer`] with
     /// [`Receipt::Unverified`].
     Broadcast { object: Vec<u8>, precedence: u8 },
-    /// The station's belief about frame loss towards `peer`: overs to it are
-    /// sized from this until the next one.
-    Belief { peer: Callsign, erasure: Erasure },
+    /// What the station believes about the link towards `peer`: overs to it
+    /// are sized, and silent overs weighed, by this until the next one.
+    Belief { peer: Callsign, belief: PeerBelief },
     /// Application durably stored (or refused) a just-received object.
     Accept {
         from: Callsign,
@@ -31,9 +31,36 @@ pub enum Command {
     },
 }
 
+/// What the station believes about the link towards a peer.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct PeerBelief {
+    /// Frame loss while the link is open: overs are sized from it.
+    pub erasure: Erasure,
+    /// Chance the link is open now.
+    pub open: f64,
+    /// What a second of airtime costs, in units of what completing the
+    /// transfer is worth. An over that brings no answer is evidence that the
+    /// link has closed; overs stop once the next one's chance of being
+    /// answered is worth less than its airtime.
+    pub airtime_cost: f64,
+}
+
+impl PeerBelief {
+    /// Frame loss `erasure` on a link taken to be open, whose airtime costs
+    /// nothing: overs go on until `max_rounds` bring no progress.
+    pub fn open(erasure: Erasure) -> PeerBelief {
+        PeerBelief {
+            erasure,
+            open: 1.0,
+            airtime_cost: 0.0,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Failure {
-    /// `max_rounds` overs in a row brought no progress.
+    /// Overs brought no progress: `max_rounds` of them in a row, or as many
+    /// as silence made worth their airtime.
     NoAnswer,
     TooLarge,
     Empty,

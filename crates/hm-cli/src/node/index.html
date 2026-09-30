@@ -709,11 +709,11 @@
           </header>
           <div class="block">
             <h3 class="block-title">Path preference</h3>
-            <p class="lede">Lower cost is tried first when more than one path can reach a station.</p>
+            <p class="lede">What sending costs, in hundredths of a delivered message's value: a minute of radio or modem airtime, an internet attempt. Each message goes the way, now or later, worth most for its chance and speed.</p>
             <div class="trio">
-              <div><label for="radio_cost">Packet radio</label><input id="radio_cost" type="number" min="0.01" step="0.01" value="1" required></div>
-              <div><label for="internet_cost">Internet</label><input id="internet_cost" type="number" min="0.01" step="0.01" value="2" required></div>
-              <div><label for="modem_cost">ARQ modem</label><input id="modem_cost" type="number" min="0.01" step="0.01" value="1.5" required></div>
+              <div><label for="radio_cost">Packet radio (per minute)</label><input id="radio_cost" type="number" min="0.01" step="0.01" value="5" required></div>
+              <div><label for="internet_cost">Internet (per attempt)</label><input id="internet_cost" type="number" min="0.01" step="0.01" value="2" required></div>
+              <div><label for="modem_cost">ARQ modem (per minute)</label><input id="modem_cost" type="number" min="0.01" step="0.01" value="5" required></div>
             </div>
           </div>
           <div class="block">
@@ -1702,9 +1702,9 @@ const liveFields = [
 ];
 const liveDefaults = {
   beacon_minutes: 10,
-  radio_cost: 1,
+  radio_cost: 5,
   internet_cost: 2,
-  modem_cost: 1.5,
+  modem_cost: 5,
   retry_first_secs: 60,
   retry_max_secs: 3600,
   retry_attempts: 12,

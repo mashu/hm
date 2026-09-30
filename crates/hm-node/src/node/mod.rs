@@ -177,6 +177,9 @@ pub struct Node {
     /// neighbours reported was counted as missed.
     unheard_until: BTreeMap<Callsign, u64>,
     heard: Vec<heard::Station>,
+    /// Share of the time others keep the radio channel busy: what radio
+    /// airtime costs rises with it.
+    channel_busy: f64,
 }
 
 impl Node {
@@ -231,6 +234,7 @@ impl Node {
             beacons_seen: BTreeMap::new(),
             unheard_until: BTreeMap::new(),
             heard: Vec::new(),
+            channel_busy: hm_model::QUIET_BUSY,
         };
         node.advertise_schedules(now);
         node

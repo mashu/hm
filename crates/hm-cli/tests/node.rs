@@ -217,16 +217,20 @@ fn inbox(addr: SocketAddr) -> Vec<Value> {
         .clone()
 }
 
+/// Waits for `n` of the operator's own messages to be delivered, and returns
+/// the newest of them. Receipts this station sends are its own business:
+/// they are delivered once handed on, and are not counted.
 fn delivered(addr: SocketAddr, n: usize, what: &str) -> Value {
     wait_for(Duration::from_secs(120), what, || {
         let out = get(addr, "/api/messages?direction=out");
-        let done: Vec<&Value> = out
+        let mine: Vec<&Value> = out
             .as_array()
             .unwrap()
             .iter()
-            .filter(|m| m["state"] == "Delivered")
+            .filter(|m| m["kind"] != "Receipt" && m["kind"] != "CustodyFail")
             .collect();
-        (done.len() >= n).then(|| out[0].clone())
+        let done = mine.iter().filter(|m| m["state"] == "Delivered").count();
+        (done >= n).then(|| mine[0].clone())
     })
 }
 
@@ -620,6 +624,7 @@ fn mail_waits_while_the_receiver_is_off_air() {
         queued["note"].as_str().unwrap().starts_with("NoAnswer"),
         "{queued}"
     );
+    // The receiver comes on the air and says so: its beacon wakes the mail.
     let b = start(Setup {
         key: &bob,
         me: "SO5KM-1",
@@ -629,7 +634,7 @@ fn mail_waits_while_the_receiver_is_off_air() {
         internet: None,
         store: &b_db,
         retry: QUICK,
-        beacon_every: None,
+        beacon_every: Some(Duration::from_secs(2)),
         trust_file: None,
     });
     delivered(a.http_addr, 1, "delivery after the receiver came up");

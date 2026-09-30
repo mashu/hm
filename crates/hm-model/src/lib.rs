@@ -48,8 +48,8 @@ pub mod math;
 pub use beliefs::{
     Beliefs, Estimate, LinkEstimate, Mean, RestoreError, Thompson, FORGET_AFTER, MISS_HORIZON,
 };
-pub use channel::{clear_slot, ChannelModel, ChannelObservation, CHANNEL_HALF_LIFE};
-pub use custodian::{CustodianModel, CustodianObservation, CustodianPrior, CUSTODIAN_HALF_LIFE};
+pub use channel::{access_wait, clear_slot, ChannelModel, ChannelObservation, CHANNEL_HALF_LIFE, QUIET_BUSY};
+pub use custodian::{CustodianModel, CustodianObservation, CustodianPrior, HandedOver, CUSTODIAN_HALF_LIFE};
 pub use erasure::{broadcast_burst, burst_size, plan_overs, Erasure, OverCost};
 pub use evidence::{Beta, Evidence, Prior};
 pub use link::{LinkModel, LinkObservation, LinkPrior, SampledLink, ERASURE_HALF_LIFE, HANDOFF_HALF_LIFE};
@@ -98,6 +98,31 @@ impl Bearer {
 
     pub fn from_index(index: u8) -> Option<Bearer> {
         Bearer::ALL.get(usize::from(index)).copied()
+    }
+}
+
+/// One value for each bearer.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PerBearer<T>(pub [T; 3]);
+
+impl<T> PerBearer<T> {
+    /// `f` of each bearer.
+    pub fn from_fn(f: impl FnMut(Bearer) -> T) -> PerBearer<T> {
+        PerBearer(Bearer::ALL.map(f))
+    }
+}
+
+impl<T> core::ops::Index<Bearer> for PerBearer<T> {
+    type Output = T;
+
+    fn index(&self, bearer: Bearer) -> &T {
+        &self.0[bearer.index()]
+    }
+}
+
+impl<T> core::ops::IndexMut<Bearer> for PerBearer<T> {
+    fn index_mut(&mut self, bearer: Bearer) -> &mut T {
+        &mut self.0[bearer.index()]
     }
 }
 

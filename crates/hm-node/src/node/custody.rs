@@ -3,7 +3,7 @@
 
 use hm_bundle::{Bundle, Kind, Opened, Precedence};
 use hm_ident::Identity;
-use hm_model::CustodianObservation;
+use hm_model::{CustodianObservation, HandedOver};
 use hm_store::{Direction, ReclaimOutcome, RetryPolicy, Store};
 use hm_wire::{Callsign, ObjectId};
 
@@ -21,7 +21,8 @@ impl Node {
     /// the end-to-end receipt as long as waiting pays: resending sooner risks
     /// a duplicate, later a lost message found out too late. The final
     /// destination itself cannot lose what it holds: from there, resending
-    /// never pays.
+    /// never pays. A receipt or a custody-fail notice, which nothing answers,
+    /// is the custodian's from here.
     pub(super) fn custody_taken(&mut self, now: u64, id: ObjectId, flight: &InFlight) {
         let peer = flight.peer;
         let at_destination = self
@@ -30,12 +31,19 @@ impl Node {
             .ok()
             .flatten()
             .is_some_and(|r| r.final_destination() == peer);
+        let eta = flight.route.arrival.max(now);
+        let handed = HandedOver {
+            downstream: flight.downstream,
+            alternative: if at_destination { 0.0 } else { flight.alternative },
+            // A delivered message's worth in copies: what sending one along
+            // the route is expected to cost.
+            value: 1.0 / flight.route.attempt_cost.max(1.0e-6),
+            expected_secs: eta - now,
+            remaining_secs: flight.expires_at.saturating_sub(now),
+        };
         let suspect_secs = self.beliefs.suspect_after(
             peer,
-            flight.downstream,
-            if at_destination { 0.0 } else { flight.alternative },
-            1.0 / self.settings.costs.of(flight.bearer).max(1.0e-6),
-            flight.expires_at.saturating_sub(now),
+            &handed,
             (MIN_SUSPECT_SECS, self.settings.custody_suspect_secs),
             now,
         );
@@ -48,6 +56,8 @@ impl Node {
                 now,
                 grace_secs: self.settings.custody_grace_secs,
                 suspect_secs,
+                eta,
+                answered: answered_end_to_end(&self.store, id),
             },
         ) {
             Ok(true) => {
@@ -67,8 +77,8 @@ impl Node {
         }
     }
 
-    /// End-to-end receipts for messages a custodian took: how long it took,
-    /// and that the custodian did its part.
+    /// End-to-end receipts for messages a custodian took: how late past the
+    /// planned arrival, and that the custodian did its part.
     pub(super) fn take_custody_outcomes(&mut self) {
         match self.store.take_custody_outcomes() {
             Ok(outcomes) => {
@@ -78,7 +88,7 @@ impl Node {
                         outcome.custodian,
                         outcome.delivered_at,
                         CustodianObservation::Delivered {
-                            delay_secs: outcome.delivered_at.saturating_sub(outcome.handed_at),
+                            late_secs: outcome.delivered_at.saturating_sub(outcome.expected_at),
                         },
                     );
                 }
@@ -102,15 +112,21 @@ impl Node {
             }
             // Our own message went to a custodian and no receipt came back in
             // all that time, by any path: the custodian takes its share of
-            // the blame, weighed against the rest of the route's chance, so a
-            // station that takes custody and drops it stops attracting
-            // traffic. The link that carried the handoff did its part and is
-            // not blamed.
+            // the blame, weighed against the rest of the route's chance and
+            // the chance the receipt is only late, so a station that takes
+            // custody and drops it stops attracting traffic. The link that
+            // carried the handoff did its part and is not blamed.
             if record.direction == Direction::Out {
-                if let Some(custodian) = record.custody_by {
+                if let Some(handed) = record.handed() {
                     let downstream = self.handed.remove(&record.id).unwrap_or(0.5);
-                    self.beliefs
-                        .observe_custodian(custodian, now, CustodianObservation::Lost { downstream });
+                    self.beliefs.observe_custodian(
+                        handed.custodian,
+                        now,
+                        CustodianObservation::Silent {
+                            downstream,
+                            late_secs: now.saturating_sub(handed.eta),
+                        },
+                    );
                 }
             }
             match self
@@ -235,14 +251,20 @@ pub(super) fn on_gave_up_receipt(store: &Store, receipt_id: ObjectId, now: u64) 
     }
 }
 
+/// The kind of bundle `id` holds, if it can be read.
+fn kind_of(store: &Store, id: ObjectId) -> Option<Kind> {
+    let object = store.object(id).ok()??;
+    Opened::decode(&object).ok().map(|opened| opened.bundle.kind)
+}
+
+/// Whether an end-to-end receipt will answer `id`: nothing answers a receipt
+/// or a custody-fail notice.
+fn answered_end_to_end(store: &Store, id: ObjectId) -> bool {
+    !matches!(kind_of(store, id), Some(Kind::Receipt | Kind::CustodyFail))
+}
+
 pub(super) fn retry_policy_for(store: &Store, id: ObjectId, settings: &Settings) -> RetryPolicy {
-    let Ok(Some(object)) = store.object(id) else {
-        return settings.retry;
-    };
-    let Ok(opened) = Opened::decode(&object) else {
-        return settings.retry;
-    };
-    if opened.bundle.kind == Kind::Receipt {
+    if kind_of(store, id) == Some(Kind::Receipt) {
         settings.receipt_retry
     } else {
         settings.retry

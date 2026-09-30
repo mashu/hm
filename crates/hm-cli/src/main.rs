@@ -197,13 +197,13 @@ struct NodeArgs {
     /// Accept inbound internet links from any valid certificate [internet.open_hub].
     #[arg(long)]
     open_hub: Option<bool>,
-    /// Relative cost of a delivery attempt by radio [delivery.radio_cost].
+    /// Cost of a minute of radio airtime, in hundredths of a message's value [delivery.radio_cost].
     #[arg(long)]
     radio_cost: Option<f64>,
-    /// Relative cost of a delivery attempt over the internet [delivery.internet_cost].
+    /// Cost of an attempt over the internet, in hundredths of a message's value [delivery.internet_cost].
     #[arg(long)]
     internet_cost: Option<f64>,
-    /// Relative cost of a delivery attempt by ARQ modem [delivery.modem_cost].
+    /// Cost of a minute of ARQ modem airtime, in hundredths of a message's value [delivery.modem_cost].
     #[arg(long)]
     modem_cost: Option<f64>,
     /// First retry delay in seconds [delivery.retry_first_secs].

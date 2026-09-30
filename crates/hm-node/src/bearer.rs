@@ -3,19 +3,19 @@
 
 use hm_model::Erasure;
 use hm_wire::{Callsign, Dest, ObjectId};
-use hm_xfer::{Failure, Receipt};
+use hm_xfer::{Failure, PeerBelief, Receipt};
 
 use crate::heard;
 
 #[derive(Debug)]
 pub enum RadioCmd {
-    /// Transfer `object` to `to`, with overs sized from the station's belief
-    /// about frame loss on the link (`erasure`).
+    /// Transfer `object` to `to`, with overs sized, and silence weighed, by
+    /// the station's belief about the link.
     Send {
         object: Vec<u8>,
         to: Callsign,
         precedence: u8,
-        erasure: Erasure,
+        belief: PeerBelief,
     },
     /// RF bulletin: `Dest::Broadcast`, no ACK wait; `erasure`: the station's
     /// belief about frame loss on its radio links in general.
@@ -72,6 +72,10 @@ pub enum RadioEvt {
     Heard(Vec<heard::Station>),
     /// We now beacon every this many seconds (more stations, longer).
     BeaconInterval(u64),
+    /// Others keep the channel busy this share of the time.
+    Channel {
+        busy: f64,
+    },
 }
 
 /// How a transfer over the internet or through an ARQ modem ended.

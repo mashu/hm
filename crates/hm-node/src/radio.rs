@@ -13,12 +13,12 @@
 
 use hm_core::{DetRng, Input, Machine, Millis, Output, Port};
 use hm_ident::Identity;
-use hm_model::ChannelModel;
+use hm_model::{ChannelModel, ChannelObservation};
 use hm_wire::{
     Callsign, Dest, FrameHeader, FrameType, Locator, FEATURE_MAILBOX, FEATURE_RELAY, FLAG_HOLDING,
 };
 use hm_xfer::beacon::{beacon_frame, read_beacon};
-use hm_xfer::{broadcast_peer, Command, Config, Event, Xfer};
+use hm_xfer::{broadcast_peer, Command, Config, Event, PeerBelief, Xfer};
 
 use crate::adverts::advertised_flags;
 use crate::control::{
@@ -54,9 +54,12 @@ pub struct LinkTiming {
 impl LinkTiming {
     /// Airtime of one frame of `len` bytes on this link, key-up included.
     pub fn airtime_ms(&self, len: usize) -> u64 {
-        self.txdelay_ms.saturating_add(
-            ((len as u64 + LINK_OVERHEAD_BYTES) * 8 * 1_000).div_ceil(u64::from(self.bitrate_bps.max(1))),
-        )
+        self.txdelay_ms.saturating_add(self.frame_ms(len))
+    }
+
+    /// Airtime of a frame of `len` bytes sent while the transmitter is keyed.
+    pub fn frame_ms(&self, len: usize) -> u64 {
+        ((len as u64 + LINK_OVERHEAD_BYTES) * 8 * 1_000).div_ceil(u64::from(self.bitrate_bps.max(1)))
     }
 }
 
@@ -106,6 +109,8 @@ pub struct Radio {
     holding: bool,
     channel: ChannelModel,
     channel_seen: u64,
+    /// Airtime of others' frames heard since `channel_seen`.
+    busy_ms: u64,
     sharing: usize,
 }
 
@@ -163,6 +168,7 @@ impl Radio {
             holding: false,
             channel,
             channel_seen: unix,
+            busy_ms: 0,
             sharing,
             rng: rng.fork(2),
         };
@@ -231,10 +237,10 @@ impl Radio {
                 object,
                 to,
                 precedence,
-                erasure,
+                belief,
             } => {
                 self.x
-                    .handle(now, Input::Command(Command::Belief { peer: to, erasure }), xo);
+                    .handle(now, Input::Command(Command::Belief { peer: to, belief }), xo);
                 self.x.handle(
                     now,
                     Input::Command(Command::Send {
@@ -254,7 +260,7 @@ impl Radio {
                     now,
                     Input::Command(Command::Belief {
                         peer: broadcast_peer(),
-                        erasure,
+                        belief: PeerBelief::open(erasure),
                     }),
                     xo,
                 );
@@ -293,6 +299,7 @@ impl Radio {
         out: &mut Vec<Output<RadioEvt>>,
     ) {
         let unix = self.unix(now);
+        self.busy_ms += self.timing.frame_ms(data.len());
         self.heard_changed |= self.hear(unix, &data);
         if let Ok((header, payload)) = FrameHeader::decode(&data) {
             if header.ftype == FrameType::Sync && header.src != self.me {
@@ -353,8 +360,19 @@ impl Radio {
             let exposure = (unix - self.channel_seen) as f64 / window as f64;
             self.channel
                 .observe_active(unix, self.heard.active(unix, window) as u32, exposure);
+            self.channel.observe(
+                unix,
+                ChannelObservation::Occupancy {
+                    busy_ms: self.busy_ms,
+                    total_ms: (unix - self.channel_seen) * 1_000,
+                },
+            );
+            self.busy_ms = 0;
             self.channel_seen = unix;
-            self.x.set_listeners(self.channel.contenders(unix).ceil() as u32);
+            let busy = self.channel.busy(unix);
+            self.x
+                .set_channel(busy, self.channel.contenders(unix).ceil() as u32);
+            out.push(Output::Event(RadioEvt::Channel { busy }));
         }
         let sharing = self.channel.sharing(unix);
         if sharing != self.sharing {

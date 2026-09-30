@@ -190,6 +190,8 @@ fn relay_custody_moves_without_claiming_final_delivery() {
                 now: 110,
                 grace_secs: 3600,
                 suspect_secs: 86_400,
+                eta: 0,
+                answered: true,
             }
         )
         .unwrap());
@@ -228,6 +230,8 @@ fn active_custody_is_l_one_normally_and_l_two_only_when_urgent() {
                 now: 20,
                 grace_secs: 3600,
                 suspect_secs: 86_400,
+                eta: 0,
+                answered: true,
             }
         )
         .unwrap());
@@ -241,6 +245,8 @@ fn active_custody_is_l_one_normally_and_l_two_only_when_urgent() {
                 now: 21,
                 grace_secs: 3600,
                 suspect_secs: 86_400,
+                eta: 0,
+                answered: true,
             }
         )
         .unwrap());
@@ -266,6 +272,8 @@ fn unverified_receipt_does_not_transfer_custody() {
                 now: 20,
                 grace_secs: 3600,
                 suspect_secs: 86_400,
+                eta: 0,
+                answered: true,
             }
         )
         .unwrap());
@@ -293,6 +301,8 @@ fn cancellation_ignores_late_receipt_and_e2e_requires_destination() {
                 now: 20,
                 grace_secs: 3600,
                 suspect_secs: 86_400,
+                eta: 0,
+                answered: true,
             }
         )
         .unwrap());
@@ -333,6 +343,8 @@ fn deletion_cancels_first_and_never_removes_active_custody() {
                 now: 21,
                 grace_secs: 3600,
                 suspect_secs: 86_400,
+                eta: 0,
+                answered: true,
             }
         )
         .unwrap());
@@ -358,6 +370,8 @@ fn suspect_reclaims_then_delivered_unconfirmed_when_expired() {
                 now: 100,
                 grace_secs: 50,
                 suspect_secs: 30,
+                eta: 0,
+                answered: true,
             }
         )
         .unwrap());
@@ -395,6 +409,8 @@ fn suspect_reclaims_then_delivered_unconfirmed_when_expired() {
                 now: 200,
                 grace_secs: 10,
                 suspect_secs: 5,
+                eta: 0,
+                answered: true,
             }
         )
         .unwrap());
@@ -427,6 +443,8 @@ fn custody_fail_notice_reclaims() {
                 now: 20,
                 grace_secs: 3600,
                 suspect_secs: 86_400,
+                eta: 0,
+                answered: true,
             }
         )
         .unwrap());
@@ -554,6 +572,8 @@ fn end_to_end_receipts_report_custody_outcomes_once() {
                 now: 200,
                 grace_secs: 60,
                 suspect_secs: 3_600,
+                eta: 500,
+                answered: true,
             },
         )
         .unwrap());
@@ -563,11 +583,57 @@ fn end_to_end_receipts_report_custody_outcomes_once() {
         vec![CustodyOutcome {
             id: id(1),
             custodian: relay,
-            handed_at: 200,
+            expected_at: 500,
             delivered_at: 900,
         }]
     );
     assert!(store.take_custody_outcomes().unwrap().is_empty());
+}
+
+/// Custody reclaimed too soon: the receipt that comes after all is the first
+/// custodian's, with its true lateness, not lost, and not the next one's.
+#[test]
+fn a_receipt_after_a_reclaim_is_credited_to_the_first_custodian() {
+    let db = TempDb::new("custody-late");
+    let store = Store::open(&db.0).unwrap();
+    let (first, second, dest) = (call("M0BBB"), call("M0DDD"), call("M0CCC"));
+    store.enqueue(id(1), b"mail", dest, 0, 100_000).unwrap();
+    let hand = |to, now, eta| {
+        assert!(store.set_next_hop(id(1), to).unwrap());
+        assert!(store
+            .custody_transferred(
+                id(1),
+                CustodyHandoff {
+                    next_hop: to,
+                    receipt_verified: true,
+                    by: "radio",
+                    now,
+                    grace_secs: 60,
+                    suspect_secs: 600,
+                    eta,
+                    answered: true,
+                },
+            )
+            .unwrap());
+    };
+    hand(first, 200, 300);
+    assert_eq!(
+        store
+            .reclaim_custody(id(1), 900, "custody suspect; reclaiming")
+            .unwrap(),
+        ReclaimOutcome::Requeued
+    );
+    hand(second, 1_000, 1_100);
+    assert!(store.e2e_delivered(id(1), id(2), dest, 5_000).unwrap());
+    assert_eq!(
+        store.take_custody_outcomes().unwrap(),
+        vec![CustodyOutcome {
+            id: id(1),
+            custodian: first,
+            expected_at: 300,
+            delivered_at: 5_000,
+        }]
+    );
 }
 
 #[test]
@@ -637,6 +703,84 @@ fn final_delivery_and_e2e_receipt_queue_are_atomic_and_idempotent() {
     assert_eq!(store.list(Direction::In, 10).unwrap().len(), 1);
     assert_eq!(store.list(Direction::Out, 10).unwrap().len(), 1);
     assert_eq!(store.due(100).unwrap()[0].id, id(2));
+}
+
+/// A message received again was sent again because its sender never saw the
+/// receipt: it is answered again, but only once the first receipt is no
+/// longer on its way.
+#[test]
+fn a_duplicate_is_answered_again_once_the_first_receipt_is_gone() {
+    let db = TempDb::new("answer-again");
+    let store = Store::open(&db.0).unwrap();
+    let origin = call("M0AAA");
+    let received = ReceivedMessage {
+        id: id(1),
+        object: b"message",
+        from: origin,
+        verified: true,
+        wire_seq: None,
+    };
+    let reply = |n| QueuedMessage {
+        id: id(n),
+        object: b"receipt",
+        to: origin,
+        precedence: 1,
+        expires_at: 100_000,
+        max_hops: 8,
+    };
+    assert!(store.receive_with_reply(received, reply(2), 100).unwrap());
+    // Still queued: the second copy gets no second receipt.
+    assert!(!store.receive_with_reply(received, reply(3), 200).unwrap());
+    assert!(store.record(id(3)).unwrap().is_none());
+    // The first receipt handed on and done with: the next copy is answered.
+    assert!(store
+        .custody_transferred(
+            id(2),
+            CustodyHandoff {
+                next_hop: origin,
+                receipt_verified: true,
+                by: "radio",
+                now: 300,
+                grace_secs: 60,
+                suspect_secs: 600,
+                eta: 300,
+                answered: false,
+            },
+        )
+        .unwrap());
+    assert_eq!(store.record(id(2)).unwrap().unwrap().state, State::Delivered);
+    assert!(!store.receive_with_reply(received, reply(4), 400).unwrap());
+    assert_eq!(store.record(id(4)).unwrap().unwrap().state, State::Queued);
+    assert_eq!(store.list(Direction::In, 10).unwrap().len(), 1);
+}
+
+/// Nothing answers a receipt end to end: handed to a custodian, it is that
+/// custodian's, and no suspect timer brings it back.
+#[test]
+fn an_unanswered_handoff_ends_with_custody() {
+    let db = TempDb::new("unanswered");
+    let store = Store::open(&db.0).unwrap();
+    let (relay, dest) = (call("M0BBB"), call("M0CCC"));
+    store.enqueue(id(1), b"receipt", dest, 1, 0).unwrap();
+    assert!(store.set_next_hop(id(1), relay).unwrap());
+    assert!(store
+        .custody_transferred(
+            id(1),
+            CustodyHandoff {
+                next_hop: relay,
+                receipt_verified: true,
+                by: "radio",
+                now: 100,
+                grace_secs: 60,
+                suspect_secs: 600,
+                eta: 100,
+                answered: false,
+            },
+        )
+        .unwrap());
+    let record = store.record(id(1)).unwrap().unwrap();
+    assert_eq!(record.state, State::DeliveredUnconfirmed);
+    assert!(store.suspect_due(10_000).unwrap().is_empty());
 }
 
 #[test]
@@ -784,6 +928,8 @@ fn a_receipt_passing_through_closes_the_relay_holding_it_answers() {
                 now: 110,
                 grace_secs: 50,
                 suspect_secs: 30,
+                eta: 0,
+                answered: true,
             }
         )
         .unwrap());

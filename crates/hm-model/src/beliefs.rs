@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use hm_core::DetRng;
 use hm_wire::Callsign;
 
-use crate::custodian::{CustodianModel, CustodianObservation, CustodianPrior};
+use crate::custodian::{CustodianModel, CustodianObservation, CustodianPrior, HandedOver};
 use crate::erasure::Erasure;
 use crate::evidence::Prior;
 use crate::link::{LinkModel, LinkObservation, LinkPrior, SampledLink};
@@ -211,24 +211,17 @@ impl Beliefs {
 
     /// How long to wait for an end-to-end receipt from a message handed to
     /// `custodian` before reclaiming it (see [`CustodianModel::suspect_after`]).
-    #[allow(clippy::too_many_arguments)]
     pub fn suspect_after(
         &self,
         custodian: Callsign,
-        downstream: f64,
-        alternative: f64,
-        value: f64,
-        remaining: u64,
+        handed: &HandedOver,
         bounds: (u64, u64),
         now: u64,
     ) -> u64 {
         let default = CustodianModel::default();
         self.custodians.get(&custodian).unwrap_or(&default).suspect_after(
             &self.custodian_prior,
-            downstream,
-            alternative,
-            value,
-            remaining,
+            handed,
             bounds,
             now,
         )
@@ -333,16 +326,19 @@ impl Beliefs {
         Ok(())
     }
 
-    /// Re-estimate the population prior of `bearer`'s links: their typical
-    /// chance of being open, averaged over links, and the pooled handoff and
-    /// frame-loss rates, each shrunk toward the hyperprior.
+    /// Re-estimate the population prior of `bearer`'s links: how many are
+    /// within reach, how often those are open, averaged over links (each
+    /// counted by its chance of being within reach), and the pooled handoff
+    /// and frame-loss rates, each shrunk toward the hyperprior.
     fn refit_link_prior(&mut self, bearer: Bearer, now: u64) {
         let hyper = LinkPrior::for_bearer(bearer);
-        let (mut links, mut open) = (0.0, 0.0);
+        let (mut links, mut in_reach, mut open) = (0.0, 0.0, 0.0);
         let (mut ok, mut failed, mut lost, mut got) = (0.0, 0.0, 0.0, 0.0);
         for (_, link) in self.links.iter().filter(|(k, _)| k.bearer == bearer) {
+            let reach = link.reachable();
             links += 1.0;
-            open += daily_open(link, now);
+            in_reach += reach;
+            open += reach * daily_open(link, now);
             let (y, n) = link.handoff_counts(now);
             ok += y;
             failed += n;
@@ -357,7 +353,8 @@ impl Beliefs {
             )
         };
         self.link_priors[bearer.index()] = LinkPrior {
-            p_open: (open + HYPER_WEIGHT * hyper.p_open) / (links + HYPER_WEIGHT),
+            reachable: (in_reach + HYPER_WEIGHT * hyper.reachable) / (links + HYPER_WEIGHT),
+            p_open: (open + HYPER_WEIGHT * hyper.p_open) / (in_reach + HYPER_WEIGHT),
             handoff: pooled(ok, ok + failed, hyper.handoff),
             erasure: pooled(lost, lost + got, hyper.erasure),
             ..hyper
