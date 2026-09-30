@@ -180,3 +180,32 @@ fn handoff_chances_are_checked_against_outcomes() {
     }
     assert!((restored.link_success(dead, now, now) - after).abs() < 1.0e-12);
 }
+
+/// Each observation is recorded with what it did: a beacon heard makes a
+/// handoff likelier, a failed one less likely; the record keeps the latest
+/// of each kind only, so that a flood of one kind (beacons missed) does not
+/// push out the rest.
+#[test]
+fn the_journal_shows_evidence_moving_the_chances() {
+    let mut beliefs = Beliefs::new();
+    let k = key("M0ME", "M0AAA", Bearer::Radio);
+    beliefs.observe_link(k, 100, LinkObservation::Heard);
+    beliefs.observe_link(k, 200, LinkObservation::Handoff { ok: false });
+    let updates: Vec<&Update> = beliefs.journal().collect();
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[0].subject, Subject::Link(k.path()));
+    assert_eq!(updates[0].observed, Observed::Link(LinkObservation::Heard));
+    assert!(updates[0].after > updates[0].before, "{:?}", updates[0]);
+    assert!(updates[1].after < updates[1].before, "{:?}", updates[1]);
+    for t in 0..(JOURNAL_LEN as u64 + 10) {
+        beliefs.observe_custodian(call("M0AAA"), 300 + t, CustodianObservation::Accepted);
+    }
+    assert_eq!(beliefs.journal().count(), JOURNAL_LEN + 2);
+    let first = beliefs.journal().next().unwrap();
+    assert_eq!(first.observed, Observed::Link(LinkObservation::Heard));
+    let last = beliefs.journal().next_back().unwrap();
+    assert_eq!(
+        (last.at, last.subject),
+        (300 + JOURNAL_LEN as u64 + 9, Subject::Custodian(call("M0AAA")))
+    );
+}
