@@ -31,7 +31,11 @@ impl Node {
         let record = self.store.record(id).ok().flatten();
         let at_destination = record.as_ref().is_some_and(|r| r.final_destination() == peer);
         let origin = record.as_ref().is_some_and(|r| r.direction == Direction::Out);
-        let eta = flight.route.arrival.max(now);
+        // The receipt is due back once the message has arrived and the
+        // receipt has made the trip back, which runs over the same paths
+        // (propagation is reciprocal) and takes about as long.
+        let arrival = flight.route.arrival.max(now);
+        let eta = arrival.saturating_add(arrival - now);
         let handed = HandedOver {
             downstream: flight.downstream,
             alternative: if at_destination { 0.0 } else { flight.alternative },
@@ -78,7 +82,7 @@ impl Node {
     }
 
     /// End-to-end receipts for messages a custodian took: how late past the
-    /// planned arrival, and that the custodian did its part.
+    /// time the receipt was due back, and that the custodian did its part.
     pub(super) fn take_custody_outcomes(&mut self) {
         match self.store.take_custody_outcomes() {
             Ok(outcomes) => {

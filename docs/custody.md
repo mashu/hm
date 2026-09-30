@@ -30,7 +30,7 @@ an unverified one never moves custody.
   G(τ) = V·L·a·u(τ) − A·(L + p·S(τ))
   ```
 
-  Resending at `τ` past the route's planned arrival rescues a lost message
+  Resending at `τ` past the time the receipt was due rescues a lost message
   (probability `L = 1 − p`, with `p` the custodian's chance of doing its part
   times the rest of the route's) by the other way (chance `a`), worth `V`
   copies scaled by `u(τ)`, the value left at `τ`; it costs a copy's airtime
@@ -39,6 +39,14 @@ an unverified one never moves custody.
   maximises `G`; when nothing makes it positive the origin does not resend.
   Waiting pays while receipts are still likely to arrive, and stops paying
   as the rescue loses value.
+
+  The receipt is due once the message has arrived, as the route planned,
+  and the receipt has come back, which it does over the same paths
+  (propagation is reciprocal) and in about as long. Counting from the
+  planned arrival alone, with an hour's slack, was right for five stations
+  and wrong for twenty: receipts that took most of a day to come back
+  across a sparse network looked lost, the origins resent 666 times for 160
+  messages, and the copies crowded out the rest.
 - **A relay's part ends** with the next custodian's verified custody
   receipt. Relays never see the end-to-end receipt (it goes back to the
   origin, not through them), so a timer at every relay could only resend
@@ -88,7 +96,7 @@ one is no longer on its way, so duplicates do not multiply receipts.
 ## Learning from outcomes
 
 When the end-to-end receipt arrives, the origin records how late it was
-against the route's plan, and credits the first custodian it handed to (its
+against the time it was due, and credits the first custodian it handed to (its
 copy had the head start), even if custody was reclaimed meanwhile. When a
 timer fires, the silence is recorded as censored evidence: the custodian
 takes only its share of the blame. See [models](models.md#custodians).

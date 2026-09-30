@@ -25,6 +25,9 @@ openings. `cargo run --release -p hm-node --example hf_days -- 7 4 10`
 | receding horizon, relays around the origin | 240 / 240 | 1.7 h / 16.1 h | 8.3 % |
 | relays release at handoff, expected airtime, 32-byte HF symbols | 240 / 240 | 2.1 h / 15.1 h | 7.4 % |
 | relays plan on the mean | 240 / 240 | 1.7 h / 15.9 h | 6.6 % |
+| departures on hearing the next hop | 240 / 240 | 1.5 h / 14.4 h | 6.8 % |
+| the open state followed through a transfer, stopping to wait for the peer | 240 / 240 | 1.8 h / 15.2 h | 6.4 % |
+| the receipt due after the trip there and back | 240 / 240 | 1.7 h / 16.0 h | 6.2 % |
 
 Where the airtime went in the first run: data 27 %, session opens 19 %,
 mostly attempts into closed paths. Now: beacons 3.4 %, data about 2 %,
@@ -38,43 +41,67 @@ is each station's neighbourhood (its own frames and those of the stations it
 has a path to), mean and worst; beacon, control and data are seconds on the
 air per station per hour.
 
-`cargo run --release -p hm-node --example hf_scale -- 5,10,20,40 4 800 4 1`
+`cargo run --release -p hm-node --example hf_scale -- 5,10,20 4 800 4 1`
 (all within 800 km: every pair has a path at some hours)
 
 | Stations | Delivered | Latency p50 / p90 | Busy, mean / worst | Beacon | Control | Data |
 | --- | --- | --- | --- | --- | --- | --- |
-| 5 | 40 / 40 | 3.0 h / 7.6 h | 7.8 % / 7.8 % | 23.9 s | 16.7 s | 15.9 s |
-| 10 | 80 / 80 | 3.8 h / 14.8 h | 27.6 % / 27.6 % | 16.1 s | 41.8 s | 41.5 s |
+| 5 | 40 / 40 | 2.8 h / 12.0 h | 8.4 % / 8.4 % | 23.6 s | 18.7 s | 18.2 s |
+| 10 | 80 / 80 | 7.3 h / 17.8 h | 24.5 % / 24.5 % | 16.2 s | 36.1 s | 35.9 s |
+| 20 | 158 / 160 | 13.6 h / 32.2 h | 91.5 % / 91.5 % | 7.9 s | 75.9 s | 80.9 s |
 
-`... -- 5,10,20,40 4 0 4 1` (the square grows with the network, 360 km × √n)
+`... -- 5,10,20 4 0 4 1` (the square grows with the network, 360 km × √n)
 
 | Stations | Delivered | Latency p50 / p90 | Busy, mean / worst | Beacon | Control | Data |
 | --- | --- | --- | --- | --- | --- | --- |
-| 5 | 40 / 40 | 2.8 h / 13.7 h | 8.2 % / 8.2 % | 24.1 s | 17.8 s | 17.1 s |
-| 10 | 78 / 80 | 7.3 h / 37.6 h | 46.3 % / 51.3 % | 16.0 s | 83.7 s | 85.1 s |
+| 5 | 40 / 40 | 3.1 h / 33.2 h | 7.7 % / 7.7 % | 24.2 s | 15.5 s | 15.6 s |
+| 10 | 80 / 80 | 9.1 h / 38.1 h | 28.7 % / 31.3 % | 16.8 s | 48.2 s | 47.6 s |
+| 20 | 121 / 160 | 17.9 h / 54.5 h | 53.3 % / 82.2 % | 13.6 s | 70.0 s | 73.4 s |
 
-The ten-station dense network went from 78 % busy to 28 % over the changes
-of this round: relays stopped resending what was delivered (their timers
-could only fire on messages whose receipt went back to the origin, not
-through them), stopped copying each other's holdings over the radio, and
-stopped passing messages from relay to relay on the strength of a lucky
-draw. Beacons take less airtime per station as the network grows.
+Over this round the ten-station networks went from 27.6 % busy (dense)
+and 46.3 % (sparse) to 24.5 % and 28.7 %, and the sparse twenty from 104
+delivered at 76 % busy (124 % at the worst station, frames overlapping) to
+121 at 53 %: planning that scales (a four-day run of twenty stations took
+more than twenty minutes, now three to eight), senders that stop probing a
+path gone quiet, and origins that no longer resend what is only slow. (The
+dense twenty was measured just before the last of these.) Beacons take less airtime per
+station as the network grows.
+
+**How long the transmitter is keyed.** A station's transmitter is on
+about 1 % of the time in the Baltic week (some 45 s an hour) and 3 % in the
+sparse ten, in many short key-ups: median 4.5–5 s (mostly beacons), 90th
+percentile about 8 s, longest about 33 s (a full burst of 16 two-second
+frames at 300 bd). The seconds-per-hour columns above are sums over an
+hour, not single transmissions; "busy" counts every station a station
+hears, not its own transmitter.
 
 ### What is still wrong
 
-- **Long, lossy paths.** In the sparse network 57 % of attempts end in no
-  answer, and fading loses more data airtime (10 % of the channel) than gets
-  through (6.8 %). Paths of 600–1,000 km at 12 ± 3 dB and 1 Hz Doppler are
-  hard at 300 bd; the handoff estimates on them run optimistic.
+- **Two-hop horizon.** Beacons tell each station of its two-hop
+  neighbourhood only. In the sparse twenty, where most pairs are three to
+  five hops apart, stations beyond that guess: they try the destination
+  directly or a relay that might hear it, and the 39 messages not delivered
+  were each tried by up to eight stations, none of which could reach the
+  destination. What is missing is a bounded summary of who reaches whom,
+  spread within the control budget (a probabilistic distance vector).
+- **A dense channel of twenty.** Twenty stations sharing one 300 bd channel
+  keep it busy 90 % of the time: about as much data airtime is lost to
+  fades and collisions as gets through. Carrier sense persistence is fixed
+  (p = 0.25), where the number of stations contending is known and could
+  set it.
+- **300 bd AFSK is a poor HF mode.** It has no forward error correction of
+  its own and its symbols are short against multipath. The simulated
+  numbers are for it because it can be simulated; on the air, HF traffic
+  belongs on an ARQ modem (VARA HF, ARDOP), which hm-net supports as a
+  bearer ([modems](operating/modems.md)).
+- **Key-ups up to half a minute.** Bursts of 16 frames and frames queued
+  behind one another can keep the transmitter on for 30 s at 300 bd; a cap
+  on a single key-up, with a rest after it, belongs in the radio layer.
 - **One symbol size for every path.** 32-byte symbols suit fading paths and
   are slower on good ones (see below); the size should follow each path's
   loss belief ([transfer](transfer.md#frame-and-symbol-sizes)).
 - **Receipts are messages.** An end-to-end receipt is routed like any
-  message, and on a busy HF network can take hours to reach the origin,
-  whose timer may fire first.
-- **Two-hop horizon.** Beacons tell each station of its two-hop
-  neighbourhood only; beyond that it guesses, through relays that may know
-  more.
+  message, and on a busy HF network can take hours to reach the origin.
 
 ## Transfers
 

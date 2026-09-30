@@ -10,7 +10,8 @@
 //! `world::scattered`); a fixed side packs more stations into the same
 //! channel as the network grows, `0` grows the square with the network so
 //! that each station keeps about as many neighbours. Each station sends the
-//! same number of messages a day whatever the size.
+//! same number of messages a day whatever the size. `HM_UNDELIVERED=1` lists
+//! the messages not delivered; `HM_LOG` and `HM_TRACE` work as in `hf_days`.
 
 #[path = "../tests/support/world.rs"]
 mod world;
@@ -101,6 +102,19 @@ fn main() {
             .map(|((kind, fate), (_, ms))| format!("{kind} {fate} {:.1}%", *ms as f64 / 10.0 / seconds))
             .collect();
         println!("    unicast airtime by fate: {}", fates.join(", "));
+        let (p50, p90, longest) = outcome.keyup_secs();
+        println!("    key-ups: p50 {p50:.1} s, p90 {p90:.1} s, longest {longest:.1} s");
+        if std::env::var("HM_UNDELIVERED").is_ok() {
+            for m in outcome.sent.iter().filter(|m| m.delivered_after.is_none()) {
+                let id: String = m.id.0[..6].iter().map(|b| format!("{b:02x}")).collect();
+                println!(
+                    "    not delivered: {id} {} -> {} queued at {} h",
+                    scenario.stations[m.from],
+                    scenario.stations[m.to],
+                    m.at / 3600
+                );
+            }
+        }
         if outcome.possible() < outcome.sent.len() {
             println!(
                 "    ({} of {} were possible at all)",

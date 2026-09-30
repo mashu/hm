@@ -91,6 +91,8 @@ What they print:
   the station a frame was for: delivered, lost to a fade (`LostChannel`),
   to a collision, to the receiver's own transmitter, or `Unheard` (no path
   to it then).
+- **key-ups**: how long each station's transmitter stays on at a time,
+  median, 90th percentile and longest.
 
 Two short scenarios run in CI (`crates/hm-node/tests/days.rs`): a station
 reaching one it never hears through a neighbour, and reproducibility (the

@@ -6,22 +6,25 @@
 //! ```text
 //! a_n  = P(accepts custody | the handoff reached it)      Beta, fading evidence
 //! r_n  = P(does its part | it accepted)                    Beta, fading evidence
-//! ℓ    = how late the end-to-end receipt comes back, past the time the
-//!        route planned the message to arrive (the way back, and any slip):
+//! ℓ    = how late the end-to-end receipt comes back, past the time it was
+//!        due: the route's planned arrival, and as long again for the
+//!        receipt's trip back over the same paths:
 //!        ln max(ℓ, 1 min) ~ N(μ, 1/λ),  (μ, λ) ~ Normal-Gamma   fading statistics
 //! ```
 //!
-//! Measuring from the route's own arrival, not from the handoff, keeps what
+//! Measuring from when the receipt was due, not from the handoff, keeps what
 //! the router already knows out of the custodian's account: a route that
-//! waits for the morning opening is not a slow custodian.
+//! waits for the morning opening is not a slow custodian, and a receipt that
+//! comes back across a large network as slowly as the message went is not
+//! late.
 //!
 //! A message handed to `n` reaches its destination with probability `r_n q`,
 //! where `q` is the rest of the route's chance, which the router predicted.
-//! No receipt yet, `ℓ` past the planned arrival, is a mixture: `n` dropped
+//! No receipt yet, `ℓ` past when it was due, is a mixture: `n` dropped
 //! it (weight `1 − r_n`), the rest of the way failed (`r_n (1 − q)`), or
 //! the receipt is still on its way (`r_n q (1 − F(ℓ))`). Assumed density
 //! filtering gives `n` only its share of the blame,
-//! `(1 − r_n) / (1 − r_n q F(ℓ))`: silence soon after the planned arrival
+//! `(1 − r_n) / (1 − r_n q F(ℓ))`: silence soon after the receipt was due
 //! says little, since receipts are often later than that. (Counting it as a
 //! loss outright would teach that custodians drop what they only delay, and
 //! reclaim ever sooner.) A receipt that comes after all, even after custody
@@ -79,8 +82,8 @@ impl Default for CustodianPrior {
         CustodianPrior {
             accepts: Prior::new(0.9, 2.0),
             delivers: Prior::new(0.8, 2.0),
-            // A receipt comes back about an hour after the planned arrival,
-            // give or take a factor of four.
+            // A receipt comes back about an hour after it was due, give or
+            // take a factor of four.
             delay_mean: log(3_600.0),
             delay_count: 1.0,
             delay_shape: 2.0,
@@ -103,9 +106,9 @@ pub enum CustodianObservation {
     /// It is busy for `retry_after` seconds.
     Busy { retry_after: u64 },
     /// An end-to-end receipt came back for a message it took, `late_secs`
-    /// past the time the route planned the message to arrive.
+    /// past the time it was due ([`HandedOver::expected_secs`]).
     Delivered { late_secs: u64 },
-    /// No receipt has come back `late_secs` past the planned arrival, and
+    /// No receipt has come back `late_secs` past the time it was due, and
     /// custody was reclaimed; the rest of the route beyond it had chance
     /// `downstream`.
     Silent { downstream: f64, late_secs: u64 },
@@ -120,7 +123,8 @@ pub struct HandedOver {
     pub alternative: f64,
     /// A delivered message's worth, in copies sent.
     pub value: f64,
-    /// Seconds from the handoff to the route's planned arrival.
+    /// Seconds from the handoff until the end-to-end receipt is due back:
+    /// the route's planned arrival, and the receipt's trip back.
     pub expected_secs: u64,
     /// Seconds from the handoff until the message expires.
     pub remaining_secs: u64,
@@ -231,7 +235,7 @@ impl CustodianModel {
     }
 
     /// Chance a receipt for a message it took has come back by `late_secs`
-    /// past the planned arrival.
+    /// past the time it was due.
     pub fn delay_cdf(&self, prior: &CustodianPrior, late_secs: u64, now: u64) -> f64 {
         let (nu, m, s) = self.delays.predictive(prior, now);
         math::student_t_cdf((log(late_secs.max(1) as f64) - m) / s, nu)
@@ -265,7 +269,7 @@ impl CustodianModel {
     }
 
     /// How long after a handoff to wait for the end-to-end receipt before
-    /// reclaiming custody: the planned arrival, then the lateness `τ` in
+    /// reclaiming custody: when the receipt was due, then the lateness `τ` in
     /// `bounds` that maximises the expected gain of resending (module docs).
     /// Waits to the end of `bounds` when resending never pays.
     pub fn suspect_after(
@@ -353,7 +357,7 @@ mod tests {
 
     /// Receipts that come about two hours late teach the lateness; the
     /// suspect time lands past most of them, earlier for a custodian that
-    /// often drops, and never before the route's planned arrival.
+    /// often drops, and never before the receipt is due.
     #[test]
     fn suspect_time_follows_the_plan_the_lateness_and_the_reliability() {
         let prior = CustodianPrior::default();
@@ -395,7 +399,7 @@ mod tests {
     }
 
     /// Reclaiming early and counting it a loss would feed on itself: silence
-    /// soon after the planned arrival barely moves the belief, and the
+    /// soon after the receipt was due barely moves the belief, and the
     /// receipts that come late after all are learned from.
     #[test]
     fn early_silence_does_not_teach_that_a_slow_custodian_drops() {

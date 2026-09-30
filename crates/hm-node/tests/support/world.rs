@@ -109,11 +109,24 @@ pub struct Outcome {
     /// `LostCollision`, ..., or `Unheard`: no path to it then): (frames,
     /// milliseconds).
     pub fates: BTreeMap<(String, String), (u64, u64)>,
+    /// With [`Scenario::log`]: how long each key-up lasted (the transmitter
+    /// on from its first frame's start to its last frame's end), ms.
+    pub keyups: Vec<u64>,
 }
 
 impl Outcome {
     pub fn delivered(&self) -> usize {
         self.sent.iter().filter(|s| s.delivered_after.is_some()).count()
+    }
+
+    /// Key-up lengths: median, 90th percentile and longest, seconds.
+    pub fn keyup_secs(&self) -> (f64, f64, f64) {
+        let at = |p: f64| {
+            self.keyups
+                .get(((self.keyups.len().max(1) - 1) as f64 * p).round() as usize)
+                .map_or(0.0, |ms| *ms as f64 / 1_000.0)
+        };
+        (at(0.5), at(0.9), at(1.0))
     }
 
     pub fn possible(&self) -> usize {
@@ -380,6 +393,9 @@ pub fn run(scenario: &Scenario) -> Outcome {
     // fate at the addressee is known.
     let mut unicast: BTreeMap<u64, (String, usize, u64)> = BTreeMap::new();
     let mut fates: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
+    // Each station's key-up under way: (first frame's start, last frame's end).
+    let mut keyed: BTreeMap<usize, (u64, u64)> = BTreeMap::new();
+    let mut keyups = Vec::new();
     for entry in sim.log() {
         match entry {
             hm_sim::LogEntry::Tx {
@@ -387,9 +403,18 @@ pub fn run(scenario: &Scenario) -> Outcome {
                 from,
                 start,
                 end,
+                keyup,
                 data,
                 ..
             } => {
+                match keyed.get_mut(from) {
+                    Some(on) if !*keyup => on.1 = end.0,
+                    _ => {
+                        if let Some((first, last)) = keyed.insert(*from, (start.0, end.0)) {
+                            keyups.push(last - first);
+                        }
+                    }
+                }
                 let (kind, to, dst) = match hm_wire::FrameHeader::decode(data) {
                     Ok((h, _)) => (
                         format!("{:?}", h.ftype),
@@ -430,6 +455,8 @@ pub fn run(scenario: &Scenario) -> Outcome {
             _ => {}
         }
     }
+    keyups.extend(keyed.into_values().map(|(first, last)| last - first));
+    keyups.sort_unstable();
     for (kind, _, ms) in unicast.into_values() {
         let e = fates.entry((kind, "Unheard".into())).or_insert((0, 0));
         e.0 += 1;
@@ -478,6 +505,7 @@ pub fn run(scenario: &Scenario) -> Outcome {
         wall_secs: wall.elapsed().as_secs_f64(),
         airtime,
         fates,
+        keyups,
         estimates: sim
             .machines()
             .map(|station| (station.me(), station.node().status(EPOCH + end / 1_000).estimates))

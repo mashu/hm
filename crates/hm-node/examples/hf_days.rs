@@ -51,6 +51,8 @@ fn main() {
             .map(|((_, fate), (_, ms))| format!("{fate} {:.1}%", *ms as f64 / 10.0 / seconds))
             .collect();
         println!("        data frames: {}", fates.join(", "));
+        let (p50, p90, longest) = outcome.keyup_secs();
+        println!("        key-ups: p50 {p50:.1} s, p90 {p90:.1} s, longest {longest:.1} s");
         for m in outcome.sent.iter().filter(|m| m.delivered_after.is_none()) {
             println!(
                 "        not delivered: {} {} -> {} queued at {} h",
