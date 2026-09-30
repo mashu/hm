@@ -25,7 +25,11 @@
 //! * CSMA persistence and control-plane sharing: [`ChannelModel`].
 //!
 //! Priors are the population's ([`Beliefs`]): a new link is expected to behave
-//! like the links of its bearer that this station already knows.
+//! like the links of its bearer that this station already knows. And every
+//! handoff chance the beliefs give out is checked against how the station's
+//! handoffs ended ([`Forecast`], [`Beliefs::observe_forecast`]): the station's
+//! own record, in bands of the chance given, corrects the chances where the
+//! models err (Bayesian binning, the bands shrunk toward each other).
 //!
 //! `no_std`: the transfer engine sizes bursts with it on the radio thread.
 
@@ -37,6 +41,7 @@ use hm_wire::{Callsign, ContactBearer};
 use minicbor::{Decode, Encode};
 
 mod beliefs;
+mod calibration;
 mod channel;
 mod custodian;
 pub mod diurnal;
@@ -48,6 +53,7 @@ pub mod math;
 mod openness;
 
 pub use beliefs::{Beliefs, Estimate, Mean, RestoreError, Thompson, FORGET_AFTER, MISS_HORIZON};
+pub use calibration::Forecast;
 pub use channel::{access_wait, ChannelModel, ChannelObservation, CHANNEL_HALF_LIFE, QUIET_BUSY};
 pub use custodian::{CustodianModel, CustodianObservation, CustodianPrior, HandedOver, CUSTODIAN_HALF_LIFE};
 pub use erasure::{broadcast_burst, burst_size, plan_overs, Erasure, OverCost};

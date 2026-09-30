@@ -105,10 +105,11 @@ impl Estimate for Mean<'_> {
 
     fn handoff_if_open(&mut self, link: LinkKey) -> f64 {
         let prior = self.beliefs.link_prior(link.bearer);
-        match self.beliefs.links.get(&link.path()) {
+        let own = match self.beliefs.links.get(&link.path()) {
             Some(model) => model.handoff(prior, self.now).mean(),
             None => prior.handoff.mean,
-        }
+        };
+        self.beliefs.calibrated(link, own)
     }
 }
 
@@ -140,12 +141,8 @@ impl Thompson<'_> {
 
 impl Estimate for Thompson<'_> {
     fn link(&mut self, link: LinkKey, t: u64, stated: Option<f64>) -> f64 {
-        let sampled = self.sampled(link);
-        with_stated(
-            sampled.success(t),
-            self.beliefs.handoff_weight(link, self.now),
-            stated,
-        )
+        let own = self.beliefs.calibrated(link, self.sampled(link).success(t));
+        with_stated(own, self.beliefs.handoff_weight(link, self.now), stated)
     }
 
     fn accepts(&mut self, station: Callsign, t: u64) -> f64 {
@@ -193,6 +190,7 @@ impl Estimate for Thompson<'_> {
     }
 
     fn handoff_if_open(&mut self, link: LinkKey) -> f64 {
-        self.sampled(link).handoff()
+        let own = self.sampled(link).handoff();
+        self.beliefs.calibrated(link, own)
     }
 }

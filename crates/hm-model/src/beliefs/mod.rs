@@ -4,6 +4,8 @@
 //! about all links of the same bearer (all custodians), shrunk toward a weak
 //! hyperprior. A link never seen before is expected to behave like the links
 //! of its kind (empirical Bayes), not like a number written into the code.
+//! The handoff chances given out are checked against how handoffs end, and
+//! recalibrated ([`Calibration`]).
 
 mod estimate;
 mod records;
@@ -15,6 +17,7 @@ use alloc::vec::Vec;
 
 use hm_wire::Callsign;
 
+use crate::calibration::{Calibration, Forecast};
 use crate::custodian::{CustodianModel, CustodianObservation, CustodianPrior, HandedOver};
 use crate::erasure::Erasure;
 use crate::evidence::Prior;
@@ -44,6 +47,8 @@ pub const STATED_STRENGTH: f64 = 2.0;
 enum Subject {
     Link(LinkKey),
     Custodian(Callsign),
+    /// A bearer's calibration, for paths seen open (`true`) or not.
+    Calibration(Bearer, bool),
 }
 
 pub struct Beliefs {
@@ -52,6 +57,9 @@ pub struct Beliefs {
     custodians: BTreeMap<Callsign, CustodianModel>,
     link_priors: [LinkPrior; 3],
     custodian_prior: CustodianPrior,
+    /// By bearer, then by whether the path was seen open: how the handoff
+    /// chances given map to those that come true.
+    calibration: [[Calibration; 2]; 3],
     changed: BTreeSet<Subject>,
     removed: BTreeSet<Subject>,
 }
@@ -69,6 +77,7 @@ impl Beliefs {
             custodians: BTreeMap::new(),
             link_priors: Bearer::ALL.map(LinkPrior::for_bearer),
             custodian_prior: CustodianPrior::default(),
+            calibration: Default::default(),
             changed: BTreeSet::new(),
             removed: BTreeSet::new(),
         }
@@ -153,11 +162,50 @@ impl Beliefs {
 
     /// Chance a handoff over the link completes, started at `t`.
     pub fn link_success(&self, key: LinkKey, t: u64, now: u64) -> f64 {
+        self.calibrated(key, self.model_success(key, t, now))
+    }
+
+    /// The link model's own chance, before calibration.
+    fn model_success(&self, key: LinkKey, t: u64, now: u64) -> f64 {
         let prior = self.link_prior(key.bearer);
         match self.links.get(&key.path()) {
             Some(link) => link.success(prior, t, now),
             None => self.unseen(key.bearer, now).success(prior, t, now),
         }
+    }
+
+    /// Whether the path `key` runs over has been seen open.
+    fn seen(&self, key: LinkKey) -> bool {
+        self.links
+            .get(&key.path())
+            .is_some_and(|link| link.last_open().is_some())
+    }
+
+    /// A handoff chance given for `key`, as it comes true.
+    fn calibrated(&self, key: LinkKey, p: f64) -> f64 {
+        self.calibration[key.bearer.index()][usize::from(self.seen(key))].apply(p)
+    }
+
+    /// The chance for a handoff over `key` starting now, to check against how
+    /// it ends ([`Beliefs::observe_forecast`]).
+    pub fn forecast(&self, key: LinkKey, now: u64) -> Forecast {
+        Forecast {
+            bearer: key.bearer,
+            seen: self.seen(key),
+            chance: self.model_success(key, now, now),
+        }
+    }
+
+    /// A handoff started with `forecast` ended at `at`: `carried` when the
+    /// link carried it, whatever the custodian said (a refusal is an answer).
+    pub fn observe_forecast(&mut self, forecast: Forecast, carried: bool, at: u64) {
+        self.calibration[forecast.bearer.index()][usize::from(forecast.seen)].observe(
+            forecast.chance,
+            carried,
+            at,
+        );
+        self.changed
+            .insert(Subject::Calibration(forecast.bearer, forecast.seen));
     }
 
     /// Weight of this station's own handoff evidence on the link.

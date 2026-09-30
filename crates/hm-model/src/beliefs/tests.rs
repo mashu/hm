@@ -141,3 +141,42 @@ fn stated_probabilities_yield_to_evidence() {
     let informed = beliefs.mean(now).link(k, now, Some(0.95));
     assert!(informed < 0.3, "{informed}");
 }
+
+/// Handoffs over a path never heard, given a few percent, that never
+/// complete teach the station to give such paths less; paths it has heard
+/// keep their chances, and the lesson survives a restart.
+#[test]
+fn handoff_chances_are_checked_against_outcomes() {
+    let mut beliefs = Beliefs::new();
+    let (dead, good) = (
+        key("M0ME", "M0AAA", Bearer::Radio),
+        key("M0ME", "M0BBB", Bearer::Radio),
+    );
+    beliefs.observe_link(dead, 0, LinkObservation::Missed);
+    let now = 600;
+    let given = beliefs.link_success(dead, now, now);
+    let forecast = beliefs.forecast(dead, now);
+    for n in 0..300 {
+        beliefs.observe_forecast(forecast, false, now + n);
+    }
+    for n in 0..300 {
+        let heard = Forecast {
+            bearer: Bearer::Radio,
+            seen: true,
+            chance: 0.8,
+        };
+        beliefs.observe_forecast(heard, n % 5 != 0, now + n);
+    }
+    let after = beliefs.link_success(dead, now, now);
+    assert!(after < given / 3.0, "{given} -> {after}");
+    beliefs.observe_link(good, now, LinkObservation::Heard);
+    assert!(beliefs.link_success(good, now, now) > 0.5);
+    // Other bearers learned nothing.
+    let modem = key("M0ME", "M0AAA", Bearer::Modem);
+    assert!((beliefs.link_success(modem, now, now) - beliefs.forecast(modem, now).chance).abs() < 1.0e-12);
+    let mut restored = Beliefs::new();
+    for (k, v) in beliefs.take_changed() {
+        restored.restore(&k, &v.unwrap()).unwrap();
+    }
+    assert!((restored.link_success(dead, now, now) - after).abs() < 1.0e-12);
+}

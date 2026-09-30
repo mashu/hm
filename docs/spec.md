@@ -526,6 +526,9 @@ paths it attests (its origin to the receiver, each station it lists to its
 origin) open at their times, and each becomes a contact in both directions.
 Custodians have a model of their own (acceptance, busy periods, delivery
 onward), and a link never seen starts from its bearer's population prior.
+Every handoff chance is then corrected by the station's record of how the
+chances it gave came true, kept per bearer for paths seen open and paths
+not ([models](models.md#checking-the-chances)).
 
 A route delivers with probability `P = product(p_e)`, each hop's link
 completing and its custodian accepting (and, before the destination, doing its

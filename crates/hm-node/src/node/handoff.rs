@@ -1,6 +1,6 @@
 //! Transfers under way, how they end, and what each ending teaches.
 
-use hm_model::{Bearer, Beliefs, CustodianObservation, LinkKey, LinkObservation};
+use hm_model::{Bearer, Beliefs, CustodianObservation, Forecast, LinkKey, LinkObservation};
 use hm_route::Route;
 use hm_store::Retry;
 use hm_wire::{Callsign, ObjectId};
@@ -21,6 +21,9 @@ pub(crate) struct InFlight {
     pub downstream: f64,
     pub alternative: f64,
     pub expires_at: u64,
+    /// The chance the beliefs gave the first hop, to check against how the
+    /// handoff ends; none for a transfer not planned as a route.
+    pub forecast: Option<Forecast>,
 }
 
 impl InFlight {
@@ -43,6 +46,7 @@ impl InFlight {
             downstream: 1.0,
             alternative: 0.0,
             expires_at: u64::MAX,
+            forecast: None,
         }
     }
 }
@@ -112,13 +116,25 @@ impl Outcome {
 }
 
 /// What a flight's outcome tells the beliefs: the link's part and the
-/// custodian's, each only where it bears.
+/// custodian's, each only where it bears, and whether the link carried it as
+/// often as the chance given for it said (a refusal or a "busy" came back
+/// over the link: carried).
 pub(crate) fn learn(beliefs: &mut Beliefs, me: Callsign, flight: &InFlight, outcome: &Outcome, now: u64) {
     let link = LinkKey {
         from: me,
         to: flight.peer,
         bearer: flight.bearer,
     };
+    let carried = match outcome {
+        Outcome::Delivered | Outcome::Refused { .. } | Outcome::Busy { .. } | Outcome::Unverified(_) => {
+            Some(true)
+        }
+        Outcome::LinkFailed(_) => Some(false),
+        Outcome::Local { .. } => None,
+    };
+    if let (Some(forecast), Some(carried)) = (flight.forecast, carried) {
+        beliefs.observe_forecast(forecast, carried, now);
+    }
     match outcome {
         Outcome::Delivered => {
             beliefs.observe_link(link, now, LinkObservation::Handoff { ok: true });
