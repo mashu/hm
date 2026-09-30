@@ -1,7 +1,11 @@
 # hm-net as a federated, congestion-free, low-latency alternative to Winlink — a critical assessment
 
+> **A snapshot.** This assessment was written against the code at the time and is kept as a record. The current design is described in
+> [the documentation](../README.md); what has changed since is in
+> [results](../results.md).
+
 Assessed on branch `claude/admiring-bell-k8drix`, 2026‑09‑29, after the fixes in
-`CODE_REVIEW.md`. Numbers marked *measured* come from the simulator running the real
+[the code review](code-review.md). Numbers marked *measured* come from the simulator running the real
 protocol code, with the command to reproduce them. Everything else comes from reading the
 code. §6 lists what this round changed; "before" means commit `5ff3fef`.
 

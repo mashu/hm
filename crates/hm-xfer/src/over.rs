@@ -287,6 +287,28 @@ impl Xfer {
         }
     }
 
+    /// Whether a transfer of `need` symbols of `t` bytes to `to` opens with a
+    /// short probe (the OFFER and a symbol or two) rather than a full burst.
+    /// A probe costs its airtime whatever happens and saves the rest of the
+    /// burst when the path turns out closed; opening with the burst saves a
+    /// turnaround (our key-up and the peer's ACK) when it is open. So probe
+    /// when `(1 − P(open)) · (burst − probe) > P(open) · turnaround`, both in
+    /// airtime. A link believed open, as an unknown one is, opens with the
+    /// burst.
+    pub(crate) fn opens_with_probe(&self, to: Callsign, need: u32, t: u16) -> bool {
+        let belief = self.belief(to);
+        if belief.open >= 1.0 {
+            return false;
+        }
+        let frame_air = self.cfg.air(1, self.cfg.data_frame_len(usize::from(t)));
+        let cap = (self.cfg.max_burst as u32).min(self.window(to)).max(1);
+        let burst = hm_model::burst_size(need, cap, &belief.erasure, self.over_cost(frame_air, cap, false));
+        let probe = need.clamp(1, 2).min(burst);
+        let saved = f64::from(burst - probe) * frame_air.0 as f64;
+        let turnaround = (self.cfg.txdelay + self.ack_air()).0 as f64;
+        (1.0 - belief.open) * saved > belief.open * turnaround
+    }
+
     /// After an over that brought no answer: Bayes' rule on whether the link
     /// is open, and whether the next over's chance of being answered is worth
     /// its airtime. An over is answered, if the link is open, when at least

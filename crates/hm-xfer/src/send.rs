@@ -194,7 +194,7 @@ impl Xfer {
             offer_next: true,
             open_next: !p.broadcast && self.cfg.sessions && !self.knows(p.to, now),
             need: k,
-            probe: false,
+            probe: !p.broadcast && self.opens_with_probe(p.to, k, t),
             timeouts: 0,
             last_cost: Millis::ZERO,
             sent_last_round: 0,

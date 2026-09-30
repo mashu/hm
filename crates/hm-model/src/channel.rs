@@ -10,10 +10,10 @@
 //!
 //! Forgetting (an hour's half-life) lets both follow the day. The contender
 //! posterior replaces a raw count of stations heard, which jumps with every
-//! beacon, in the decisions that depend on it: how far apart beacons go to
-//! keep the control plane in its share of the channel, and the p-persistence
-//! of CSMA, whose throughput-optimal value for `N` saturated stations is
-//! about `1/N`.
+//! beacon, in the decisions that depend on it: how far apart beacons go and
+//! how the control budget is shared, to keep the control plane in its share
+//! of the channel, and how many listeners a broadcast is sized for. The
+//! occupancy prices airtime and sizes the wait for a clear channel.
 
 use minicbor::{Decode, Encode};
 
@@ -102,13 +102,6 @@ impl ChannelModel {
     pub fn busy(&self, now: u64) -> f64 {
         self.occupancy(now).mean()
     }
-
-    /// KISS persistence byte for p-persistent CSMA: transmit with probability
-    /// `(value + 1) / 256` per clear slot, about `1/N` for `N` stations.
-    pub fn persistence(&self, now: u64) -> u8 {
-        let p = 1.0 / (1.0 + self.contenders(now));
-        (libm::round(p * 256.0) - 1.0).clamp(15.0, 255.0) as u8
-    }
 }
 
 /// Expected wait for a clear channel that others keep busy a share `busy`
@@ -145,18 +138,6 @@ mod tests {
             "{}",
             looked.contenders(3_600)
         );
-    }
-
-    #[test]
-    fn persistence_falls_as_contenders_grow() {
-        let mut quiet = ChannelModel::default();
-        let mut busy = ChannelModel::default();
-        for t in 0..20 {
-            quiet.observe(t, ChannelObservation::Active { stations: 1 });
-            busy.observe(t, ChannelObservation::Active { stations: 20 });
-        }
-        assert!(quiet.persistence(20) > busy.persistence(20));
-        assert!(busy.persistence(20) >= 15);
     }
 
     #[test]

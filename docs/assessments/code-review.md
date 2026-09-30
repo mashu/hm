@@ -1,5 +1,9 @@
 # hm-net — critical design & code review
 
+> **A snapshot.** This review was written against the code at the time and is kept as a record. The current design is described in
+> [the documentation](../README.md); what has changed since is in
+> [results](../results.md).
+
 Reviewed commit `c65ab0d` (branch `main`, up to date with origin) on 2026‑09‑28.
 Scope: whole workspace (13 crates, ~33k LoC Rust), `SPEC.md`, README, CI.
 Toolchain: rustc/cargo 1.94.1.
@@ -20,7 +24,7 @@ tuned for VHF 1200 bd.
 Every fix below is covered by tests that fail on the code before it (checked by
 running them against the old code), and the workspace passes `cargo fmt`, `clippy
 -D warnings` and all 347 tests. A second pass, measuring the protocol against
-Winlink, Meshtastic and others, is in [`PROTOCOL_ASSESSMENT.md`](PROTOCOL_ASSESSMENT.md);
+Winlink, Meshtastic and others, is in [the protocol assessment](protocol.md);
 it found and fixed a control‑plane congestion collapse not listed below.
 
 | Finding | Status | Commit | What changed |

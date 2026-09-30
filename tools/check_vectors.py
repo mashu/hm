@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent check of the SPEC.md test vectors.
+"""Independent check of the docs/spec.md test vectors.
 
 Re-implements base-40 packing and verifies ids and signatures with the
 reference BLAKE3 and libsodium (PyNaCl) implementations, sharing no code with

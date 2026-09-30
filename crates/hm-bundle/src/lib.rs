@@ -83,7 +83,7 @@ impl From<minicbor::decode::Error> for BundleError {
     }
 }
 
-/// One message. CBOR map with integer keys; see `SPEC.md` for the table.
+/// One message. CBOR map with integer keys; see `docs/spec.md` for the table.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 #[cbor(map)]
 pub struct Bundle {

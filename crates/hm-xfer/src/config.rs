@@ -99,11 +99,14 @@ impl Config {
     /// transfer longer, because a sender backing off after missed ACKs goes
     /// quiet for longer on a slow link.
     ///
-    /// On a simulated 300 bd path with Watterson-style fading (0.5 to 1 Hz
-    /// Doppler spread, `hm-sim`'s `Loss::Fading`), 32-byte symbols (2 s
-    /// frames) lost a third less airtime to fades than 64 bytes (3 s), and
-    /// 64 bytes less than 128 or 200: a shorter frame is less likely to meet
-    /// a fade, down to where the header outweighs the symbol. Overs of up to 60 s did better
+    /// A shorter frame is less likely to meet a fade, down to where the
+    /// header outweighs the symbol, so the best size depends on the path. On
+    /// simulated 300 bd paths with Watterson-style fading (`hm-sim`'s
+    /// `Loss::Fading`), 64 bytes did better than 128 or 200 on one path at
+    /// 20 dB and 0.5 Hz Doppler spread; over a week of five stations on
+    /// paths down to 13 dB and 1 Hz, 32 bytes (2 s frames) lost a third less
+    /// airtime to fades than 64 (3 s), and are the default. (Choosing the
+    /// size per path from its loss belief would do better on both.) Overs of up to 60 s did better
     /// than 20 s: fewer key-ups and ACK round trips for the same symbols.
     pub fn for_link(me: Callsign, bitrate_bps: u32, txdelay: Millis) -> Config {
         let mut cfg = Config::vhf_1200(me);

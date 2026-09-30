@@ -10,7 +10,7 @@
 //! - [`ObjectId`]: 32-byte content hash naming bundles, records and attachments.
 //! - [`stream`]: messages on reliable byte streams (internet links, ARQ modems).
 //!
-//! Layouts are specified in `SPEC.md` at the repository root.
+//! Layouts are specified in `docs/spec.md`.
 
 #![cfg_attr(not(test), no_std)]
 

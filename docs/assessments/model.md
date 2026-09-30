@@ -1,5 +1,9 @@
 # hm-net: probabilistic design, architecture and robustness assessment
 
+> **A snapshot.** This assessment, and its plan, were written against the code at the time; its last section records progress on the plan. The current design is described in
+> [the documentation](../README.md); what has changed since is in
+> [results](../results.md).
+
 Scope: every place the stack estimates, predicts or decides under uncertainty;
 whether those parts share one generative story or are separate heuristics;
 code structure; airtime waste; routing and state bugs; and whether tests and
@@ -528,3 +532,57 @@ compares acting now with the best later opening); attempt cost as expected
 airtime priced by the channel's occupancy; stopping silent rounds on the
 posterior (P7's neighbour). `hm-cli/tests/control_load.rs` still copies the
 daemon's control policy by hand; it can now run `Radio` machines instead.
+
+### Second round
+
+Done since: P5 (forecasts), airtime priced by the channel, stopping silent
+transfers on the posterior (P7's neighbour), and the scaling work below.
+The design as it now stands is in the documentation
+([models](../models.md), [routing](../routing.md), [custody](../custody.md));
+the numbers are in [results](../results.md). In order:
+
+- **P5, forecasts.** Every known link can be taken later: departures every
+  15 minutes up to 36 hours ahead, each with the chance the beliefs forecast
+  then, keeping the upper envelope. A route that departs later defers the
+  message until then, or until its first hop is heard, and is planned again
+  every quarter hour while it waits (receding horizon).
+- **Airtime priced by occupancy.** A hop costs its expected airtime,
+  `(bytes · E[1/(1 − ε)] + overhead) · 8 / rate`, at a price per second that
+  grows as `1 / (1 − busy)` with the channel's occupancy. One channel belief,
+  in the radio machine, feeds both the price and the transfer engine.
+- **Silence stops a transfer.** After each unanswered over, the posterior
+  that the path is open falls by the chance of that silence were it open;
+  the transfer ends when another over is worth less than its airtime. On a
+  doubtful path the first over is a short probe.
+- **Holding is an option.** A route is taken only if its expected utility is
+  above zero; the search stops at the first label whose bound is not.
+- **Reach.** A zero-inflated link model: a path never seen open is out of
+  reach with a probability each miss raises. Pairs that never hear each
+  other are ruled out in hours instead of being tried all week.
+- **Custody, done honestly.** The receipt timer runs from the route's
+  planned arrival; silence is censored evidence (blame
+  `(1 − r) / (1 − r·q·F(ℓ))`, not a loss); late receipts are credited, so
+  the delays are learned from slow receipts too. Before this, premature
+  reclaims taught that custodians drop messages, which shortened the timer,
+  which caused more reclaims.
+- **Receipts were resent forever.** Nothing answers a receipt end to end,
+  yet each waited for an answer and was resent at every timeout. Now a
+  receipt's part ends when custody passes. (2,630 reclaims a week before;
+  the channel from 13.8 % busy to 7.7 %.)
+- **Scaling.** With ten stations in reach of one another the channel was
+  78 % busy. Three causes, each a design error rather than a tuning one:
+  every relay ran its own end-to-end timer, though the receipt never passes
+  through relays, so the timers could only resend what was delivered (relays
+  now release at the next custodian's receipt, as in DTN custody transfer,
+  and take a message back on a custody-fail notice); relays pulled each
+  other's holdings over the radio, an epidemic under another name (internet
+  only now); and every relay explored by Thompson sampling, though it never
+  learns how its choice ended, so messages walked from relay to relay (relays
+  plan on the mean; the origin explores). 78 % → 28 %.
+
+Still open: per-path symbol sizes; receipts routed as ordinary messages;
+beacons tell only of two hops; handoff estimates on long fading paths run
+optimistic (57 % of attempts unanswered in the sparse ten-station network);
+P8 (beacon diet) and P10 (CSMA persistence from the channel model, which
+needs the TNC's persistence to follow it, and the simulator's CSMA to be
+set by the station).
