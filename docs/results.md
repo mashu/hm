@@ -177,7 +177,16 @@ kept.
   the sparse twenty much the same at 1/16 and 1/2. Most are between stations
   that cannot hear each other at that hour (their path is closed) sending
   to one that hears both. Setting persistence from the number of stations
-  contending, as planned, would not help.
+  contending, as planned, would not help. Nor did virtual carrier sense:
+  receivers giving their sender's next over its airtime in the ACK's
+  credit field, and stations that heard an ACK or an over between two others
+  holding their own overs, beacons and control frames until the next turn
+  was done. The dense twenty stayed at 158 delivered with 20.1 % of the time
+  in collisions (83.1 % busy), the sparse twenty went to 130 at 9.3 %
+  (46.4 %): within what one seed varies. A frame spoils reception at a
+  station that it reaches at all, and on these paths a third station
+  decodes only a small share of the ACKs it could spoil, so it seldom knows
+  to keep quiet. Not kept.
 - **300 bd AFSK is a poor HF mode.** It has no forward error correction of
   its own and its symbols are short against multipath. The simulated
   numbers are for it because it can be simulated; on the air, HF traffic

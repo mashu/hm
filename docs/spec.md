@@ -72,7 +72,7 @@ Receivers drop frames with an unknown version or type.
 | 0 | 2 | symbols still needed for the current object; 0 = done, 0xFFFF = send the OFFER again |
 | 2 | 1 | received SNR in dB, signed; −128 = unknown |
 | 3 | 1 | suggested modem mode for the peer; 255 = none |
-| 4 | 2 | airtime credit for the peer until the next ACK, ms |
+| 4 | 2 | airtime credit for the peer until the next ACK, ms; 0 = none (stations send 0 and ignore it: reserved) |
 | 6 | 1 | n, number of completed-object prefixes (≤ 16) |
 | 7 | 8n | first 8 bytes of each completed object id |
 | 7 + 8n | 64 | optional receipt: the receiver's Ed25519 signature (section 7); present exactly when the payload is 64 bytes longer |
