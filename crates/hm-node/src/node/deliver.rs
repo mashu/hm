@@ -334,18 +334,27 @@ impl Node {
             airtime_price: self.settings.costs.airtime(self.channel_busy),
             ..RoutingPolicy::default()
         };
-        // Plan with one draw from the beliefs: links little is known about
-        // get tried in proportion to the chance that they are the best. A
-        // draw in which nothing is worth trying holds the message only when
-        // the beliefs on average agree: a link as likely out of reach as
-        // not is still worth one try when its airtime is cheap.
-        self.plans += 1;
-        let mut draw = self.beliefs.thompson(self.rng.fork(self.plans), now);
-        let planned = match plan_routes(&self.graph, &mut draw, &request, policy) {
-            Err(RouteError::NotWorthIt) => {
-                plan_routes(&self.graph, &mut self.beliefs.mean(now), &request, policy)
+        // The origin plans with one draw from the beliefs: links and
+        // custodians little is known about get tried in proportion to the
+        // chance that they are the best, and the end-to-end receipt, or its
+        // absence, teaches it which were. A draw in which nothing is worth
+        // trying holds the message only when the beliefs on average agree: a
+        // link as likely out of reach as not is still worth one try when its
+        // airtime is cheap. A relay never learns how its choice ended, so it
+        // has nothing to explore for: it plans on the beliefs as they are.
+        // (Each relay drawing afresh among many would pass the message on to
+        // whichever looked best in its draw, hop after hop.)
+        let planned = if r.direction == Direction::Out {
+            self.plans += 1;
+            let mut draw = self.beliefs.thompson(self.rng.fork(self.plans), now);
+            match plan_routes(&self.graph, &mut draw, &request, policy) {
+                Err(RouteError::NotWorthIt) => {
+                    plan_routes(&self.graph, &mut self.beliefs.mean(now), &request, policy)
+                }
+                planned => planned,
             }
-            planned => planned,
+        } else {
+            plan_routes(&self.graph, &mut self.beliefs.mean(now), &request, policy)
         };
         let plan = match planned {
             Ok(plan) => plan,
