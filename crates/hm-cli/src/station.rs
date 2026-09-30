@@ -12,7 +12,7 @@ use hm_bundle::{Address, Bundle, BundleError, Kind, Precedence, SignedBundle};
 use hm_core::{DetRng, Millis};
 use hm_ident::Identity;
 use hm_wire::Callsign;
-use hm_xfer::{Command, Config, Event, Failure, Receipt, Xfer};
+use hm_xfer::{Command, Event, Failure, Receipt, Xfer};
 
 use crate::driver::{run, End, Flow, Link};
 use crate::files::{KeyFile, Trust};
@@ -52,11 +52,9 @@ pub use hm_node::utc_clock;
 impl Station<'_> {
     /// Transfer engine for this station, trusting every trusted key.
     pub fn engine(&self) -> io::Result<Xfer> {
-        // Symbols and overs sized for the link's rate: an HF link at 300 bd
-        // gets small symbols and short overs, not the VHF 1200 ones.
-        let mut cfg = Config::for_link(self.me, self.timing.bitrate_bps, Millis(self.timing.txdelay_ms));
-        cfg.ack_guard = Millis(self.timing.guard_ms);
-        cfg.max_rounds = self.timing.max_rounds;
+        // Symbols and overs sized for the link's rate (an HF link at 300 bd
+        // gets small symbols and short overs), key-ups no longer than allowed.
+        let cfg = self.timing.engine_config(self.me);
         let mut xfer = Xfer::new(cfg, Identity::from_secret(self.key.identity.secret()), rng())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         for (call, key) in self.trust.iter() {

@@ -36,6 +36,7 @@ const FAST: LinkTiming = LinkTiming {
     txdelay_ms: 50,
     guard_ms: 300,
     max_rounds: 3,
+    max_keyup_ms: 20_000,
 };
 const TOKEN: &str = "test-token";
 const QUICK: RetryPolicy = RetryPolicy {

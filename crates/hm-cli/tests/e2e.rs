@@ -28,6 +28,7 @@ const FAST: LinkTiming = LinkTiming {
     txdelay_ms: 50,
     guard_ms: 300,
     max_rounds: 12,
+    max_keyup_ms: 20_000,
 };
 
 fn call(s: &str) -> Callsign {

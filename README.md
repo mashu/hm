@@ -34,8 +34,9 @@ the time. hm-net treats airtime as the resource that matters:
   share of the channel however many stations share it.
 
 In simulation, five real stations on a week of fading, diurnal HF deliver
-240 of 240 messages at 7 % channel occupancy, most within two hours of the
-earliest possible; see [results](docs/results.md).
+240 of 240 messages at 6 % channel occupancy, half within 1.3 hours of the
+earliest possible, each transmitter keyed about 1 % of the time and never
+for much more than 20 s at once; see [results](docs/results.md).
 
 ## Quick start
 

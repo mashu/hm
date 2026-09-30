@@ -49,12 +49,33 @@ pub struct LinkTiming {
     pub txdelay_ms: u64,
     pub guard_ms: u64,
     pub max_rounds: u8,
+    /// Longest the transmitter stays keyed at a time; 0 for no limit. No
+    /// over is longer, and one that would follow others straight into a
+    /// longer key-up waits for the duty cycle's bucket to refill.
+    pub max_keyup_ms: u64,
 }
 
 impl LinkTiming {
     /// Airtime of one frame of `len` bytes on this link, key-up included.
     pub fn airtime_ms(&self, len: usize) -> u64 {
         self.txdelay_ms.saturating_add(self.frame_ms(len))
+    }
+
+    /// The transfer engine's settings for this link: symbols and overs sized
+    /// for its rate, its guard and rounds. A transmitter keyed too long heats
+    /// its final amplifier: no over lasts longer than a key-up may, and the
+    /// duty cycle's bucket holds no more, so overs and the frames before them
+    /// cannot run together into a longer one.
+    pub fn engine_config(&self, me: Callsign) -> Config {
+        let mut cfg = Config::for_link(me, self.bitrate_bps, Millis(self.txdelay_ms));
+        cfg.ack_guard = Millis(self.guard_ms);
+        cfg.max_rounds = self.max_rounds;
+        if self.max_keyup_ms > 0 {
+            let keyup = Millis(self.max_keyup_ms);
+            cfg.max_over = cfg.max_over.min(keyup);
+            cfg.bucket = cfg.bucket.min(keyup);
+        }
+        cfg
     }
 
     /// Airtime of a frame of `len` bytes sent while the transmitter is keyed.
@@ -107,6 +128,10 @@ pub struct Radio {
     sync_queue: SyncQueue,
     next_sync: Option<Millis>,
     holding: bool,
+    /// When the frames of ours handed to the link will have gone out, as far
+    /// as their airtime says (the link, when it can tell, says exactly):
+    /// beacons and SYNC wait for it, rather than lengthen the key-up.
+    on_air_until: Millis,
     channel: ChannelModel,
     channel_seen: u64,
     /// Airtime of others' frames heard since `channel_seen`.
@@ -126,9 +151,7 @@ impl Radio {
             epoch,
             seed,
         } = spec;
-        let mut cfg = Config::for_link(me, timing.bitrate_bps, Millis(timing.txdelay_ms));
-        cfg.ack_guard = Millis(timing.guard_ms);
-        cfg.max_rounds = timing.max_rounds;
+        let cfg = timing.engine_config(me);
         let rng = DetRng::from_seed(seed);
         let mut x = Xfer::new(cfg, Identity::from_secret(identity.secret()), rng.fork(1))?;
         x.set_trust(settings.trust.iter());
@@ -166,6 +189,7 @@ impl Radio {
             sync_queue: SyncQueue::new(SYNC_QUEUE_FRAMES),
             next_sync: None,
             holding: false,
+            on_air_until: now,
             channel,
             channel_seen: unix,
             busy_ms: 0,
@@ -332,17 +356,25 @@ impl Radio {
             return false;
         }
         let new = self.heard.frame(unix, header.src);
-        match read_beacon(frame) {
-            Some(beacon) => {
-                if self.heard.beacon(unix, &beacon, &self.trust) == heard::KeyCheck::Mismatch {
-                    log(format!(
-                        "beacon from {} carries a different key than the one trusted for it",
-                        beacon.from
-                    ));
-                }
+        let Some(beacon) = read_beacon(frame) else {
+            return new;
+        };
+        match self.heard.beacon(unix, &beacon, &self.trust) {
+            Some(heard::KeyCheck::Mismatch) => {
+                log(format!(
+                    "beacon from {} names a different key than the one trusted for it",
+                    beacon.from
+                ));
                 true
             }
-            None => new,
+            Some(_) => true,
+            None => {
+                log(format!(
+                    "beacon from {} does not verify with the key trusted for it; dropped",
+                    beacon.from
+                ));
+                new
+            }
         }
     }
 
@@ -381,7 +413,7 @@ impl Radio {
                 .set_permyriad(control_share_permyriad(self.control_permyriad, sharing));
         }
         if let (Some(at), Some(every)) = (self.next_beacon, self.beacon_every()) {
-            if now >= at {
+            if now >= at.max(self.on_air_until) {
                 self.beacon(now, unix, every, out);
             }
         }
@@ -391,7 +423,7 @@ impl Radio {
             self.heard_changed = false;
             self.next_report = now + Millis(HEARD_REPORT_MS);
         }
-        if self.next_sync.is_some_and(|at| now >= at) {
+        if self.next_sync.is_some_and(|at| now >= at.max(self.on_air_until)) {
             self.next_sync = None;
             let sending = self
                 .sync_queue
@@ -407,10 +439,10 @@ impl Radio {
                 };
                 match header.frame(&payload) {
                     Ok(frame) => {
-                        if self
-                            .control_budget
-                            .admit(now.0, self.timing.airtime_ms(frame.len()))
-                        {
+                        let airtime = self.timing.airtime_ms(frame.len());
+                        if self.control_budget.admit(now.0, airtime) {
+                            self.x.spend(now, Millis(airtime));
+                            self.keyed(now, frame.len());
                             out.push(Output::Transmit {
                                 port: self.port,
                                 data: frame,
@@ -448,7 +480,10 @@ impl Radio {
         };
         // Every station in reach beacons about this often: together they keep
         // to the beacon share of the channel.
-        let interval = beacon_interval_ms(every, self.sharing, self.timing.airtime_ms(frame.len()));
+        let airtime = self.timing.airtime_ms(frame.len());
+        let interval = beacon_interval_ms(every, self.sharing, airtime);
+        self.x.spend(now, Millis(airtime));
+        self.keyed(now, frame.len());
         out.push(Output::Transmit {
             port: self.port,
             data: frame,
@@ -462,10 +497,23 @@ impl Radio {
     }
 
     /// What the transfer engine said, for the node.
-    fn engine_output(&self, xo: Vec<Output<Event>>, out: &mut Vec<Output<RadioEvt>>) {
+    /// A frame of `len` bytes handed to the link at `now`: on the air after
+    /// what is already there, with a key-up if the transmitter was idle.
+    fn keyed(&mut self, now: Millis, len: usize) {
+        self.on_air_until = if now >= self.on_air_until {
+            now + Millis(self.timing.airtime_ms(len))
+        } else {
+            self.on_air_until + Millis(self.timing.frame_ms(len))
+        };
+    }
+
+    fn engine_output(&mut self, now: Millis, xo: Vec<Output<Event>>, out: &mut Vec<Output<RadioEvt>>) {
         for o in xo {
             out.push(match o {
-                Output::Transmit { port, data } => Output::Transmit { port, data },
+                Output::Transmit { port, data } => {
+                    self.keyed(now, data.len());
+                    Output::Transmit { port, data }
+                }
                 Output::Event(Event::Received { from, id, object }) => Output::Event(RadioEvt::Received {
                     from,
                     xfer_id: id,
@@ -505,7 +553,7 @@ impl Machine for Radio {
             Input::Command(command) => self.command(now, command, &mut xo),
             Input::Frame { data, .. } => self.frame(now, data, &mut xo, out),
         }
-        self.engine_output(xo, out);
+        self.engine_output(now, xo, out);
         self.service(now, out);
     }
 
@@ -513,7 +561,7 @@ impl Machine for Radio {
         if self.x.next_deadline().is_some_and(|at| at <= now) {
             let mut xo = Vec::new();
             self.x.on_deadline(now, &mut xo);
-            self.engine_output(xo, out);
+            self.engine_output(now, xo, out);
         }
         self.service(now, out);
     }
@@ -522,12 +570,15 @@ impl Machine for Radio {
         if !self.interval_told {
             return Some(Millis::ZERO);
         }
+        // Beacons and SYNC wait for our frames on the air to go out; the
+        // link saying so wakes us.
+        let own = |at: Option<Millis>| at.map(|at| at.max(self.on_air_until));
         [
             self.x.next_deadline(),
-            self.next_beacon,
+            own(self.next_beacon),
             Some(self.next_report),
             Some(self.channel_look_at()),
-            self.next_sync,
+            own(self.next_sync),
         ]
         .into_iter()
         .flatten()
@@ -535,6 +586,7 @@ impl Machine for Radio {
     }
 
     fn transmitted(&mut self, now: Millis, port: Port) {
+        self.on_air_until = now;
         self.x.transmitted(now, port);
     }
 }

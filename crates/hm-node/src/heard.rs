@@ -95,14 +95,18 @@ impl HeardTable {
         new
     }
 
-    /// A verified beacon; returns how its key compares with `trust`.
-    pub fn beacon(&mut self, now: u64, b: &HeardBeacon, trust: &Trust) -> KeyCheck {
-        self.frame(now, b.from);
+    /// A beacon heard; returns how its key compares with `trust`, or `None`
+    /// when it names the trusted key and does not verify with it (forged or
+    /// damaged), and is dropped. A station with no trusted key cannot be
+    /// checked: its beacon is listed, and believed in nothing.
+    pub fn beacon(&mut self, now: u64, b: &HeardBeacon, trust: &Trust) -> Option<KeyCheck> {
         let key = match trust.key_for(b.from) {
             None => KeyCheck::Unknown,
-            Some(k) if k == b.key() => KeyCheck::Trusted,
-            Some(_) => KeyCheck::Mismatch,
+            Some(k) if b.signed_by(&k) => KeyCheck::Trusted,
+            Some(k) if k.id() != b.beacon.key_id => KeyCheck::Mismatch,
+            Some(_) => return None,
         };
+        self.frame(now, b.from);
         let s = self.stations.get_mut(&b.from).expect("inserted above");
         s.beacon = Some(BeaconSeen {
             at: now,
@@ -112,7 +116,7 @@ impl HeardTable {
             heard: b.beacon.heard.clone(),
             locator: b.beacon.locator,
         });
-        key
+        Some(key)
     }
 
     /// Drop stations not heard for a day.
@@ -196,21 +200,25 @@ mod tests {
         let mut t = HeardTable::default();
         assert_eq!(
             t.beacon(1000, &beacon(1, "SA0KAM-10", 1005), &trust),
-            KeyCheck::Trusted
+            Some(KeyCheck::Trusted)
         );
         assert_eq!(
             t.beacon(1000, &beacon(2, "SA0KAM", 1000), &trust),
-            KeyCheck::Mismatch
+            Some(KeyCheck::Mismatch)
         );
         assert_eq!(
             t.beacon(1000, &beacon(3, "SO5KM", 990), &trust),
-            KeyCheck::Unknown
+            Some(KeyCheck::Unknown)
         );
         // Hearing an unknown station's beacon twice does not make it trusted.
         assert_eq!(
             t.beacon(1100, &beacon(3, "SO5KM", 1100), &trust),
-            KeyCheck::Unknown
+            Some(KeyCheck::Unknown)
         );
+        // Naming the trusted key without its signature: dropped.
+        let mut forged = beacon(2, "SA0KAM", 1200);
+        forged.beacon.key_id = Identity::from_secret([1; 32]).public().id();
+        assert_eq!(t.beacon(1200, &forged, &trust), None);
         let list = t.list();
         let kam10 = list.iter().find(|s| s.call == call("SA0KAM-10")).unwrap();
         let seen = kam10.beacon.as_ref().unwrap();

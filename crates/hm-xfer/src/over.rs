@@ -95,7 +95,7 @@ impl Xfer {
         for f in frames {
             self.transmit(f, out);
         }
-        self.tokens_ms -= cost.0 as i64;
+        self.charge(now, cost);
 
         // The peer answers after our over: its guard, its key-up, a full ACK
         // (and its OPEN, if we sent ours), our slack.

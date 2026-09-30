@@ -28,6 +28,7 @@ openings. `cargo run --release -p hm-node --example hf_days -- 7 4 10`
 | departures on hearing the next hop | 240 / 240 | 1.5 h / 14.4 h | 6.8 % |
 | the open state followed through a transfer, stopping to wait for the peer | 240 / 240 | 1.8 h / 15.2 h | 6.4 % |
 | the receipt due after the trip there and back | 240 / 240 | 1.7 h / 16.0 h | 6.2 % |
+| beacons naming the key by an 8-byte id, key-ups of at most 20 s | 240 / 240 | 1.3 h / 15.9 h | 6.2 % |
 
 Where the airtime went in the first run: data 27 %, session opens 19 %,
 mostly attempts into closed paths. Now: beacons 3.4 %, data about 2 %,
@@ -46,44 +47,59 @@ air per station per hour.
 
 | Stations | Delivered | Latency p50 / p90 | Busy, mean / worst | Beacon | Control | Data |
 | --- | --- | --- | --- | --- | --- | --- |
-| 5 | 40 / 40 | 2.8 h / 12.0 h | 8.4 % / 8.4 % | 23.6 s | 18.7 s | 18.2 s |
-| 10 | 80 / 80 | 7.3 h / 17.8 h | 24.5 % / 24.5 % | 16.2 s | 36.1 s | 35.9 s |
-| 20 | 158 / 160 | 13.6 h / 32.2 h | 91.5 % / 91.5 % | 7.9 s | 75.9 s | 80.9 s |
+| 5 | 40 / 40 | 2.8 h / 13.1 h | 6.8 % / 6.8 % | 22.1 s | 13.6 s | 13.0 s |
+| 10 | 80 / 80 | 5.1 h / 16.3 h | 23.7 % / 23.7 % | 15.8 s | 35.8 s | 33.7 s |
+| 20 | 157 / 160 | 11.1 h / 32.8 h | 94.3 % / 94.3 % | 8.0 s | 78.9 s | 82.8 s |
 
 `... -- 5,10,20 4 0 4 1` (the square grows with the network, 360 km × √n)
 
 | Stations | Delivered | Latency p50 / p90 | Busy, mean / worst | Beacon | Control | Data |
 | --- | --- | --- | --- | --- | --- | --- |
-| 5 | 40 / 40 | 3.1 h / 33.2 h | 7.7 % / 7.7 % | 24.2 s | 15.5 s | 15.6 s |
-| 10 | 80 / 80 | 9.1 h / 38.1 h | 28.7 % / 31.3 % | 16.8 s | 48.2 s | 47.6 s |
-| 20 | 121 / 160 | 17.9 h / 54.5 h | 53.3 % / 82.2 % | 13.6 s | 70.0 s | 73.4 s |
+| 5 | 40 / 40 | 2.9 h / 22.9 h | 9.6 % / 9.6 % | 22.2 s | 23.5 s | 23.5 s |
+| 10 | 80 / 80 | 5.7 h / 34.9 h | 29.7 % / 32.4 % | 16.4 s | 50.3 s | 49.8 s |
+| 20 | 127 / 160 | 19.6 h / 50.7 h | 65.2 % / 99.3 % | 13.3 s | 86.5 s | 89.8 s |
 
 Over this round the ten-station networks went from 27.6 % busy (dense)
-and 46.3 % (sparse) to 24.5 % and 28.7 %, and the sparse twenty from 104
-delivered at 76 % busy (124 % at the worst station, frames overlapping) to
-121 at 53 %: planning that scales (a four-day run of twenty stations took
-more than twenty minutes, now three to eight), senders that stop probing a
-path gone quiet, and origins that no longer resend what is only slow. (The
-dense twenty was measured just before the last of these.) Beacons take less airtime per
-station as the network grows.
+and 46.3 % (sparse) to about 24 % and 30 %, and the sparse twenty from 104
+delivered to 127: planning that scales (a four-day run of twenty stations
+took more than twenty minutes, now four to eight), senders that stop
+probing a path gone quiet, and origins that no longer resend what is only
+slow. Capping key-ups at 20 s costs airtime where transfers are long and
+paths poor (the twenties: more, shorter overs, each with its own key-up and
+answer). One seed of twenty stations varies a lot: three seeds of the
+sparse twenty, before the cap, delivered 121, 139 and 136. Beacons take
+less airtime per station as the network grows.
 
 **How long the transmitter is keyed.** A station's transmitter is on
 about 1 % of the time in the Baltic week (some 45 s an hour) and 3 % in the
-sparse ten, in many short key-ups: median 4.5–5 s (mostly beacons), 90th
-percentile about 8 s, longest about 33 s (a full burst of 16 two-second
-frames at 300 bd). The seconds-per-hour columns above are sums over an
-hour, not single transmissions; "busy" counts every station a station
-hears, not its own transmitter.
+sparse ten, in many short key-ups: median 3.8 s (mostly beacons), 90th
+percentile 7.7 s, longest about 22 s with the default 20 s cap on a key-up
+(it was about 35 s before the cap: a full burst of 16 two-second frames at
+300 bd, or overs, answers and beacons running on one after another). The
+seconds-per-hour columns above are sums over an hour, not single
+transmissions; "busy" counts every station a station hears, not its own
+transmitter.
 
 ### What is still wrong
 
-- **Two-hop horizon.** Beacons tell each station of its two-hop
-  neighbourhood only. In the sparse twenty, where most pairs are three to
-  five hops apart, stations beyond that guess: they try the destination
-  directly or a relay that might hear it, and the 39 messages not delivered
-  were each tried by up to eight stations, none of which could reach the
-  destination. What is missing is a bounded summary of who reaches whom,
-  spread within the control budget (a probabilistic distance vector).
+- **Relays that hold for good.** In the sparse twenty, most messages not
+  delivered sit at a relay that finds, every quarter of an hour for days,
+  no route worth its airtime. It plans on the posterior mean, and counts
+  each hop beyond the next as a single attempt: over three to five hops the
+  chance multiplies down below what the airtime costs on a busy channel,
+  though each custodian on the way would try again. The chance a route
+  should carry past the first hop is the chance with retries.
+- **Two-hop horizon, and what telling more did.** Beacons tell each
+  station of its two-hop neighbourhood only; beyond, it guesses. We tried
+  sampled reach entries: each beacon carrying up to three "I reach D with
+  chance p in about t" statements from the station's own models, weighted
+  by chance and by how long since it last told them, within the bytes the
+  key id freed, taken by listeners as stated probabilities. Over three
+  seeds of the sparse twenty it delivered 372 of 480 against 396 without,
+  at 54 % busy against 58 %: messages moved toward the stations that
+  claimed a way and then stalled at them, for the reason above. Knowing
+  more was not what was missing, so it was not kept; it is worth trying
+  again once relays value what custodians further on will do.
 - **A dense channel of twenty.** Twenty stations sharing one 300 bd channel
   keep it busy 90 % of the time: about as much data airtime is lost to
   fades and collisions as gets through. Carrier sense persistence is fixed
@@ -94,9 +110,6 @@ hears, not its own transmitter.
   numbers are for it because it can be simulated; on the air, HF traffic
   belongs on an ARQ modem (VARA HF, ARDOP), which hm-net supports as a
   bearer ([modems](operating/modems.md)).
-- **Key-ups up to half a minute.** Bursts of 16 frames and frames queued
-  behind one another can keep the transmitter on for 30 s at 300 bd; a cap
-  on a single key-up, with a rest after it, belongs in the radio layer.
 - **One symbol size for every path.** 32-byte symbols suit fading paths and
   are slower on good ones (see below); the size should follow each path's
   loss belief ([transfer](transfer.md#frame-and-symbol-sizes)).

@@ -327,6 +327,7 @@ pub fn run(scenario: &Scenario) -> Outcome {
                     txdelay_ms: radio.txdelay.0,
                     guard_ms: 1_500,
                     max_rounds: 12,
+                    max_keyup_ms: 20_000,
                 },
                 link_features: FEATURE_COMPACT,
                 settings: settings(trust.clone()),

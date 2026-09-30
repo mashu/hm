@@ -161,7 +161,7 @@ impl Station {
         heard.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
         let beacon = Beacon {
             flags: FLAG_RELAY | if self.holding { FLAG_HOLDING } else { 0 },
-            key: [7; 32],
+            key_id: [7; 8],
             time: now_s as u32,
             locator: None,
             heard: heard

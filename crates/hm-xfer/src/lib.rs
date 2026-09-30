@@ -252,6 +252,13 @@ impl Xfer {
             .unwrap_or_else(|| PeerBelief::open(self.erasure(peer)))
     }
 
+    /// Airtime the station spent at `now` outside transfers (beacons, control
+    /// frames): it counts against the duty cycle like an over, so an over
+    /// cannot follow it straight into a key-up longer than the bucket.
+    pub fn spend(&mut self, now: Millis, airtime: Millis) {
+        self.charge(now, airtime);
+    }
+
     /// What the station believes about the channel: the share of the time
     /// others keep it busy, and how many stations share it (whom a broadcast
     /// is sized for).

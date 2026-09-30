@@ -76,12 +76,29 @@ Direwolf itself (95 against 94 of 100 in rising noise).
 ## Beacons
 
 Every 10 minutes (`beacon_minutes`, 0 for none) the node sends a signed
-beacon: its callsign and key, its grid locator, whether it has internet links
+beacon: its callsign and the id of its key, its grid locator, whether it has internet links
 or relays, whether it holds mail for others, and the stations it has heard
 lately. As more stations share the channel, beacons go further apart, so that
 together they keep to a small share of it ([control plane](../control-plane.md)).
 The Network view lists every station heard, with the distance and bearing to
 those that give a locator, and for those that beacon whether their key
 matches the one you trust.
+
+## How long the transmitter is keyed
+
+Data modes keep a transmitter at full output for as long as it is keyed, and
+long key-ups heat the final amplifier. The node keys up for at most
+`max_keyup_secs` at a time (20 by default; 0 for no limit): no burst of a
+transfer is longer, the airtime a burst may use at once is no more (above it
+the node keeps to half the time on the air), and beacons and control frames
+wait for its own frames to go out rather than run on after them. In a
+simulated week of five HF stations at 300 bd, half the key-ups are under
+5 s (mostly beacons) and each station's transmitter is on about 1 % of the
+time ([results](../results.md)). Run data modes at reduced power as your
+transceiver's manual advises.
+
+On HF, 300 bd packet is slow and fragile against fading; an ARQ modem
+(VARA HF, ARDOP) moves the same message in far less time on the air when
+the path is decent.
 
 See also [ARQ modems](modems.md) for VARA, Mercury and ARDOP.

@@ -62,6 +62,9 @@ pub struct RadioSettings {
     pub max_rounds: u32,
     /// A signed beacon this often, in minutes; 0 for none.
     pub beacon_minutes: u64,
+    /// Longest the transmitter stays keyed at a time, in seconds; 0 for no
+    /// limit. Longer transfers go out in several key-ups.
+    pub max_keyup_secs: u64,
 }
 
 impl Default for RadioSettings {
@@ -80,6 +83,7 @@ impl Default for RadioSettings {
             framing: "ax25".into(),
             max_rounds: 12,
             beacon_minutes: 10,
+            max_keyup_secs: 20,
         }
     }
 }
@@ -92,6 +96,7 @@ impl RadioSettings {
             txdelay_ms: self.txdelay_ms,
             guard_ms: self.guard_ms,
             max_rounds: self.max_rounds.max(1).min(u32::from(u8::MAX)) as u8,
+            max_keyup_ms: self.max_keyup_secs.saturating_mul(1_000),
         }
     }
 

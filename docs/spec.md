@@ -273,8 +273,10 @@ nothing about who received it.
 - A transfer that is backing off does not hold up the others: transfers to
   other peers may send their overs meanwhile, one over awaiting an ACK at a
   time. Never use session 0 (a CLOSE with session 0 covers every transfer).
-- Keep a long-run airtime budget (duty cycle with a burst allowance), and never
-  send an over larger than the allowance.
+- Keep an airtime budget (a duty cycle with a burst allowance that refills
+  only while the transmitter is idle), take every frame sent from it, and
+  never send an over larger than the allowance: the allowance bounds a
+  key-up.
 
 **Broadcast transfers** (bulletins): OFFER and DATA go to the broadcast
 destination and listeners never send completion ACKs. Repair works like
@@ -363,26 +365,28 @@ never as a verdict on the bundle.
 ## 8. Beacons
 
 A station announces itself with a BEACON frame: destination broadcast, session
-and index 0 (receivers ignore both). Payload, 108 + 7n bytes:
+and index 0 (receivers ignore both). Payload, 84 + 7n bytes:
 
 | Offset | Size | Field |
 | --- | --- | --- |
 | 0 | 1 | flags: 0x01 mailbox (holds mail for other stations), 0x02 relay (passes mail on, Phase 2), 0x04 internet (has internet links), 0x08 holding (holds bundles others may pull with holdings SYNC, section 11.3); other bits 0, and ignored by receivers |
-| 1 | 32 | the station's Ed25519 key |
-| 33 | 4 | Unix time in seconds when sent |
-| 37 | 6 | Maidenhead locator: 4 or 6 characters in upper-case ASCII (`JO89` or `JO89XI`), a 4-character one followed by two zero bytes; all zero when the station gives none |
-| 43 | 1 | n, stations heard (at most 16) |
-| 44 | 7n | per station heard: callsign (6), minutes since last heard (1; 255 = 255 or more) |
-| 44 + 7n | 64 | signature by the key over `"hm/beacon-sig/v0" \|\| header source callsign (6) \|\| bytes 0 to 43 + 7n` |
+| 1 | 8 | key id: the first 8 bytes of BLAKE3(`"hm/key-id/v0"` \|\| the station's Ed25519 key) |
+| 9 | 4 | Unix time in seconds when sent |
+| 13 | 6 | Maidenhead locator: 4 or 6 characters in upper-case ASCII (`JO89` or `JO89XI`), a 4-character one followed by two zero bytes; all zero when the station gives none |
+| 19 | 1 | n, stations heard (at most 16) |
+| 20 | 7n | per station heard: callsign (6), minutes since last heard (1; 255 = 255 or more) |
+| 20 + 7n | 64 | signature by the key over `"hm/beacon-sig/v0" \|\| header source callsign (6) \|\| bytes 0 to 19 + 7n` |
 
 Rules:
 
 - Drop a beacon with a malformed locator (letters A–R, digits, then A–X).
-- Drop a beacon whose signature does not verify with the key it carries. One that
-  verifies proves only that its sender holds that key.
-- Never learn a key from a beacon. Compare it with the trusted keys instead: the
-  listed key (trusted), no key for the station (unknown), or another key
-  (mismatch: an impostor, or a station with a new key; worth a warning).
+- Check a beacon with the key trusted for its source callsign: when the key id
+  is that key's and the signature verifies, the beacon is the station's. When
+  the key id is that key's and the signature does not verify, drop it. When
+  the key id is another (mismatch: an impostor, or a station with a new key;
+  worth a warning) or no key is trusted for the station (unknown), the beacon
+  cannot be checked: show it, and believe nothing it says.
+- Never learn a key from a beacon: it carries only the key's id.
 - Recommended: beacon every 10 minutes with ±10% jitter, the first one at a random
   moment 5 to 30 s after the radio comes up; list stations heard in the last hour,
   most recent first.
@@ -812,5 +816,5 @@ ack   01001b97cbd86b00004f8af6fbf2b4000000000080ff00000126a90b587084a21311b09926
 close 03001b97cbd86b00004f8af6fbbeef0000000301005a
 
 ## Beacon from SA0KAM-10 (secret 0x0b x 32, mailbox, JO89xi, heard SO5KM-1 3 min ago)
-beacon 04a53e713ef6fbffffffffffff00000000000166be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a6ab13b804a4f3839584901001b97cbd86b036310c680632414ca1c334f57df9df4b445475c36b99df19b143662928e5b8bdb1a2d9709298a363a5c9781d062ccba553c8b2b75e4a78d978bb209f6f2fac302
+beacon 04a53e713ef6fbffffffffffff000000000001686f21d945a1ad186ab13b804a4f3839584901001b97cbd86b031f6ba70d79759d1dd35f9a8e11d1936d7c7124139071c9fd1638b393fe39a5f309f64b0f22a8324efcf8deab687c9d23d871efb95811c4df201c98b377ba730c
 ```

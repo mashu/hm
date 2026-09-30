@@ -26,6 +26,7 @@ key = {key:?}
 # ptt = "vox"               or "rts:/dev/ttyUSB0", "cm108:/dev/hidraw0"
 # framing = "ax25"          built-in modem: or "il2p" (far more robust in noise), "auto"
 # max_rounds = 12           radio handoff attempts before giving up
+# max_keyup_secs = 20       longest the transmitter stays keyed at a time (0: no limit)
 [radio]
 beacon_minutes = 10         # 0 turns the beacon off
 

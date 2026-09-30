@@ -1,9 +1,11 @@
 //! Airtime: the transmitter's budget, what frames and overs cost on air, and
 //! the wait for a channel others keep busy.
 
+use alloc::vec::Vec;
+
 use crate::send::OutState;
-use crate::{Xfer, MAX_REMAINING_TRUSTED, NACK_SPREAD_ACKS};
-use hm_core::Millis;
+use crate::{Event, Xfer, MAX_REMAINING_TRUSTED, NACK_SPREAD_ACKS};
+use hm_core::{Millis, Output};
 use hm_model::OverCost;
 use hm_wire::{DataPreamble, Dest, FrameHeader, FrameType, HEADER_LEN, OPEN_LEN};
 
@@ -15,14 +17,41 @@ impl Xfer {
         self.tokens_at = self.tokens_at.max(now);
     }
 
-    /// When `cost` ms of airtime will be affordable. A full bucket always is,
-    /// so a single frame longer than the bucket cannot block forever.
+    /// Airtime spent at `now` on frames of ours (the key-up included when
+    /// the transmitter was idle): taken from the bucket, which refills only
+    /// once the transmitter has fallen silent again, as a final amplifier
+    /// cools only then. So what the bucket holds bounds a key-up, not only
+    /// the airtime over a stretch of time.
+    pub(crate) fn charge(&mut self, now: Millis, airtime: Millis) {
+        self.refill(now);
+        self.tokens_ms -= airtime.0 as i64;
+        self.tokens_at = now.max(self.tokens_at) + airtime;
+    }
+
+    /// An answer (an ACK, a CLOSE, our OPEN before them) goes at once,
+    /// whatever the bucket holds: the station waiting for it would give up.
+    /// It is taken from the bucket all the same.
+    pub(crate) fn answer(&mut self, now: Millis, frame: Vec<u8>, out: &mut Vec<Output<Event>>) {
+        let keyup = if now >= self.tokens_at {
+            self.cfg.txdelay
+        } else {
+            Millis::ZERO
+        };
+        self.charge(now, keyup + self.cfg.air(1, frame.len()));
+        self.transmit(frame, out);
+    }
+
+    /// When `cost` ms of airtime will be affordable: once what the bucket
+    /// holds covers it, counting refills from when the transmitter falls
+    /// silent. A full bucket always is, so a single frame longer than the
+    /// bucket cannot block forever.
     pub(crate) fn affordable_at(&self, now: Millis, cost: Millis) -> Millis {
         let short = cost.0.min(self.cfg.bucket.0) as i64 - self.tokens_ms;
         if short <= 0 || self.cfg.duty_cycle_permille >= 1000 {
             now
         } else {
-            now + Millis((short as u64 * 1000).div_ceil(self.cfg.duty_cycle_permille as u64))
+            now.max(self.tokens_at)
+                + Millis((short as u64 * 1000).div_ceil(self.cfg.duty_cycle_permille as u64))
         }
     }
 

@@ -103,7 +103,7 @@ impl Xfer {
             };
             let payload = ack.to_vec().expect("fields in range");
             let f = self.frame(FrameType::Ack, key.0, key.1, 0, &payload, false);
-            self.transmit(f, out);
+            self.answer(now, f, out);
         }
         if self.answer_at().is_none_or(|t| t > now) {
             return;
@@ -124,16 +124,16 @@ impl Xfer {
             if self.open_replies.remove(&key.0) {
                 let ours = self.our_open(true).to_bytes().expect("in range");
                 let f = self.frame(FrameType::Ctrl, key.0, key.1, 0, &ours, false);
-                self.transmit(f, out);
+                self.answer(now, f, out);
             }
             let f = self.frame(FrameType::Ctrl, key.0, key.1, 0, &close.to_bytes(), false);
-            self.transmit(f, out);
+            self.answer(now, f, out);
         }
         for key in due {
             if self.open_replies.remove(&key.0) {
                 let ours = self.our_open(true).to_bytes().expect("in range");
                 let f = self.frame(FrameType::Ctrl, key.0, key.1, 0, &ours, false);
-                self.transmit(f, out);
+                self.answer(now, f, out);
             }
             let inc = self.incoming.get_mut(&key).expect("collected above");
             inc.ack_at = None;
@@ -159,7 +159,7 @@ impl Xfer {
             };
             let payload = ack.to_vec().expect("fields in range");
             let f = self.frame(FrameType::Ack, key.0, key.1, 0, &payload, false);
-            self.transmit(f, out);
+            self.answer(now, f, out);
         }
     }
 }

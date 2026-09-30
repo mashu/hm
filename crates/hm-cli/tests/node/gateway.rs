@@ -133,6 +133,22 @@ fn radio_first_and_the_internet_when_radio_fails() {
         let st = get(a.http_addr, "/api/status");
         (st["internet_peers"] == json!(["SO5KM"]) && st["radio"] == json!(true)).then_some(())
     });
+    // A's operator would rather not pay for the internet while the radio
+    // might do: an internet attempt costs a fifth of a message. (At the
+    // default cost A, knowing nothing yet of how its handoffs go by radio,
+    // draws a doubtful radio now and then and tries the internet first, as
+    // exploration should.)
+    let internet_cost = |cost: f64| {
+        let (status, body) = http(
+            a.http_addr,
+            "PATCH",
+            "/api/settings",
+            Some(&json!({ "internet_cost": cost })),
+            Some(TOKEN),
+        );
+        assert_eq!(status, 200, "{body}");
+    };
+    internet_cost(20.0);
     // Radio goes first once it is known to work: B's beacon says it hears A.
     wait_for(Duration::from_secs(30), "B's beacon, hearing A", || {
         let st = get(a.http_addr, "/api/status");
@@ -147,6 +163,10 @@ fn radio_first_and_the_internet_when_radio_fails() {
     send(a.http_addr, json!({"to": "SO5KM-1", "text": "one"}));
     let first = delivered(a.http_addr, 1, "first delivery");
     assert_eq!(first["delivered_by"], "radio");
+    // Back to the default: with a radio handoff that worked in its beliefs,
+    // A still tries the radio first, and turns to the internet soon once
+    // the radio goes quiet.
+    internet_cost(2.0);
 
     tnc.blocked.store(true, Ordering::SeqCst);
     send(a.http_addr, json!({"to": "SO5KM-1", "text": "two"}));

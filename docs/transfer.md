@@ -133,6 +133,19 @@ ask first, so one repair over serves them all.
 
 ## Airtime limits
 
-A duty-cycle budget with a burst allowance protects the transmitter's
-finals. Channel access (carrier sense) is below the engine: on the KISS path
-the TNC does it; the built-in modem has its own p-persistent CSMA.
+A key-up limit protects the transmitter's final amplifier, which heats while
+keyed and cools only while idle. The engine keeps a bucket of airtime as
+large as the longest key-up allowed (`[radio] max_keyup_secs`, 20 s by
+default): every frame of ours is taken from it (overs, answers, and the
+node's beacons and control frames), and it refills at half the rate of time
+passing, only once the transmitter has fallen silent. An over waits until
+the bucket covers it, and none is larger than the bucket, so frames sent
+one after another cannot run into a longer key-up; an answer (an ACK, a
+CLOSE) never waits, since the station waiting for it would give up. The
+node's beacons and control frames also wait for its own frames to go out
+rather than follow straight on. In simulation at 300 bd the longest key-up
+came down from about 35 s to about 22 s (an answer can add a few seconds to
+a full one); half the key-ups are under 4 s.
+
+Channel access (carrier sense) is below the engine: on the KISS path the TNC
+does it; the built-in modem has its own p-persistent CSMA.

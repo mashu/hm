@@ -12,8 +12,11 @@ A beacon is a signed broadcast: who the station is, which stations it has
 heard lately and when (up to 16), and flags (relays, keeps a mailbox, has an
 internet link, holds something for others). Beacons are the radio topology:
 each gives every listener its one-hop neighbourhood, and the neighbour's
-list its two-hop one. Keys are never learned from beacons; a beacon from a
-station whose trusted key differs is reported, not believed.
+list its two-hop one. A beacon names the key it is signed with by an 8-byte
+id, not the key itself: keys are never learned from beacons, and a listener
+checks the signature with the key it trusts for the station. One from a
+station whose trusted key has another id is reported, not believed. (The
+full key made every beacon 24 bytes longer, most of a second at 300 bd.)
 
 Beacons go out every `beacon_minutes` (10 by default), or further apart when
 many stations share the channel: all their beacons together keep to 2 % of

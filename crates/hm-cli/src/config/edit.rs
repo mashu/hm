@@ -198,6 +198,7 @@ pub fn set_radio(path: &Path, old: &RadioSettings, new: &RadioSettings) -> io::R
         ("bitrate", u64::from(old.bitrate), u64::from(new.bitrate)),
         ("txdelay_ms", old.txdelay_ms, new.txdelay_ms),
         ("guard_ms", old.guard_ms, new.guard_ms),
+        ("max_keyup_secs", old.max_keyup_secs, new.max_keyup_secs),
     ] {
         if o != n {
             put(key, (n as i64).into());

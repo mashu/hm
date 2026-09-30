@@ -212,6 +212,7 @@ fn start(ether: &Ether, key: &KeyFile, me: &str, peer: &KeyFile, db: &Tmp) -> no
                 txdelay_ms: 300,
                 guard_ms: 1500,
                 max_rounds: 12,
+                max_keyup_ms: 20_000,
             },
         }),
         radio_builder: None,
