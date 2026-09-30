@@ -70,6 +70,28 @@ A plan for later is a forecast, and forecasts improve: the message is
 planned again at least every 15 minutes while it waits (a receding horizon),
 and at once when the station it waits for is heard.
 
+## Or when the next hop is heard
+
+On the radio, knowing whether a path is open costs nothing: a station that
+hears its next hop knows the path is open now. So a first hop over the radio
+has one more way to leave: when the next hop is next heard, within two
+hours. The peer transmits about once a beacon interval, and each
+transmission is heard if the path is open then and the frame gets through,
+so the model gives the chance of hearing it in the window and the expected
+wait ([`hm_model::first_hearing`](models.md)). The departure completes with
+
+```text
+P(heard within the window) · P(handoff | open) · P(accepted)
+```
+
+and costs its airtime only if the peer is heard, where sending now on a
+forecast costs the airtime whatever the path turns out to be. For mail, half
+a beacon interval of waiting is worth little against a week's life, so on HF
+this is usually the best first move; for urgent traffic the wait counts, and
+sending now can win. In a network of twenty HF stations, attempts made on a
+forecast alone had succeeded one time in seven, and attempts made within ten
+minutes of hearing the peer three times in four.
+
 ## The search
 
 The planner is an A* search over partial routes (labels). Each label's bound

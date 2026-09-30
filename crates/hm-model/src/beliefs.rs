@@ -14,6 +14,7 @@ use hm_wire::Callsign;
 use crate::custodian::{CustodianModel, CustodianObservation, CustodianPrior, HandedOver};
 use crate::erasure::Erasure;
 use crate::evidence::Prior;
+use crate::hearing::{first_hearing, Hearing};
 use crate::link::{LinkModel, LinkObservation, LinkPrior, SampledLink};
 use crate::{Bearer, LinkKey};
 
@@ -438,6 +439,22 @@ pub trait Estimate {
     /// Expected airtime to get a frame through `link` while it is open, in
     /// frames ([`Erasure::airtime_factor`]).
     fn airtime_factor(&mut self, link: LinkKey) -> f64;
+    /// When the far end of radio `link` is next heard, within `window` of
+    /// now, if it transmits about every `interval` seconds (the link's own
+    /// interval once learned).
+    fn hearing(&mut self, link: LinkKey, window: u64, interval: u64) -> Hearing;
+    /// Chance a handoff over `link` completes, the path being open.
+    fn handoff_if_open(&mut self, link: LinkKey) -> f64;
+}
+
+impl Beliefs {
+    /// How often the far end of `key` transmits: the link's learned
+    /// interval, or `interval`.
+    fn transmits_every(&self, key: LinkKey, interval: u64) -> u64 {
+        self.link(key)
+            .and_then(LinkModel::beacon_interval)
+            .unwrap_or(interval)
+    }
 }
 
 /// Weigh a stated probability against the station's own estimate `own`,
@@ -472,6 +489,21 @@ impl Estimate for Mean<'_> {
     fn airtime_factor(&mut self, link: LinkKey) -> f64 {
         self.beliefs.erasure(link, self.now).airtime_factor()
     }
+
+    fn hearing(&mut self, link: LinkKey, window: u64, interval: u64) -> Hearing {
+        let (beliefs, now) = (self.beliefs, self.now);
+        let through = 1.0 - beliefs.erasure(link, now).mean();
+        let every = beliefs.transmits_every(link, interval);
+        first_hearing(|t| beliefs.p_open(link, t, now), through, now, window, every)
+    }
+
+    fn handoff_if_open(&mut self, link: LinkKey) -> f64 {
+        let prior = self.beliefs.link_prior(link.bearer);
+        match self.beliefs.links.get(&link.path()) {
+            Some(model) => model.handoff(prior, self.now).mean(),
+            None => prior.handoff.mean,
+        }
+    }
 }
 
 /// Estimates drawn from the beliefs, the same draw for every question about
@@ -485,18 +517,29 @@ pub struct Thompson<'a> {
     delivers: BTreeMap<Callsign, f64>,
 }
 
-impl Estimate for Thompson<'_> {
-    fn link(&mut self, link: LinkKey, t: u64, stated: Option<f64>) -> f64 {
+impl Thompson<'_> {
+    /// This plan's draw of `link`, the same for every question about it.
+    fn sampled(&mut self, link: LinkKey) -> SampledLink {
         let (beliefs, now) = (self.beliefs, self.now);
         let rng = &mut self.rng;
-        let sampled = *self.links.entry(link.path()).or_insert_with(|| {
+        *self.links.entry(link.path()).or_insert_with(|| {
             let prior = beliefs.link_prior(link.bearer);
             match beliefs.links.get(&link.path()) {
                 Some(model) => model.sample(prior, rng, now),
                 None => beliefs.unseen(link.bearer, now).sample(prior, rng, now),
             }
-        });
-        with_stated(sampled.success(t), beliefs.handoff_weight(link, now), stated)
+        })
+    }
+}
+
+impl Estimate for Thompson<'_> {
+    fn link(&mut self, link: LinkKey, t: u64, stated: Option<f64>) -> f64 {
+        let sampled = self.sampled(link);
+        with_stated(
+            sampled.success(t),
+            self.beliefs.handoff_weight(link, self.now),
+            stated,
+        )
     }
 
     fn accepts(&mut self, station: Callsign, t: u64) -> f64 {
@@ -534,6 +577,17 @@ impl Estimate for Thompson<'_> {
     /// explored.
     fn airtime_factor(&mut self, link: LinkKey) -> f64 {
         self.beliefs.erasure(link, self.now).airtime_factor()
+    }
+
+    fn hearing(&mut self, link: LinkKey, window: u64, interval: u64) -> Hearing {
+        let sampled = self.sampled(link);
+        let through = 1.0 - self.beliefs.erasure(link, self.now).mean();
+        let every = self.beliefs.transmits_every(link, interval);
+        first_hearing(|t| sampled.open(t), through, self.now, window, every)
+    }
+
+    fn handoff_if_open(&mut self, link: LinkKey) -> f64 {
+        self.sampled(link).handoff()
     }
 }
 

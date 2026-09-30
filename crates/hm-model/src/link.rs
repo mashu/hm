@@ -516,18 +516,28 @@ pub struct SampledLink {
 }
 
 impl SampledLink {
-    pub fn success(&self, t: u64) -> f64 {
+    /// Chance the path is open at `t`.
+    pub fn open(&self, t: u64) -> f64 {
         if !self.reachable {
             return 0.0;
         }
         let pi = self.availability.p_open(t);
-        let open = if t <= self.state_at {
+        if t <= self.state_at {
             self.state
         } else {
             let decay = exp(-((t - self.state_at) as f64) / self.persistence_secs);
             pi + (self.state - pi) * decay
-        };
-        open * self.handoff
+        }
+    }
+
+    /// Chance a handoff completes while the path is open.
+    pub fn handoff(&self) -> f64 {
+        self.handoff
+    }
+
+    /// Chance a handoff started at `t` completes.
+    pub fn success(&self, t: u64) -> f64 {
+        self.open(t) * self.handoff
     }
 }
 

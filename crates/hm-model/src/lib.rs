@@ -42,6 +42,7 @@ mod custodian;
 pub mod diurnal;
 mod erasure;
 mod evidence;
+mod hearing;
 mod link;
 pub mod math;
 
@@ -50,6 +51,7 @@ pub use channel::{access_wait, ChannelModel, ChannelObservation, CHANNEL_HALF_LI
 pub use custodian::{CustodianModel, CustodianObservation, CustodianPrior, HandedOver, CUSTODIAN_HALF_LIFE};
 pub use erasure::{broadcast_burst, burst_size, plan_overs, Erasure, OverCost};
 pub use evidence::{Beta, Evidence, Prior};
+pub use hearing::{first_hearing, Hearing};
 pub use link::{LinkModel, LinkObservation, LinkPrior, SampledLink, ERASURE_HALF_LIFE, HANDOFF_HALF_LIFE};
 
 /// How a link carries bundles.

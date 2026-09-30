@@ -328,6 +328,8 @@ impl Node {
             forbidden: PerBearer::from_fn(|bearer| bearer.on_air() && !rf_ok),
             closed_now: &closed_now,
             urgent: r.precedence >= 2,
+            // Stations on the radio are heard about as often as they beacon.
+            hearing_interval_secs: if self.radio_up { self.beacon_interval } else { 0 },
         };
         let policy = RoutingPolicy {
             attempt_cost: self.settings.costs.attempt(),
@@ -422,6 +424,20 @@ impl Node {
             return;
         };
         let (bearer, peer) = (first.contact.bearer, first.contact.to);
+        if first.on_hearing {
+            // Waits to hear the next hop: woken when it is, planned again
+            // meanwhile with what has been learned.
+            let again = first.depart.min(now + REPLAN_SECS);
+            if self.store.defer(r.id, again, Some(peer)).unwrap_or(false) {
+                log(format!(
+                    "{} to {} waits to hear {peer} ({:.0}% within the hour or so)",
+                    short(&r.id),
+                    r.final_destination(),
+                    f64::from(first.probability_permillion) / 10_000.0,
+                ));
+            }
+            return;
+        }
         if first.depart > now {
             let again = first.depart.min(now + REPLAN_SECS);
             if self.store.defer(r.id, again, Some(peer)).unwrap_or(false) {

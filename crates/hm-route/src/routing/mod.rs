@@ -39,6 +39,16 @@
 //! message waits for a better time or a better route
 //! ([`RouteError::NotWorthIt`]).
 //!
+//! **Or on hearing.** On the radio, knowing whether a path is open costs
+//! nothing: a station that hears its next hop knows the path is open now.
+//! A first hop over the radio may leave when the next hop is next heard,
+//! within [`RoutingPolicy::hearing_window_secs`]: it completes with the chance
+//! of hearing it by then times the chance of a handoff over an open path,
+//! and costs its airtime only if it is heard. Sending now on a forecast costs
+//! the airtime whatever the path turns out to be. For mail, waiting half a
+//! beacon interval is worth little against a week's life; for urgent
+//! traffic, the wait counts.
+//!
 //! A route that fails is not the end: the custodian tries another. A failed
 //! first hop is known within the transfer; a loss further on only when the
 //! custody suspect timer fires, much later. The final ranking counts the
@@ -73,6 +83,9 @@ pub struct RouteHop {
     /// A departure the beliefs forecast on a known link, not a contact the
     /// graph holds: nothing to reserve.
     pub forecast: bool,
+    /// Leaves when the next hop is next heard (`depart` is the expected
+    /// time), not at a set time: the station waits to hear it.
+    pub on_hearing: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -150,6 +163,9 @@ pub struct RouteRequest<'a> {
     /// Time-critical: value halves every [`URGENT_HALF_LIFE`], and two copies
     /// may go two ways at once.
     pub urgent: bool,
+    /// About how often stations on the radio transmit (the beacon interval),
+    /// for leaving when the next hop is heard; zero leaves that out.
+    pub hearing_interval_secs: u64,
 }
 
 impl RouteRequest<'_> {
@@ -179,6 +195,8 @@ pub struct RoutingPolicy {
     /// How far ahead known links are planned; zero plans only the contacts
     /// the graph holds.
     pub forecast_horizon_secs: u64,
+    /// How long a station may wait to hear its next hop.
+    pub hearing_window_secs: u64,
 }
 
 impl Default for RoutingPolicy {
@@ -193,6 +211,7 @@ impl Default for RoutingPolicy {
             airtime_price: PerBearer([0.05 / 60.0, 0.0, 0.05 / 60.0]),
             forecast_step_secs: 15 * 60,
             forecast_horizon_secs: 36 * 3_600,
+            hearing_window_secs: 2 * 3_600,
         }
     }
 }

@@ -44,6 +44,7 @@ fn request<'a>(visited: &'a [Callsign], closed_now: &'a [LinkKey]) -> RouteReque
         forbidden: PerBearer::default(),
         closed_now,
         urgent: false,
+        hearing_interval_secs: 0,
     }
 }
 
@@ -406,6 +407,7 @@ mod search_limit {
             forbidden: PerBearer::default(),
             closed_now: &[],
             urgent: false,
+            hearing_interval_secs: 0,
         }
     }
 

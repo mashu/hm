@@ -180,6 +180,10 @@ struct Step {
     rate_bps: u32,
     handed: f64,
     forecast: bool,
+    on_hearing: bool,
+    /// Chance the attempt is made, and its airtime spent: one, but for a
+    /// departure on hearing, the chance of hearing.
+    spend: f64,
 }
 
 /// The chance of a handoff (the link completes it, the next station accepts)
@@ -317,7 +321,7 @@ pub(super) fn find_candidates(
         }
         steps.clear();
         contact_steps(graph, estimate, &arena, index, &mut steps);
-        forecast_steps(graph, estimate, &mut forecasts, &arena, index, &mut steps);
+        forecast_steps(graph, estimate, policy, &mut forecasts, &arena, index, &mut steps);
         for step in steps.drain(..) {
             let Some(next) = extend(estimate, request, policy, &arena, index, step) else {
                 continue;
@@ -396,6 +400,8 @@ fn contact_steps(
             rate_bps: contact.rate_bps,
             handed,
             forecast: false,
+            on_hearing: false,
+            spend: 1.0,
         });
     }
 }
@@ -406,6 +412,7 @@ fn contact_steps(
 fn forecast_steps(
     graph: &ContactGraph,
     estimate: &mut dyn Estimate,
+    policy: RoutingPolicy,
     forecasts: &mut Forecasts,
     arena: &Arena<'_>,
     index: usize,
@@ -447,6 +454,8 @@ fn forecast_steps(
                 rate_bps: known.rate_bps,
                 handed,
                 forecast: true,
+                on_hearing: false,
+                spend: 1.0,
             });
         };
         if label.arrival < horizon {
@@ -468,7 +477,58 @@ fn forecast_steps(
         {
             offer(first + k as u64 * step, *handed);
         }
+        if let Some(step) = hearing_step(estimate, request, policy, label, link, known.rate_bps, transfer) {
+            steps.push(step);
+        }
     }
+}
+
+/// Leaving the source over the radio when the next hop is next heard: the
+/// chance of hearing it within the window, times that of a handoff over an
+/// open path and of its acceptance; the airtime is spent only if it is
+/// heard.
+fn hearing_step(
+    estimate: &mut dyn Estimate,
+    request: &RouteRequest<'_>,
+    policy: RoutingPolicy,
+    label: &Label,
+    link: LinkKey,
+    rate_bps: u32,
+    transfer: u64,
+) -> Option<Step> {
+    if label.parent.is_some()
+        || link.bearer != Bearer::Radio
+        || request.hearing_interval_secs == 0
+        || policy.hearing_window_secs == 0
+        || request.forbidden[link.bearer]
+    {
+        return None;
+    }
+    let window = policy
+        .hearing_window_secs
+        .min(request.expires_at.saturating_sub(request.now));
+    let hearing = estimate.hearing(link, window, request.hearing_interval_secs);
+    let depart = request.now.saturating_add(hearing.wait_secs.max(1));
+    let arrive = depart.saturating_add(transfer);
+    if hearing.chance <= 0.0 || arrive > request.expires_at {
+        return None;
+    }
+    let handed = hearing.chance * estimate.handoff_if_open(link) * estimate.accepts(link.to, arrive);
+    Some(Step {
+        key: ContactKey {
+            from: link.from,
+            to: link.to,
+            bearer: link.bearer,
+            epoch: depart,
+        },
+        depart,
+        arrive,
+        rate_bps,
+        handed,
+        forecast: true,
+        on_hearing: true,
+        spend: hearing.chance,
+    })
 }
 
 /// The label one step on from label `index`, if it fits the deadline and the
@@ -520,7 +580,7 @@ fn extend(
     };
     let hop_cost = policy.attempt_cost[bearer] + policy.airtime_price[bearer] * attempt_airtime;
     let risk_cost = label.risk_cost - probability.ln();
-    let attempt_cost = label.attempt_cost + reach * hop_cost;
+    let attempt_cost = label.attempt_cost + reach * step.spend * hop_cost;
     Some(Label {
         station: to,
         arrival: step.arrive,
@@ -540,6 +600,7 @@ fn extend(
             airtime_millis: edge_airtime,
             probability_permillion: (probability * 1_000_000.0).round() as u32,
             forecast: step.forecast,
+            on_hearing: step.on_hearing,
         }),
         parent: Some(index),
         hops: label.hops + 1,

@@ -476,6 +476,7 @@ impl Model {
                     forbidden: hm_model::PerBearer::default(),
                     closed_now: &[],
                     urgent: message.bundle.urgent,
+                    hearing_interval_secs: 0,
                 };
                 let mut estimate = beliefs.mean(contact.start);
                 let plan = plan_routes(graph, &mut estimate, &request, RoutingPolicy::default()).ok()?;
